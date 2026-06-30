@@ -1,6 +1,14 @@
 import Foundation
 import GRDB
 
+/// Per-table download position: the `(updated_at, id)` of the last applied row. Stored as a
+/// **tuple**, not a bare timestamp, so resuming a pull never skips rows that share a millisecond
+/// across a page boundary.
+struct SyncCursor: Sendable, Equatable {
+    var updatedAt: String
+    var id: String
+}
+
 /// One pending upload, as read back from `_sync_outbox`.
 struct OutboxEntry: FetchableRecord, Sendable {
     var seq: Int64

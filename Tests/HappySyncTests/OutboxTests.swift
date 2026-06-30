@@ -4,56 +4,7 @@ import GRDB
 import Supabase
 @testable import HappySync
 
-/// Records every call and can simulate a run of upsert failures, so the drain's ordering, retry,
-/// and payload behaviour are observable without a network.
-actor FakeRemote: SyncRemote {
-    let serverUpdatedAt = "2026-06-30T12:00:00.000Z"
-    private(set) var upsertCalls: [(table: String, row: [String: AnyJSON])] = []
-    private(set) var deleteCalls: [(table: String, pk: String)] = []
-    private var remainingFailures: Int
-
-    init(failUpserts: Int = 0) { remainingFailures = failUpserts }
-
-    enum Failure: Error { case simulated }
-
-    func upsert(table: String, row: [String: AnyJSON]) async throws -> [String: AnyJSON] {
-        upsertCalls.append((table, row))
-        if remainingFailures > 0 { remainingFailures -= 1; throw Failure.simulated }
-        var server = row
-        server["updated_at"] = .string(serverUpdatedAt)
-        return server
-    }
-
-    func delete(table: String, primaryKey: String, pk: String) async throws {
-        deleteCalls.append((table, pk))
-    }
-}
-
-/// Engine over a caller-supplied DB so tests can pre-create domain tables.
-private func makeEngine(db: any DatabaseWriter, tables: [SyncTable]) throws -> SyncEngine {
-    try SyncEngine(
-        db: db,
-        supabase: SupabaseClient(
-            supabaseURL: URL(string: "https://example.supabase.co")!,
-            supabaseKey: "test-anon-key"
-        ),
-        tables: tables,
-        auth: { "test-token" }
-    )
-}
-
-/// A DB with one `recipes` domain table (id, title, updated_at) plus HappySync's internal tables.
-private func recipesDB() throws -> DatabaseQueue {
-    let db = try DatabaseQueue()
-    try db.write { db in
-        try db.create(table: "recipes") { t in
-            t.column("id", .text).primaryKey()
-            t.column("title", .text)
-            t.column("updated_at", .text)
-        }
-    }
-    return db
-}
+// FakeRemote, makeEngine, and recipesDB live in TestSupport.swift.
 
 // MARK: - FK topological ordering
 

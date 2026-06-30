@@ -10,6 +10,10 @@ protocol SyncRemote: Sendable {
     func upsert(table: String, row: [String: AnyJSON]) async throws -> [String: AnyJSON]
     /// Propagates a delete for one row, keyed by primary key.
     func delete(table: String, primaryKey: String, pk: String) async throws
+    /// Fetches up to `limit` rows changed since `cursor`, ordered by the `(updated_at, id)` tuple
+    /// so the caller can resume exactly where it left off. Tombstoned rows (`deleted_at != null`)
+    /// are included.
+    func fetch(table: String, since cursor: SyncCursor?, primaryKey: String, limit: Int) async throws -> [[String: AnyJSON]]
 }
 
 /// `SyncRemote` over a Supabase PostgREST client. Idempotent by primary key, so the drain can
@@ -39,5 +43,23 @@ struct SupabaseRemote: SyncRemote {
             .eq(primaryKey, value: pk)
             .setHeader(name: "Authorization", value: "Bearer \(token)")
             .execute()
+    }
+
+    func fetch(table: String, since cursor: SyncCursor?, primaryKey: String, limit: Int) async throws -> [[String: AnyJSON]] {
+        let token = await auth()
+        var query = client.from(table).select()
+        if let cursor {
+            // (updated_at, id) > (cursor.updatedAt, cursor.id), as a PostgREST or-filter.
+            query = query.or(
+                "updated_at.gt.\(cursor.updatedAt),and(updated_at.eq.\(cursor.updatedAt),\(primaryKey).gt.\(cursor.id))"
+            )
+        }
+        return try await query
+            .order("updated_at", ascending: true)
+            .order(primaryKey, ascending: true)
+            .limit(limit)
+            .setHeader(name: "Authorization", value: "Bearer \(token)")
+            .execute()
+            .value
     }
 }

@@ -60,11 +60,7 @@ private func makeEngine(tables: [SyncTable] = []) throws -> SyncEngine {
     #expect(SyncTable(name: "recipes").serverOwnedColumns.isEmpty)
 }
 
-@Test func pullNowIsStillStubbed() async throws {
+@Test func pullNowWithNoTablesIsNoOp() async throws {
     let engine = try makeEngine()
-
-    // pullNow lands in APPS-414; until then it reports notImplemented.
-    await #expect(throws: SyncError.self) {
-        try await engine.pullNow()
-    }
+    try await engine.pullNow() // no tables declared → nothing to pull, must not throw
 }

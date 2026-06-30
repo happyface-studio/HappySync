@@ -52,18 +52,27 @@ final class StatusBroadcaster: Sendable {
     }
 }
 
+/// A tombstone seen during a pull, deferred so all deletes can be applied children-first.
+private struct PendingDelete: Sendable {
+    let table: String
+    let primaryKey: String
+    let pk: String
+    let updatedAt: String
+}
+
 /// The HappySync engine: owns the outbox drain, cursor pull, tombstones, FK ordering,
 /// Realtime doorbell, status, and retry/backoff.
 ///
 /// It does **not** own reads — the app keeps observing GRDB with `ValueObservation` — or schema.
 ///
-/// > Status: the upload path is live — `enqueue` (transactional write+outbox) and `drainOutbox`
-/// > (FK-ordered, idempotent, retrying) ship in APPS-413. `pullNow` (APPS-414) and the background
-/// > scheduler / Realtime doorbell that drives `start` (APPS-415) are still stubbed.
+/// > Status: upload (`enqueue` + `drainOutbox`, APPS-413) and download (`pullNow` — tuple cursor,
+/// > LWW, tombstones, pagination, APPS-414) are live. Still stubbed: the background scheduler /
+/// > Realtime doorbell that *drives* `start` (APPS-415).
 public actor SyncEngine {
     private let db: any DatabaseWriter
     private let tables: [SyncTable]
     private let remote: any SyncRemote
+    private let pageSize: Int
 
     private nonisolated let statusBroadcaster: StatusBroadcaster
     private var isRunning = false
@@ -88,11 +97,13 @@ public actor SyncEngine {
         try self.init(db: db, remote: SupabaseRemote(client: supabase, auth: auth), tables: tables)
     }
 
-    /// Injects a `SyncRemote` directly — used by tests to drive the drain with a fake.
-    init(db: any DatabaseWriter, remote: any SyncRemote, tables: [SyncTable]) throws {
+    /// Injects a `SyncRemote` directly — used by tests to drive sync with a fake. `pageSize` is
+    /// injectable so tests can force pagination on a small dataset.
+    init(db: any DatabaseWriter, remote: any SyncRemote, tables: [SyncTable], pageSize: Int = 500) throws {
         self.db = db
         self.remote = remote
         self.tables = tables
+        self.pageSize = pageSize
         self.statusBroadcaster = StatusBroadcaster(initial: SyncStatus())
 
         try SyncSchema.migrator().migrate(db)
@@ -146,10 +157,117 @@ public actor SyncEngine {
         }
     }
 
-    /// Pulls rows changed since each table's cursor and applies them last-write-wins.
-    /// - Note: Implemented in APPS-414 (tuple cursor + LWW apply + tombstones).
+    /// Pulls rows changed since each table's `(updated_at, id)` cursor and applies them
+    /// last-write-wins. Upserts run parents-first (so a child's FK target exists before the child);
+    /// tombstones are deferred and applied children-first (so a parent is never deleted out from
+    /// under a child). Each page's applies + cursor-advance happen in one transaction; pages are
+    /// pulled until one comes back short.
     public func pullNow() async throws {
-        throw SyncError.notImplemented("pullNow lands in APPS-414")
+        let order = topologicalOrder(tables)
+        var pendingDeletes: [PendingDelete] = []
+
+        for tableName in order {
+            guard let spec = tables.first(where: { $0.name == tableName }) else { continue }
+            var cursor = try await readCursor(table: spec.name)
+            while true {
+                let page = try await remote.fetch(
+                    table: spec.name, since: cursor, primaryKey: spec.primaryKey, limit: pageSize
+                )
+                if page.isEmpty { break }
+
+                let pageCursor = cursor // immutable copy for the Sendable write closure
+                let (advanced, deletes) = try await db.write { db -> (SyncCursor?, [PendingDelete]) in
+                    var advanced = pageCursor
+                    var deferred: [PendingDelete] = []
+                    for row in page {
+                        let pk = row[spec.primaryKey]?.stringValue ?? ""
+                        let updatedAt = row["updated_at"]?.stringValue ?? ""
+                        let tombstoned = !(row["deleted_at"]?.isNil ?? true)
+                        if try Self.lwwAllows(
+                            db, table: spec.name, primaryKey: spec.primaryKey, pk: pk, remoteUpdatedAt: updatedAt
+                        ) {
+                            if tombstoned {
+                                deferred.append(PendingDelete(
+                                    table: spec.name, primaryKey: spec.primaryKey, pk: pk, updatedAt: updatedAt
+                                ))
+                            } else {
+                                try RowCoding.upsertLocalRow(
+                                    db, table: spec.name, primaryKey: spec.primaryKey,
+                                    columns: RowCoding.localColumns(from: row)
+                                )
+                            }
+                        }
+                        advanced = SyncCursor(updatedAt: updatedAt, id: pk) // cursor advances whether or not we applied
+                    }
+                    if let advanced { try Self.writeCursor(db, table: spec.name, cursor: advanced) }
+                    return (advanced, deferred)
+                }
+                if let advanced { cursor = advanced }
+                pendingDeletes.append(contentsOf: deletes)
+                if page.count < pageSize { break }
+            }
+        }
+
+        // Phase 2: tombstones, children-first (reverse FK order).
+        let rank = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
+        for del in pendingDeletes.sorted(by: { (rank[$0.table] ?? 0) > (rank[$1.table] ?? 0) }) {
+            try await db.write { db in
+                // Re-check the gate: a local edit may have arrived between phases.
+                guard try Self.lwwAllows(
+                    db, table: del.table, primaryKey: del.primaryKey, pk: del.pk, remoteUpdatedAt: del.updatedAt
+                ) else { return }
+                try db.execute(
+                    sql: "DELETE FROM \"\(del.table)\" WHERE \"\(del.primaryKey)\" = ?",
+                    arguments: [del.pk]
+                )
+            }
+        }
+    }
+
+    /// Last-write-wins gate, evaluated inside the apply transaction: a remote row is applied only
+    /// if the local row isn't dirty (no pending outbox entry — its queued upload wins) and the
+    /// remote is strictly newer than the local copy (an absent local row always loses).
+    private static func lwwAllows(
+        _ db: Database, table: String, primaryKey: String, pk: String, remoteUpdatedAt: String
+    ) throws -> Bool {
+        let dirty = try Int.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE table_name = ? AND pk = ?",
+            arguments: [table, pk]
+        ) ?? 0
+        if dirty > 0 { return false }
+
+        guard let local: String = try String.fetchOne(
+            db,
+            sql: "SELECT updated_at FROM \"\(table)\" WHERE \"\(primaryKey)\" = ?",
+            arguments: [pk]
+        ) else {
+            return true // no local row (or never-stamped) → apply
+        }
+        return remoteUpdatedAt > local // ISO-8601 UTC sorts lexicographically
+    }
+
+    private func readCursor(table: String) async throws -> SyncCursor? {
+        try await db.read { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: "SELECT updated_at, last_id FROM \(SyncSchema.stateTable) WHERE table_name = ?",
+                arguments: [table]
+            ), let updatedAt: String = row["updated_at"], let id: String = row["last_id"] else {
+                return nil
+            }
+            return SyncCursor(updatedAt: updatedAt, id: id)
+        }
+    }
+
+    private static func writeCursor(_ db: Database, table: String, cursor: SyncCursor) throws {
+        try db.execute(
+            sql: """
+                INSERT INTO \(SyncSchema.stateTable) (table_name, updated_at, last_id) VALUES (?, ?, ?)
+                ON CONFLICT(table_name) DO UPDATE SET updated_at = excluded.updated_at, last_id = excluded.last_id
+                """,
+            arguments: [table, cursor.updatedAt, cursor.id]
+        )
     }
 
     /// Processes every pending outbox entry once, in FK-safe order. Each op is idempotent by

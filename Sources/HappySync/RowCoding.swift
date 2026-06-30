@@ -69,6 +69,31 @@ enum RowCoding {
         }
     }
 
+    /// Decodes a PostgREST wire row into local SQLite column values — the inverse of `payload`.
+    /// Nested JSON values are stored as JSON text (matching how `encode` keeps `jsonColumns`).
+    static func localColumns(from wire: [String: AnyJSON]) -> [String: DatabaseValue] {
+        var columns: [String: DatabaseValue] = [:]
+        for (key, value) in wire {
+            columns[key] = databaseValue(value)
+        }
+        return columns
+    }
+
+    private static func databaseValue(_ value: AnyJSON) -> DatabaseValue {
+        switch value {
+        case .null: return .null
+        case .bool(let b): return (b ? 1 : 0).databaseValue
+        case .integer(let i): return i.databaseValue
+        case .double(let d): return d.databaseValue
+        case .string(let s): return s.databaseValue
+        case .object, .array:
+            if let data = try? JSONEncoder().encode(value) {
+                return String(decoding: data, as: UTF8.self).databaseValue
+            }
+            return .null
+        }
+    }
+
     /// Renders a primary-key `DatabaseValue` as the text stored in the outbox `pk` column.
     static func pkString(_ value: DatabaseValue) -> String {
         switch value.storage {
