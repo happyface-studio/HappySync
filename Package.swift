@@ -10,7 +10,9 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.11.0"),
-        .package(url: "https://github.com/supabase/supabase-swift.git", from: "2.0.0"),
+        // supabase-community is the fork CookThis consumes; matching the URL (and SPM
+        // identity) lets the app share one supabase-swift instead of resolving two.
+        .package(url: "https://github.com/supabase-community/supabase-swift.git", from: "2.0.0"),
     ],
     targets: [
         .target(
