@@ -205,6 +205,13 @@ public actor SyncEngine {
         }
     }
 
+    /// Requests an immediate sync through the serialised runner — for app-driven triggers like
+    /// returning to the foreground or pull-to-refresh. Coalesces with any in-flight run; a no-op
+    /// until `start()` has been called.
+    public func syncNow() {
+        poke()
+    }
+
     private func poke() {
         wake?.yield(())
     }

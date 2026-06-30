@@ -33,7 +33,7 @@ import Supabase
 
     try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
 
-    let (title, outbox) = try await db.read { db -> (String?, Row?) in
+    let (title, outbox) = try db.read { db -> (String?, Row?) in
         let title = try String.fetchOne(db, sql: "SELECT title FROM recipes WHERE id = 'r1'")
         let outbox = try Row.fetchOne(db, sql: "SELECT table_name, pk, op, attempts FROM _sync_outbox")
         return (title, outbox)

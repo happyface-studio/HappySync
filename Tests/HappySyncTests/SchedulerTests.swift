@@ -85,3 +85,23 @@ import Supabase
 
     #expect(pulls >= 3) // initial sync + repeated periodic polls, with no doorbell at all
 }
+
+@Test func syncNowForcesAnImmediatePull() async throws {
+    let db = try recipesDB()
+    let remote = FakeRemote()
+    // Long poll interval, silent doorbell → only an explicit nudge can cause another pull.
+    let engine = try SyncEngine(
+        db: db, remote: remote, tables: [SyncTable(name: "recipes")],
+        doorbell: SilentDoorbell(), pollInterval: 999, debounceInterval: 0.3
+    )
+    await engine.start()
+    try await Task.sleep(for: .milliseconds(50)) // initial sync settles
+    let baseline = await remote.fetchCalls
+
+    await engine.syncNow() // e.g. the app returning to the foreground
+    try await Task.sleep(for: .milliseconds(50))
+    let after = await remote.fetchCalls
+    await engine.stop()
+
+    #expect(after > baseline) // foreground nudge pulls without waiting for the periodic poll
+}
