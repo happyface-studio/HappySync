@@ -27,7 +27,7 @@ actor FakeRemote: SyncRemote {
         upsertCalls.append((table, row))
         if remainingFailures > 0 { remainingFailures -= 1; throw Failure.simulated }
         var server = row
-        server["updated_at"] = .string(serverUpdatedAt)
+        server["updatedAt"] = .string(serverUpdatedAt)
         return server
     }
 
@@ -35,21 +35,21 @@ actor FakeRemote: SyncRemote {
         deleteCalls.append((table, pk))
     }
 
-    func fetch(table: String, since cursor: SyncCursor?, primaryKey: String, limit: Int) async throws -> [[String: AnyJSON]] {
+    func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, limit: Int) async throws -> [[String: AnyJSON]] {
         fetchCalls += 1
         if remainingFetchFailures > 0 { remainingFetchFailures -= 1; throw Failure.simulated }
-        let sorted = (dataset[table] ?? []).sorted { tuple($0, primaryKey) < tuple($1, primaryKey) }
+        let sorted = (dataset[table] ?? []).sorted { tuple($0, cursorColumn, primaryKey) < tuple($1, cursorColumn, primaryKey) }
         let filtered: [[String: AnyJSON]]
         if let cursor {
-            filtered = sorted.filter { tuple($0, primaryKey) > (cursor.updatedAt, cursor.id) }
+            filtered = sorted.filter { tuple($0, cursorColumn, primaryKey) > (cursor.updatedAt, cursor.id) }
         } else {
             filtered = sorted
         }
         return Array(filtered.prefix(limit))
     }
 
-    private func tuple(_ row: [String: AnyJSON], _ primaryKey: String) -> (String, String) {
-        (row["updated_at"]?.stringValue ?? "", row[primaryKey]?.stringValue ?? "")
+    private func tuple(_ row: [String: AnyJSON], _ cursorColumn: String, _ primaryKey: String) -> (String, String) {
+        (row[cursorColumn]?.stringValue ?? "", row[primaryKey]?.stringValue ?? "")
     }
 }
 
@@ -78,7 +78,7 @@ func recipesDB() throws -> DatabaseQueue {
         try db.create(table: "recipes") { t in
             t.column("id", .text).primaryKey()
             t.column("title", .text)
-            t.column("updated_at", .text)
+            t.column("updatedAt", .text)
         }
     }
     return db

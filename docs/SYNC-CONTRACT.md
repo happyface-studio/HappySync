@@ -14,10 +14,10 @@ data ever becomes collaborative.
 
 Per synced table:
 
-- **`updated_at timestamptz` + a `BEFORE INSERT/UPDATE` trigger stamping `now()`.**
-  Non-negotiable: LWW compares `updated_at`, and a *server* clock is what prevents two devices'
-  clock skew from silently losing writes. Never trust a client-sent `updated_at`.
-- **`deleted_at timestamptz` tombstone** (nullable). Deletes are soft — set `deleted_at` instead of
+- **`updatedAt timestamptz` + a `BEFORE INSERT/UPDATE` trigger stamping `now()`.**
+  Non-negotiable: LWW compares `updatedAt`, and a *server* clock is what prevents two devices'
+  clock skew from silently losing writes. Never trust a client-sent `updatedAt`.
+- **`deletedAt timestamptz` tombstone** (nullable). Deletes are soft — set `deletedAt` instead of
   removing the row — so deletions propagate on the next cursor pull. Deleting a parent must
   **tombstone its children too** (don't hard-`ON DELETE CASCADE`); a server trigger is the clean
   way. Purge old tombstones server-side on a schedule.
@@ -36,19 +36,19 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
 - Writes append to a local **outbox** in the same transaction as the domain write, then return
   optimistically. A background drain processes the outbox in `seq` order.
 - **PostgREST upsert** with `Prefer: return=representation` (returns the server-stamped
-  `updated_at`) for `.upsert`; soft-delete for `.delete`. Both are **idempotent by primary key**, so
+  `updatedAt`) for `.upsert`; soft-delete for `.delete`. Both are **idempotent by primary key**, so
   retries are safe; back off exponentially and count `attempts`.
 - **FK ordering:** upsert parents before children; tombstone children before parents.
 - The upsert payload **excludes** `serverOwnedColumns` (§4) and re-encodes `jsonColumns` to JSON.
 
 ## 3. Download (cursor pull → local, LWW)
 
-- Per table: `SELECT * WHERE updated_at > :cursor ORDER BY (updated_at, id)`, RLS-scoped.
-- **Tuple cursor `(updated_at, id)`** — not a bare timestamp — so rows sharing a millisecond at a
+- Per table: `SELECT * WHERE updatedAt > :cursor ORDER BY (updatedAt, id)`, RLS-scoped.
+- **Tuple cursor `(updatedAt, id)`** — not a bare timestamp — so rows sharing a millisecond at a
   page boundary aren't dropped. Advance it past the last applied row.
-- **LWW apply:** apply a remote row only if `remote.updated_at > local.updated_at` **and** the local
+- **LWW apply:** apply a remote row only if `remote.updatedAt > local.updatedAt` **and** the local
   row is not dirty (a pending local edit is never clobbered — its queued upload wins).
-- **Tombstones** (`deleted_at` set) arrive through the same pull; apply by deleting locally.
+- **Tombstones** (`deletedAt` set) arrive through the same pull; apply by deleting locally.
 - Convergence does not depend on Realtime: foreground + periodic pulls converge even if Realtime
   drops. Realtime only makes it feel instant.
 
@@ -80,9 +80,9 @@ declares the same shape):
 ## 6. Consumer #1 manifest — CookThis (9 tables)
 
 Derived from `CookThis/powersync/sync-config.yaml` (stream list) and the iOS
-`jsonEncodedColumnsByTable` registry. `updated_at?` / `deleted_at?` mark M2 server gaps still to add.
+`jsonEncodedColumnsByTable` registry. `updatedAt?` / `deletedAt?` mark M2 server gaps still to add.
 
-| table | primaryKey | dependsOn | jsonColumns | serverOwned | updated_at | deleted_at |
+| table | primaryKey | dependsOn | jsonColumns | serverOwned | updatedAt | deletedAt |
 |---|---|---|---|---|---|---|
 | `profiles` | `id` (= auth uid) | — | dietaryRestrictions, dislikedIngredients | — | **add** | **add** |
 | `recipes` | `id` | — | cuisine, dishTypes, tags, equipment, nutrition, detailedNutrition, tasteProfile, estimatedCost | _verify clone/cook counters_ | ✓ | **add** |

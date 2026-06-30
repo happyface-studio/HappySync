@@ -112,11 +112,11 @@ import Supabase
 
     let (outboxCount, stamped) = try await db.read { db -> (Int, String?) in
         let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM _sync_outbox") ?? -1
-        let stamped = try String.fetchOne(db, sql: "SELECT updated_at FROM recipes WHERE id = 'r1'")
+        let stamped = try String.fetchOne(db, sql: "SELECT updatedAt FROM recipes WHERE id = 'r1'")
         return (count, stamped)
     }
     #expect(outboxCount == 0)              // entry cleared after server confirmed
-    #expect(stamped == remote.serverUpdatedAt) // server updated_at written back locally
+    #expect(stamped == remote.serverUpdatedAt) // server updatedAt written back locally
 }
 
 @Test func drainUploadsParentsBeforeChildrenRegardlessOfEnqueueOrder() async throws {
@@ -124,12 +124,12 @@ import Supabase
     try await db.write { db in
         try db.create(table: "recipes") { t in
             t.column("id", .text).primaryKey()
-            t.column("updated_at", .text)
+            t.column("updatedAt", .text)
         }
         try db.create(table: "recipeIngredients") { t in
             t.column("id", .text).primaryKey()
             t.column("recipeId", .text)
-            t.column("updated_at", .text)
+            t.column("updatedAt", .text)
         }
     }
     let remote = FakeRemote()
@@ -174,7 +174,7 @@ import Supabase
     let afterFail = try await db.read { db -> (Int, Int, String?) in
         let pending = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM _sync_outbox") ?? -1
         let attempts = try Int.fetchOne(db, sql: "SELECT attempts FROM _sync_outbox WHERE pk = 'r1'") ?? -1
-        let stamped = try String.fetchOne(db, sql: "SELECT updated_at FROM recipes WHERE id = 'r1'")
+        let stamped = try String.fetchOne(db, sql: "SELECT updatedAt FROM recipes WHERE id = 'r1'")
         return (pending, attempts, stamped)
     }
     #expect(afterFail.0 == 1)   // entry still pending
@@ -185,7 +185,7 @@ import Supabase
     try await engine.drainOutbox()
     let afterSuccess = try await db.read { db -> (Int, String?) in
         let pending = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM _sync_outbox") ?? -1
-        let stamped = try String.fetchOne(db, sql: "SELECT updated_at FROM recipes WHERE id = 'r1'")
+        let stamped = try String.fetchOne(db, sql: "SELECT updatedAt FROM recipes WHERE id = 'r1'")
         return (pending, stamped)
     }
     #expect(afterSuccess.0 == 0)
@@ -208,7 +208,7 @@ import Supabase
         try db.create(table: "userRecipeInteractions") { t in
             t.column("id", .text).primaryKey()
             t.column("cookedCount", .integer)
-            t.column("updated_at", .text)
+            t.column("updatedAt", .text)
         }
     }
     let remote = FakeRemote()
