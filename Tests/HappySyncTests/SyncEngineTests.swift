@@ -60,12 +60,10 @@ private func makeEngine(tables: [SyncTable] = []) throws -> SyncEngine {
     #expect(SyncTable(name: "recipes").serverOwnedColumns.isEmpty)
 }
 
-@Test func stubbedSyncOpsThrowNotImplemented() async throws {
+@Test func pullNowIsStillStubbed() async throws {
     let engine = try makeEngine()
 
-    await #expect(throws: SyncError.self) {
-        try await engine.enqueue(.upsert, table: "recipes", row: ["id": "1"])
-    }
+    // pullNow lands in APPS-414; until then it reports notImplemented.
     await #expect(throws: SyncError.self) {
         try await engine.pullNow()
     }

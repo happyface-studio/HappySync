@@ -61,4 +61,10 @@ public struct SyncStatus: Sendable, Equatable {
 public enum SyncError: Error, Sendable {
     /// Functionality scheduled for a later milestone is not wired up yet.
     case notImplemented(String)
+    /// `enqueue` was called for a table not declared in the engine's `tables`.
+    case unknownTable(String)
+    /// The encoded row had no value for the table's primary-key column.
+    case missingPrimaryKey(table: String, column: String)
+    /// The row could not be encoded to SQLite column values.
+    case encoding(String)
 }

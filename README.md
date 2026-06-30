@@ -5,8 +5,9 @@ enabling constraint that personal data is *not collaborative*: one user edits th
 occasionally from two devices. That makes **last-write-wins by server timestamp** correct — no
 CRDTs needed.
 
-> Status: **M1 in progress.** This is the package scaffold (public API + internal-table
-> migrations). The outbox drain, cursor pull, and Realtime doorbell are stubbed and land next.
+> Status: **M1 in progress.** The upload path is live — transactional `enqueue` and an
+> FK-ordered, idempotent, retrying outbox drain (APPS-413). The cursor pull (APPS-414) and the
+> background scheduler / Realtime doorbell (APPS-415) are stubbed and land next.
 
 ## Model
 
