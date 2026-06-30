@@ -10,11 +10,14 @@ actor FakeRemote: SyncRemote {
     let serverUpdatedAt = "2026-06-30T12:00:00.000Z"
     private(set) var upsertCalls: [(table: String, row: [String: AnyJSON])] = []
     private(set) var deleteCalls: [(table: String, pk: String)] = []
+    private(set) var fetchCalls = 0
     private var remainingFailures: Int
+    private var remainingFetchFailures: Int
     private let dataset: [String: [[String: AnyJSON]]]
 
-    init(failUpserts: Int = 0, dataset: [String: [[String: AnyJSON]]] = [:]) {
+    init(failUpserts: Int = 0, failFetches: Int = 0, dataset: [String: [[String: AnyJSON]]] = [:]) {
         remainingFailures = failUpserts
+        remainingFetchFailures = failFetches
         self.dataset = dataset
     }
 
@@ -33,6 +36,8 @@ actor FakeRemote: SyncRemote {
     }
 
     func fetch(table: String, since cursor: SyncCursor?, primaryKey: String, limit: Int) async throws -> [[String: AnyJSON]] {
+        fetchCalls += 1
+        if remainingFetchFailures > 0 { remainingFetchFailures -= 1; throw Failure.simulated }
         let sorted = (dataset[table] ?? []).sorted { tuple($0, primaryKey) < tuple($1, primaryKey) }
         let filtered: [[String: AnyJSON]]
         if let cursor {
@@ -46,6 +51,18 @@ actor FakeRemote: SyncRemote {
     private func tuple(_ row: [String: AnyJSON], _ primaryKey: String) -> (String, String) {
         (row["updated_at"]?.stringValue ?? "", row[primaryKey]?.stringValue ?? "")
     }
+}
+
+/// A `SyncDoorbell` test double: each `fire()` rings the doorbell, simulating a Realtime change
+/// event. Backed by a single stream the engine consumes; the continuation is `Sendable`, so the
+/// class is safe to poke from a test without an actor hop.
+final class FakeDoorbell: SyncDoorbell, @unchecked Sendable {
+    private let stream: AsyncStream<Void>
+    private let continuation: AsyncStream<Void>.Continuation
+
+    init() { (stream, continuation) = AsyncStream.makeStream(of: Void.self) }
+    func ring() -> AsyncStream<Void> { stream }
+    func fire() { continuation.yield(()) }
 }
 
 /// Engine over a caller-supplied DB (and, by default, a no-op `FakeRemote`) so tests can

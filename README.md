@@ -5,10 +5,12 @@ enabling constraint that personal data is *not collaborative*: one user edits th
 occasionally from two devices. That makes **last-write-wins by server timestamp** correct — no
 CRDTs needed.
 
-> Status: **M1 in progress.** Upload (transactional `enqueue` + FK-ordered, idempotent, retrying
-> outbox drain — APPS-413) and download (`pullNow`: tuple `(updated_at, id)` cursor, last-write-wins
-> with dirty-row protection, tombstones, pagination — APPS-414) are live. The background scheduler /
-> Realtime doorbell that drives them (APPS-415) lands next.
+> Status: **M1 complete.** Upload (transactional `enqueue` + FK-ordered, idempotent, retrying
+> outbox drain — APPS-413), download (`pullNow`: tuple `(updated_at, id)` cursor, last-write-wins
+> with dirty-row protection, tombstones, pagination — APPS-414), and the scheduler that drives them
+> (`start`: debounced Realtime doorbell, periodic fallback, status stream, exponential backoff —
+> APPS-415) are all live. Next is M2 server prep (server-side `updated_at` triggers + `deleted_at`
+> tombstones) before the M3 CookThis cutover.
 
 ## Model
 
