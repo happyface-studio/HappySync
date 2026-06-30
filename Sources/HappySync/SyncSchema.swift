@@ -7,9 +7,17 @@ enum SyncSchema {
     /// One row per synced table, holding the last applied `(updated_at, id)` cursor (APPS-414).
     static let stateTable = "_sync_state"
 
-    /// Registers HappySync's internal tables. Run once on `SyncEngine` init.
+    /// A standalone migrator for HappySync's internal tables. Used when the engine owns the DB.
     static func migrator() -> DatabaseMigrator {
         var migrator = DatabaseMigrator()
+        register(into: &migrator)
+        return migrator
+    }
+
+    /// Registers HappySync's internal tables into an existing migrator. Prefer this when the app
+    /// runs its own `DatabaseMigrator` on the same database — GRDB tracks every migration in one
+    /// shared `grdb_migrations` table, so the app and HappySync must share one migrator.
+    static func register(into migrator: inout DatabaseMigrator) {
         migrator.registerMigration("happysync_v1") { db in
             try db.create(table: outboxTable) { t in
                 t.autoIncrementedPrimaryKey("seq")
@@ -26,6 +34,5 @@ enum SyncSchema {
                 t.column("last_id", .text)
             }
         }
-        return migrator
     }
 }

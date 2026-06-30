@@ -1,6 +1,56 @@
 import Foundation
+import os
 import GRDB
 import Supabase
+
+/// Multicasts the latest `SyncStatus` to any number of subscribers, replaying the latest snapshot
+/// to each new one. CookThis has two consumers (the status UI and a refresh loop); a bare
+/// `AsyncStream` is single-consumer, so the engine fans out through this instead.
+final class StatusBroadcaster: Sendable {
+    private struct State {
+        var latest: SyncStatus
+        var subscribers: [UUID: AsyncStream<SyncStatus>.Continuation] = [:]
+    }
+
+    private let state: OSAllocatedUnfairLock<State>
+
+    init(initial: SyncStatus) {
+        state = OSAllocatedUnfairLock(initialState: State(latest: initial))
+    }
+
+    /// A fresh stream that immediately replays the latest status, then receives every update.
+    func subscribe() -> AsyncStream<SyncStatus> {
+        AsyncStream { continuation in
+            let id = UUID()
+            let latest = state.withLock { s -> SyncStatus in
+                s.subscribers[id] = continuation
+                return s.latest
+            }
+            continuation.yield(latest)
+            continuation.onTermination = { [state] _ in
+                state.withLock { _ = $0.subscribers.removeValue(forKey: id) }
+            }
+        }
+    }
+
+    /// Records the new status and fans it out. Yields outside the lock to avoid reentrancy.
+    func send(_ status: SyncStatus) {
+        let continuations = state.withLock { s -> [AsyncStream<SyncStatus>.Continuation] in
+            s.latest = status
+            return Array(s.subscribers.values)
+        }
+        for continuation in continuations { continuation.yield(status) }
+    }
+
+    func finish() {
+        let continuations = state.withLock { s -> [AsyncStream<SyncStatus>.Continuation] in
+            let all = Array(s.subscribers.values)
+            s.subscribers.removeAll()
+            return all
+        }
+        for continuation in continuations { continuation.finish() }
+    }
+}
 
 /// The HappySync engine: owns the outbox drain, cursor pull, tombstones, FK ordering,
 /// Realtime doorbell, status, and retry/backoff.
@@ -15,12 +65,14 @@ public actor SyncEngine {
     private let tables: [SyncTable]
     private let auth: @Sendable () async -> String
 
-    /// Live engine status for the app's sync-status UI.
-    public nonisolated let status: AsyncStream<SyncStatus>
-    private nonisolated let statusContinuation: AsyncStream<SyncStatus>.Continuation
-
-    private var current = SyncStatus()
+    private nonisolated let statusBroadcaster: StatusBroadcaster
     private var isRunning = false
+
+    /// Live engine status. Each access returns an independent stream that replays the latest
+    /// snapshot, so multiple consumers (status UI, refresh loop) can observe concurrently.
+    public nonisolated var status: AsyncStream<SyncStatus> {
+        statusBroadcaster.subscribe()
+    }
 
     /// - Parameters:
     ///   - db: GRDB writer (`DatabaseQueue` or `DatabasePool`) — the local source of truth.
@@ -37,10 +89,9 @@ public actor SyncEngine {
         self.supabase = supabase
         self.tables = tables
         self.auth = auth
-        (self.status, self.statusContinuation) = AsyncStream<SyncStatus>.makeStream()
+        self.statusBroadcaster = StatusBroadcaster(initial: SyncStatus())
 
         try SyncSchema.migrator().migrate(db)
-        statusContinuation.yield(current)
     }
 
     /// Begins draining the outbox and pulling changes. Idempotent.
@@ -49,10 +100,10 @@ public actor SyncEngine {
         isRunning = true
     }
 
-    /// Stops background sync and finishes the status stream.
+    /// Stops background sync and finishes all status streams.
     public func stop() {
         isRunning = false
-        statusContinuation.finish()
+        statusBroadcaster.finish()
     }
 
     /// Records a write in the outbox in the same transaction as the domain write.

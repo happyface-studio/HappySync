@@ -13,17 +13,22 @@ public struct SyncTable: Sendable, Hashable {
     public let dependsOn: [String]
     /// Columns stored as JSON/JSONB that need encode/decode rather than scalar mapping.
     public let jsonColumns: [String]
+    /// Columns the server owns (e.g. RPC-managed counters) — stripped from every upsert so a
+    /// stale client value never clobbers the authoritative one. They still arrive on download.
+    public let serverOwnedColumns: [String]
 
     public init(
         name: String,
         primaryKey: String = "id",
         dependsOn: [String] = [],
-        jsonColumns: [String] = []
+        jsonColumns: [String] = [],
+        serverOwnedColumns: [String] = []
     ) {
         self.name = name
         self.primaryKey = primaryKey
         self.dependsOn = dependsOn
         self.jsonColumns = jsonColumns
+        self.serverOwnedColumns = serverOwnedColumns
     }
 }
 

@@ -4,16 +4,26 @@ import GRDB
 import Supabase
 @testable import HappySync
 
-@Test func emptyEngineMigratesAndStartsIdle() async throws {
-    let db = try DatabaseQueue() // in-memory
-    let client = SupabaseClient(
-        supabaseURL: URL(string: "https://example.supabase.co")!,
-        supabaseKey: "test-anon-key"
+private func makeEngine(tables: [SyncTable] = []) throws -> SyncEngine {
+    try SyncEngine(
+        db: try DatabaseQueue(), // in-memory
+        supabase: SupabaseClient(
+            supabaseURL: URL(string: "https://example.supabase.co")!,
+            supabaseKey: "test-anon-key"
+        ),
+        tables: tables,
+        auth: { "test-token" }
     )
+}
 
+@Test func emptyEngineMigratesAndStartsIdle() async throws {
+    let db = try DatabaseQueue()
     let engine = try SyncEngine(
         db: db,
-        supabase: client,
+        supabase: SupabaseClient(
+            supabaseURL: URL(string: "https://example.supabase.co")!,
+            supabaseKey: "test-anon-key"
+        ),
         tables: [SyncTable(name: "recipes", jsonColumns: ["nutrition"])],
         auth: { "test-token" }
     )
@@ -33,16 +43,25 @@ import Supabase
     #expect(first?.lastSyncedAt == nil)
 }
 
+@Test func statusFansOutToMultipleSubscribers() async throws {
+    let engine = try makeEngine()
+
+    // Two independent subscribers each replay the initial idle snapshot — a bare AsyncStream
+    // would starve the second consumer.
+    var a = engine.status.makeAsyncIterator()
+    var b = engine.status.makeAsyncIterator()
+    #expect(await a.next()?.phase == .idle)
+    #expect(await b.next()?.phase == .idle)
+}
+
+@Test func syncTableCarriesServerOwnedColumns() {
+    let interactions = SyncTable(name: "userRecipeInteractions", serverOwnedColumns: ["cookedCount"])
+    #expect(interactions.serverOwnedColumns == ["cookedCount"])
+    #expect(SyncTable(name: "recipes").serverOwnedColumns.isEmpty)
+}
+
 @Test func stubbedSyncOpsThrowNotImplemented() async throws {
-    let engine = try SyncEngine(
-        db: try DatabaseQueue(),
-        supabase: SupabaseClient(
-            supabaseURL: URL(string: "https://example.supabase.co")!,
-            supabaseKey: "test-anon-key"
-        ),
-        tables: [],
-        auth: { "test-token" }
-    )
+    let engine = try makeEngine()
 
     await #expect(throws: SyncError.self) {
         try await engine.enqueue(.upsert, table: "recipes", row: ["id": "1"])
