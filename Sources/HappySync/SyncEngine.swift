@@ -65,17 +65,25 @@ private struct PendingDelete: Sendable {
 ///
 /// It does **not** own reads — the app keeps observing GRDB with `ValueObservation` — or schema.
 ///
-/// > Status: upload (`enqueue` + `drainOutbox`, APPS-413) and download (`pullNow` — tuple cursor,
-/// > LWW, tombstones, pagination, APPS-414) are live. Still stubbed: the background scheduler /
-/// > Realtime doorbell that *drives* `start` (APPS-415).
+/// > Status: upload (`enqueue` + `drainOutbox`, APPS-413), download (`pullNow` — tuple cursor,
+/// > LWW, tombstones, pagination, APPS-414), and the scheduler that drives them (`start` — debounced
+/// > Realtime doorbell, periodic fallback, status, backoff, APPS-415) are all live. M1 is complete.
 public actor SyncEngine {
     private let db: any DatabaseWriter
     private let tables: [SyncTable]
     private let remote: any SyncRemote
     private let pageSize: Int
+    private let doorbell: any SyncDoorbell
+    private let pollInterval: TimeInterval
+    private let debounceInterval: TimeInterval
 
     private nonisolated let statusBroadcaster: StatusBroadcaster
     private var isRunning = false
+    private var lastSyncedAt: Date?
+    private var consecutiveFailures = 0
+    private var loopTask: Task<Void, Never>?
+    private var debounceTask: Task<Void, Never>?
+    private var wake: AsyncStream<Void>.Continuation?
 
     /// Live engine status. Each access returns an independent stream that replays the latest
     /// snapshot, so multiple consumers (status UI, refresh loop) can observe concurrently.
@@ -94,34 +102,134 @@ public actor SyncEngine {
         tables: [SyncTable],
         auth: @escaping @Sendable () async -> String
     ) throws {
-        try self.init(db: db, remote: SupabaseRemote(client: supabase, auth: auth), tables: tables)
+        try self.init(
+            db: db,
+            remote: SupabaseRemote(client: supabase, auth: auth),
+            tables: tables,
+            doorbell: SupabaseDoorbell(client: supabase, tables: tables.map(\.name))
+        )
     }
 
-    /// Injects a `SyncRemote` directly — used by tests to drive sync with a fake. `pageSize` is
-    /// injectable so tests can force pagination on a small dataset.
-    init(db: any DatabaseWriter, remote: any SyncRemote, tables: [SyncTable], pageSize: Int = 500) throws {
+    /// Injects the `SyncRemote`/`SyncDoorbell` seams directly — used by tests to drive sync with
+    /// fakes. `pageSize` forces pagination on a small dataset; `pollInterval`/`debounceInterval` let
+    /// tests shrink the scheduler's timing without waiting on production intervals.
+    init(
+        db: any DatabaseWriter,
+        remote: any SyncRemote,
+        tables: [SyncTable],
+        pageSize: Int = 500,
+        doorbell: any SyncDoorbell = SilentDoorbell(),
+        pollInterval: TimeInterval = 30,
+        debounceInterval: TimeInterval = 0.3
+    ) throws {
         self.db = db
         self.remote = remote
         self.tables = tables
         self.pageSize = pageSize
+        self.doorbell = doorbell
+        self.pollInterval = pollInterval
+        self.debounceInterval = debounceInterval
         self.statusBroadcaster = StatusBroadcaster(initial: SyncStatus())
 
         try SyncSchema.migrator().migrate(db)
     }
 
-    /// Begins background sync. Idempotent.
-    ///
-    /// The drain itself (`drainOutbox`) and its backoff policy (`backoffDelay`) are implemented;
-    /// what's still missing is the loop that *calls* them on a schedule and on the Realtime
-    /// doorbell — that lands in APPS-415, so for now `start` only flips the running flag.
+    /// Begins background sync. Idempotent. Runs an immediate convergence sync, then keeps the local
+    /// store in sync from three trigger sources, all funnelled through one serialised runner:
+    ///  - the Realtime **doorbell**, debounced so a burst of change events collapses to one pull;
+    ///  - a **periodic** poll that converges even if the Realtime channel drops;
+    ///  - (the doorbell/periodic both retry with exponential `backoffDelay` while syncs are failing).
     public func start() {
+        guard !isRunning else { return }
         isRunning = true
+
+        let (stream, continuation) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
+        wake = continuation
+        // ponytail: the running subtasks hold `self` for the engine's lifetime; `stop()` is the
+        // teardown that cancels them. Fine for an app-lifetime engine, revisit if it must be GC'd live.
+        loopTask = Task { [weak self] in
+            guard let self else { return }
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await self.runLoop(stream) }
+                group.addTask { await self.doorbellLoop() }
+                group.addTask { await self.periodicLoop() }
+            }
+        }
+        poke() // converge immediately on start
     }
 
     /// Stops background sync and finishes all status streams.
     public func stop() {
         isRunning = false
+        loopTask?.cancel(); loopTask = nil
+        debounceTask?.cancel(); debounceTask = nil
+        wake?.finish(); wake = nil
         statusBroadcaster.finish()
+    }
+
+    /// The single serialised runner: one sync at a time, so pushes and pulls never overlap. Pokes
+    /// that arrive mid-run coalesce (the wake channel buffers only the newest), so a backlog drains
+    /// in one extra pass rather than one-per-poke.
+    private func runLoop(_ wake: AsyncStream<Void>) async {
+        for await _ in wake {
+            do {
+                try await runSyncOnce()
+                consecutiveFailures = 0
+            } catch {
+                consecutiveFailures += 1 // status already shows .failed; the periodic loop retries with backoff
+            }
+        }
+    }
+
+    /// Each doorbell ring (re)arms a trailing debounce; only the last ring in a burst survives to
+    /// poke the runner, so a multi-row remote change triggers exactly one pull.
+    private func doorbellLoop() async {
+        for await _ in doorbell.ring() {
+            debounceTask?.cancel()
+            debounceTask = Task { [debounceInterval, weak self] in
+                try? await Task.sleep(for: .seconds(debounceInterval))
+                guard !Task.isCancelled else { return }
+                await self?.poke()
+            }
+        }
+    }
+
+    /// Periodic convergence: pokes every `pollInterval` while healthy, or after `backoffDelay` once
+    /// syncs start failing. This is what guarantees convergence if the Realtime doorbell goes silent.
+    private func periodicLoop() async {
+        while !Task.isCancelled {
+            let delay = nextDelay(consecutiveFailures: consecutiveFailures, pollInterval: pollInterval)
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled else { break }
+            poke()
+        }
+    }
+
+    /// Requests an immediate sync through the serialised runner — for app-driven triggers like
+    /// returning to the foreground or pull-to-refresh. Coalesces with any in-flight run; a no-op
+    /// until `start()` has been called.
+    public func syncNow() {
+        poke()
+    }
+
+    private func poke() {
+        wake?.yield(())
+    }
+
+    /// One full sync pass: push local changes then pull remote ones, driving `status` across the
+    /// run (`.syncing` → `.idle` on success with `lastSyncedAt` stamped, or `.failed` then rethrow).
+    /// The scheduler serialises these, so a push and pull never overlap.
+    func runSyncOnce() async throws {
+        statusBroadcaster.send(SyncStatus(phase: .syncing, lastSyncedAt: lastSyncedAt))
+        do {
+            try await drainOutbox()
+            try await pullNow()
+        } catch {
+            statusBroadcaster.send(SyncStatus(phase: .failed("\(error)"), lastSyncedAt: lastSyncedAt))
+            throw error
+        }
+        lastSyncedAt = Date()
+        statusBroadcaster.send(SyncStatus(phase: .idle, lastSyncedAt: lastSyncedAt))
     }
 
     /// Records a write in the outbox in the same transaction as the domain write, so the local

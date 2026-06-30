@@ -54,6 +54,13 @@ func backoffDelay(attempts: Int) -> TimeInterval {
     return pow(2.0, Double(max(capped, 1))) // 1→2s, 2→4s, 3→8s … 6→64s
 }
 
+/// How long the scheduler waits before the next automatic sync: the steady-state `pollInterval`
+/// while healthy, or exponential `backoffDelay` once syncs start failing so a flapping network
+/// isn't hammered.
+func nextDelay(consecutiveFailures: Int, pollInterval: TimeInterval) -> TimeInterval {
+    consecutiveFailures == 0 ? pollInterval : backoffDelay(attempts: consecutiveFailures)
+}
+
 /// Orders tables so a parent always precedes its children (Kahn's algorithm over `dependsOn`).
 /// Used to upload parents before children; reverse the result to delete children before parents.
 /// `dependsOn` entries naming tables outside the set are ignored.
