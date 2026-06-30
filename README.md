@@ -23,6 +23,10 @@ required for LWW correctness. Deletes propagate as `deleted_at` tombstones.
 HappySync owns the outbox drain, cursor pull, tombstones, FK ordering, Realtime doorbell,
 status, and retry/backoff. It does **not** own reads or schema.
 
+The full, language-neutral contract every client and the server must honor (server conventions,
+wire semantics, field mapping, and the per-table manifest) lives in
+[docs/SYNC-CONTRACT.md](docs/SYNC-CONTRACT.md).
+
 ## Usage
 
 ```swift
