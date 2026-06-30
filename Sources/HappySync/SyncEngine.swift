@@ -56,6 +56,7 @@ final class StatusBroadcaster: Sendable {
 private struct PendingDelete: Sendable {
     let table: String
     let primaryKey: String
+    let cursorColumn: String
     let pk: String
     let updatedAt: String
 }
@@ -279,7 +280,8 @@ public actor SyncEngine {
             var cursor = try await readCursor(table: spec.name)
             while true {
                 let page = try await remote.fetch(
-                    table: spec.name, since: cursor, primaryKey: spec.primaryKey, limit: pageSize
+                    table: spec.name, cursorColumn: spec.cursorColumn, since: cursor,
+                    primaryKey: spec.primaryKey, limit: pageSize
                 )
                 if page.isEmpty { break }
 
@@ -289,14 +291,16 @@ public actor SyncEngine {
                     var deferred: [PendingDelete] = []
                     for row in page {
                         let pk = row[spec.primaryKey]?.stringValue ?? ""
-                        let updatedAt = row["updated_at"]?.stringValue ?? ""
-                        let tombstoned = !(row["deleted_at"]?.isNil ?? true)
+                        let updatedAt = row[spec.cursorColumn]?.stringValue ?? ""
+                        let tombstoned = !(row["deletedAt"]?.isNil ?? true)
                         if try Self.lwwAllows(
-                            db, table: spec.name, primaryKey: spec.primaryKey, pk: pk, remoteUpdatedAt: updatedAt
+                            db, table: spec.name, cursorColumn: spec.cursorColumn,
+                            primaryKey: spec.primaryKey, pk: pk, remoteUpdatedAt: updatedAt
                         ) {
                             if tombstoned {
                                 deferred.append(PendingDelete(
-                                    table: spec.name, primaryKey: spec.primaryKey, pk: pk, updatedAt: updatedAt
+                                    table: spec.name, primaryKey: spec.primaryKey,
+                                    cursorColumn: spec.cursorColumn, pk: pk, updatedAt: updatedAt
                                 ))
                             } else {
                                 try RowCoding.upsertLocalRow(
@@ -322,7 +326,8 @@ public actor SyncEngine {
             try await db.write { db in
                 // Re-check the gate: a local edit may have arrived between phases.
                 guard try Self.lwwAllows(
-                    db, table: del.table, primaryKey: del.primaryKey, pk: del.pk, remoteUpdatedAt: del.updatedAt
+                    db, table: del.table, cursorColumn: del.cursorColumn,
+                    primaryKey: del.primaryKey, pk: del.pk, remoteUpdatedAt: del.updatedAt
                 ) else { return }
                 try db.execute(
                     sql: "DELETE FROM \"\(del.table)\" WHERE \"\(del.primaryKey)\" = ?",
@@ -336,7 +341,7 @@ public actor SyncEngine {
     /// if the local row isn't dirty (no pending outbox entry — its queued upload wins) and the
     /// remote is strictly newer than the local copy (an absent local row always loses).
     private static func lwwAllows(
-        _ db: Database, table: String, primaryKey: String, pk: String, remoteUpdatedAt: String
+        _ db: Database, table: String, cursorColumn: String, primaryKey: String, pk: String, remoteUpdatedAt: String
     ) throws -> Bool {
         let dirty = try Int.fetchOne(
             db,
@@ -347,7 +352,7 @@ public actor SyncEngine {
 
         guard let local: String = try String.fetchOne(
             db,
-            sql: "SELECT updated_at FROM \"\(table)\" WHERE \"\(primaryKey)\" = ?",
+            sql: "SELECT \"\(cursorColumn)\" FROM \"\(table)\" WHERE \"\(primaryKey)\" = ?",
             arguments: [pk]
         ) else {
             return true // no local row (or never-stamped) → apply
@@ -437,11 +442,11 @@ public actor SyncEngine {
     /// Writes the server-stamped `updated_at` back and clears the entry in one transaction, so the
     /// row is marked clean (its cursor won't re-pull it) only after the server confirms.
     private func stampAndClear(_ entry: OutboxEntry, spec: SyncTable, server: [String: AnyJSON]) async throws {
-        let updatedAt: String? = if case .string(let value) = server["updated_at"] { value } else { nil }
+        let updatedAt: String? = if case .string(let value) = server[spec.cursorColumn] { value } else { nil }
         try await db.write { db in
             if let updatedAt {
                 try db.execute(
-                    sql: "UPDATE \"\(spec.name)\" SET \"updated_at\" = ? WHERE \"\(spec.primaryKey)\" = ?",
+                    sql: "UPDATE \"\(spec.name)\" SET \"\(spec.cursorColumn)\" = ? WHERE \"\(spec.primaryKey)\" = ?",
                     arguments: [updatedAt, entry.pk]
                 )
             }

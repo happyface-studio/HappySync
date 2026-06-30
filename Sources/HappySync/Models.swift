@@ -9,6 +9,10 @@ public struct SyncTable: Sendable, Hashable {
     public let name: String
     /// Primary-key column. Used as the outbox `pk` and the cursor tie-breaker.
     public let primaryKey: String
+    /// Column the download cursor orders, filters, and advances by — the server-stamped change
+    /// time. Defaults to `updatedAt`; an immutable insert-only table overrides it (e.g.
+    /// `recipe_translations` cursors on `translatedAt`, since it has no `updatedAt`).
+    public let cursorColumn: String
     /// Names of tables this one references via foreign keys. Drives sync ordering.
     public let dependsOn: [String]
     /// Columns stored as JSON/JSONB that need encode/decode rather than scalar mapping.
@@ -20,12 +24,14 @@ public struct SyncTable: Sendable, Hashable {
     public init(
         name: String,
         primaryKey: String = "id",
+        cursorColumn: String = "updatedAt",
         dependsOn: [String] = [],
         jsonColumns: [String] = [],
         serverOwnedColumns: [String] = []
     ) {
         self.name = name
         self.primaryKey = primaryKey
+        self.cursorColumn = cursorColumn
         self.dependsOn = dependsOn
         self.jsonColumns = jsonColumns
         self.serverOwnedColumns = serverOwnedColumns
