@@ -446,20 +446,24 @@ public actor SyncEngine {
         let pending = try await db.read { db in
             try OutboxEntry.fetchAll(db, sql: "SELECT * FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 0")
         }
+        // Net each (table, pk) to one op first (APPS-472), then FK-order the net ops.
+        let collapsed = collapseOutbox(pending)
+        let groupSeqs = Dictionary(uniqueKeysWithValues: collapsed.map { ($0.net.seq, $0.seqs) })
         var outcome = DrainOutcome(failed: 0, deadLettered: 0)
-        for entry in orderForUpload(pending, tables: tables) {
+        for entry in orderForUpload(collapsed.map(\.net), tables: tables) {
             // Per-entry exponential backoff: skip an entry still inside its retry window so a failing
             // entry isn't re-attempted on every drain pass (and doorbell ring and poll).
             if let last = entry.lastAttemptAt, now.timeIntervalSince(last) < backoffDelay(attempts: entry.attempts) {
                 continue
             }
+            let seqs = groupSeqs[entry.seq] ?? [entry.seq]
             do {
-                try await process(entry)
+                try await process(entry, clearing: seqs)
             } catch {
                 let attempts = entry.attempts + 1
                 // Permanent (4xx) → park now; transient → park once it exhausts the retry cap.
                 let park = remoteErrorIsPermanent(error) || attempts >= deadLetterAfter
-                try await recordFailure(entry, attempts: attempts, now: now, park: park, error: error)
+                try await recordFailure(entry, groupSeqs: seqs, attempts: attempts, now: now, park: park, error: error)
                 if park { outcome.deadLettered += 1 } else { outcome.failed += 1 }
             }
         }
@@ -467,8 +471,10 @@ public actor SyncEngine {
     }
 
     /// Records a failed upload attempt: bumps `attempts`, stamps `last_attempt_at` (for the backoff
-    /// window) and `last_error` (telemetry), and parks the entry when `park`.
-    private func recordFailure(_ entry: OutboxEntry, attempts: Int, now: Date, park: Bool, error: Error) async throws {
+    /// window) and `last_error` (telemetry) on the net entry. When parking, the **whole collapsed
+    /// group** is dead-lettered together — else a superseded older op (e.g. an orphaned delete)
+    /// could become the net op on a later drain and mis-apply.
+    private func recordFailure(_ entry: OutboxEntry, groupSeqs: [Int64], attempts: Int, now: Date, park: Bool, error: Error) async throws {
         try await db.write { db in
             try db.execute(
                 sql: """
@@ -478,25 +484,37 @@ public actor SyncEngine {
                     """,
                 arguments: [attempts, now, "\(error)", park ? 1 : 0, entry.seq]
             )
+            if park {
+                let others = groupSeqs.filter { $0 != entry.seq }
+                if !others.isEmpty {
+                    let placeholders = others.map { _ in "?" }.joined(separator: ", ")
+                    try db.execute(
+                        sql: "UPDATE \(SyncSchema.outboxTable) SET dead_lettered = 1, last_error = ? WHERE seq IN (\(placeholders))",
+                        arguments: StatementArguments(["\(error)"] as [any DatabaseValueConvertible] + others.map { $0 as any DatabaseValueConvertible })
+                    )
+                }
+            }
         }
     }
 
-    private func process(_ entry: OutboxEntry) async throws {
+    /// Applies one collapsed op (the net op for a `(table, pk)`) and, on success, clears **every**
+    /// `seqs` entry the group collapsed (APPS-472) — not just the net one.
+    private func process(_ entry: OutboxEntry, clearing seqs: [Int64]) async throws {
         guard let spec = tables.first(where: { $0.name == entry.tableName }) else {
-            try await clear(entry) // table no longer synced — drop the stale entry
+            try await clear(seqs) // table no longer synced — drop the stale entries
             return
         }
         switch entry.op {
         case .upsert:
             guard let payload = try await readPayload(spec: spec, pk: entry.pk) else {
-                try await clear(entry) // row gone locally before upload — nothing to send
+                try await clear(seqs) // row gone locally before upload — nothing to send
                 return
             }
             let server = try await remote.upsert(table: spec.name, row: payload)
-            try await stampAndClear(entry, spec: spec, server: server)
+            try await stampAndClear(entry, spec: spec, server: server, seqs: seqs)
         case .delete:
             try await remote.delete(table: spec.name, primaryKey: spec.primaryKey, pk: entry.pk)
-            try await clear(entry)
+            try await clear(seqs)
         }
     }
 
@@ -515,9 +533,10 @@ public actor SyncEngine {
         }
     }
 
-    /// Writes the server-stamped `updated_at` back and clears the entry in one transaction, so the
-    /// row is marked clean (its cursor won't re-pull it) only after the server confirms.
-    private func stampAndClear(_ entry: OutboxEntry, spec: SyncTable, server: [String: AnyJSON]) async throws {
+    /// Writes the server-stamped `updated_at` back and clears the collapsed group's entries in one
+    /// transaction, so the row is marked clean (its cursor won't re-pull it) only after the server
+    /// confirms.
+    private func stampAndClear(_ entry: OutboxEntry, spec: SyncTable, server: [String: AnyJSON], seqs: [Int64]) async throws {
         let updatedAt: String? = if case .string(let value) = server[spec.cursorColumn] { value } else { nil }
         try await db.write { db in
             if let updatedAt {
@@ -526,19 +545,20 @@ public actor SyncEngine {
                     arguments: [updatedAt, entry.pk]
                 )
             }
-            try db.execute(
-                sql: "DELETE FROM \(SyncSchema.outboxTable) WHERE seq = ?",
-                arguments: [entry.seq]
-            )
+            try Self.deleteEntries(db, seqs: seqs)
         }
     }
 
-    private func clear(_ entry: OutboxEntry) async throws {
-        try await db.write { db in
-            try db.execute(
-                sql: "DELETE FROM \(SyncSchema.outboxTable) WHERE seq = ?",
-                arguments: [entry.seq]
-            )
-        }
+    private func clear(_ seqs: [Int64]) async throws {
+        try await db.write { db in try Self.deleteEntries(db, seqs: seqs) }
+    }
+
+    private static func deleteEntries(_ db: Database, seqs: [Int64]) throws {
+        guard !seqs.isEmpty else { return }
+        let placeholders = seqs.map { _ in "?" }.joined(separator: ", ")
+        try db.execute(
+            sql: "DELETE FROM \(SyncSchema.outboxTable) WHERE seq IN (\(placeholders))",
+            arguments: StatementArguments(seqs)
+        )
     }
 }
