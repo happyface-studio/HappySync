@@ -271,6 +271,10 @@ public actor SyncEngine {
     /// Records a write in the outbox in the same transaction as the domain write, so the local
     /// store and the pending-upload queue can never disagree. An `.upsert` writes the row to its
     /// table; a `.delete` removes it locally (the tombstone is propagated to the server on drain).
+    ///
+    /// Supported row value types: `String`, numbers, `Bool`, `Date` (encoded as canonical ISO-8601,
+    /// APPS-475), `null`, and — for columns declared in `jsonColumns` — nested objects/arrays.
+    /// `Data`/blob fields are **not** supported and throw `SyncError.encoding`.
     public func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws {
         guard let spec = tables.first(where: { $0.name == table }) else {
             throw SyncError.unknownTable(table)
