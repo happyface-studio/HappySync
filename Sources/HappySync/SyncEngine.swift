@@ -77,6 +77,9 @@ public actor SyncEngine {
     private let doorbell: any SyncDoorbell
     private let pollInterval: TimeInterval
     private let debounceInterval: TimeInterval
+    /// Resolves the current user's download-partition value (auth uid) for tables that declare a
+    /// `scopeColumn`, or nil when signed out. Called per pull so a user switch re-scopes (APPS-469).
+    private let scope: @Sendable () async -> String?
 
     private nonisolated let statusBroadcaster: StatusBroadcaster
     private var isRunning = false
@@ -97,17 +100,26 @@ public actor SyncEngine {
     ///   - supabase: Supabase client for PostgREST upsert/pull and the Realtime doorbell.
     ///   - tables: Synced tables in any order; the engine sorts them by `dependsOn`.
     ///   - auth: Returns a fresh Supabase access token, called before each authenticated batch.
+    ///   - scope: Resolves the current user's download-partition value (auth uid) for tables that
+    ///     declare a `scopeColumn`. Defaults to `nil` (no partition beyond RLS). Called per pull, so
+    ///     a signed-in user change re-scopes without re-declaring tables. See APPS-469.
     public init(
         db: any DatabaseWriter,
         supabase: SupabaseClient,
         tables: [SyncTable],
-        auth: @escaping @Sendable () async -> String
+        auth: @escaping @Sendable () async -> String,
+        scope: @escaping @Sendable () async -> String? = { nil }
     ) throws {
         try self.init(
             db: db,
             remote: SupabaseRemote(client: supabase, auth: auth),
             tables: tables,
-            doorbell: SupabaseDoorbell(client: supabase, tables: tables.map(\.name))
+            doorbell: SupabaseDoorbell(
+                client: supabase,
+                tables: tables.map { ($0.name, $0.scopeColumn) },
+                scope: scope
+            ),
+            scope: scope
         )
     }
 
@@ -121,7 +133,8 @@ public actor SyncEngine {
         pageSize: Int = 500,
         doorbell: any SyncDoorbell = SilentDoorbell(),
         pollInterval: TimeInterval = 30,
-        debounceInterval: TimeInterval = 0.3
+        debounceInterval: TimeInterval = 0.3,
+        scope: @escaping @Sendable () async -> String? = { nil }
     ) throws {
         self.db = db
         self.remote = remote
@@ -130,6 +143,7 @@ public actor SyncEngine {
         self.doorbell = doorbell
         self.pollInterval = pollInterval
         self.debounceInterval = debounceInterval
+        self.scope = scope
         self.statusBroadcaster = StatusBroadcaster(initial: SyncStatus())
 
         try SyncSchema.migrator().migrate(db)
@@ -277,11 +291,19 @@ public actor SyncEngine {
 
         for tableName in order {
             guard let spec = tables.first(where: { $0.name == tableName }) else { continue }
+            var scopeFilter: ScopeFilter?
+            if let scopeColumn = spec.scopeColumn {
+                // Scoped table: resolve the partition value for the signed-in user. Signed out (nil)
+                // → skip the table this pass rather than pull it unfiltered (which would download the
+                // whole public catalog); the periodic loop retries once a value is available.
+                guard let value = await scope() else { continue }
+                scopeFilter = ScopeFilter(column: scopeColumn, value: value)
+            }
             var cursor = try await readCursor(table: spec.name)
             while true {
                 let page = try await remote.fetch(
                     table: spec.name, cursorColumn: spec.cursorColumn, since: cursor,
-                    primaryKey: spec.primaryKey, limit: pageSize
+                    primaryKey: spec.primaryKey, scope: scopeFilter, limit: pageSize
                 )
                 if page.isEmpty { break }
 

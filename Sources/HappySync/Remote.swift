@@ -1,6 +1,14 @@
 import Foundation
 import Supabase
 
+/// A resolved partition filter applied to a download alongside the cursor: `column = value`. The
+/// value is the current user's partition key (e.g. the Supabase auth uid), resolved per pull — so
+/// signing in as a different user re-scopes without re-declaring tables. See APPS-469.
+struct ScopeFilter: Sendable, Equatable {
+    let column: String
+    let value: String
+}
+
 /// The server side of the upload path. Abstracted behind a protocol so the drain can be unit-tested
 /// with a fake that records call order and simulates failures — the production conformance is the
 /// only place that touches the network.
@@ -12,8 +20,9 @@ protocol SyncRemote: Sendable {
     func delete(table: String, primaryKey: String, pk: String) async throws
     /// Fetches up to `limit` rows changed since `cursor`, ordered by the `(cursorColumn, id)` tuple
     /// so the caller can resume exactly where it left off. Tombstoned rows (`deletedAt != null`)
-    /// are included.
-    func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, limit: Int) async throws -> [[String: AnyJSON]]
+    /// are included. When `scope` is set, only rows matching `scope.column = scope.value` are
+    /// returned (the download partition — orthogonal to the cursor).
+    func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]]
 }
 
 /// `SyncRemote` over a Supabase PostgREST client. Idempotent by primary key, so the drain can
@@ -47,9 +56,13 @@ struct SupabaseRemote: SyncRemote {
             .execute()
     }
 
-    func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, limit: Int) async throws -> [[String: AnyJSON]] {
+    func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] {
         let token = await auth()
         var query = client.from(table).select()
+        if let scope {
+            // Partition filter, AND-ed with the cursor below (PostgREST ANDs top-level filters).
+            query = query.eq(scope.column, value: scope.value)
+        }
         if let cursor {
             // (cursorColumn, id) > (cursor.updatedAt, cursor.id), as a PostgREST or-filter.
             query = query.or(

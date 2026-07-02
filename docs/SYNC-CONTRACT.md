@@ -21,8 +21,14 @@ Per synced table:
   removing the row — so deletions propagate on the next cursor pull. Deleting a parent must
   **tombstone its children too** (don't hard-`ON DELETE CASCADE`); a server trigger is the clean
   way. Purge old tombstones server-side on a schedule.
-- **RLS scoped to `auth.uid()`** — every row read/written is filtered to the owning user. The
-  download query carries no user filter of its own; RLS enforces the partition.
+- **RLS scoped to `auth.uid()`** — every row read/written is filtered by RLS: it is the **security
+  boundary**. It is *not* necessarily the **sync partition**. RLS may legitimately be broader than
+  what a device should download: CookThis's `recipes` SELECT policy is `isPublic = true OR userId =
+  auth.uid()`, so an unfiltered pull would download the entire public catalog to every device. When
+  RLS is broader than the partition, the table declares a `scopeColumn` (§5) and the engine filters
+  the download (and the Realtime doorbell) to `scopeColumn = <the user's partition value>`. Leave
+  `scopeColumn` unset only when RLS already scopes the table to exactly the synced partition. See
+  APPS-469.
 - **Realtime publication** — the table is in `supabase_realtime`. Realtime is a **doorbell only**:
   an event triggers a debounced `pullNow()`; payloads are never applied directly.
 - **Server-owned columns are never written by clients** — RPC-managed values (counters, clone
@@ -43,7 +49,9 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
 
 ## 3. Download (cursor pull → local, LWW)
 
-- Per table: `SELECT * WHERE updatedAt > :cursor ORDER BY (updatedAt, id)`, RLS-scoped.
+- Per table: `SELECT * WHERE updatedAt > :cursor [AND scopeColumn = :partition] ORDER BY
+  (updatedAt, id)`, RLS-scoped. The `scopeColumn` predicate is added only for tables that declare
+  one (§1, §5); it is orthogonal to the `(updatedAt, id)` cursor.
 - **Tuple cursor `(updatedAt, id)`** — not a bare timestamp — so rows sharing a millisecond at a
   page boundary aren't dropped. Advance it past the last applied row.
 - **LWW apply:** apply a remote row only if `remote.updatedAt > local.updatedAt` **and** the local
@@ -74,6 +82,9 @@ declares the same shape):
 - `dependsOn` — tables referenced by FK; drives sync ordering
 - `jsonColumns` — columns needing JSON encode/decode
 - `serverOwnedColumns` — RPC-managed columns stripped from upserts
+- `scopeColumn` — partition column (e.g. `userId`) when RLS is broader than the sync partition;
+  the engine filters downloads + the doorbell to `scopeColumn = <partition value>` (§1). Omit when
+  RLS already scopes the table to exactly the partition.
 
 ---
 
@@ -99,8 +110,25 @@ update trigger needed; cursor on `translatedAt`. ² `cookedCount` is RPC-managed
 (`rpcIncrementCookedCount`) — it must never be in an upsert payload. Verify whether `recipes`
 carries any server-owned counter (clone/cook counts) before cutover.
 
-Already satisfied server-side: RLS-per-user on all 9, `supabase_realtime` publication covers all 9,
-denormalized `userId` partition key on the recipe-child tables (COOK-328), uuid PKs.
+Already satisfied server-side: `supabase_realtime` publication covers all 9, denormalized `userId`
+partition key on the recipe-child tables (COOK-328), uuid PKs.
+
+**RLS ≠ partition (APPS-469).** RLS scopes reads/writes on all 9, but on 5 tables it is *broader*
+than the sync partition, so those must declare a `scopeColumn` or the engine downloads the whole
+public catalog to every device:
+
+| table | RLS SELECT policy | `scopeColumn` |
+|---|---|---|
+| `recipes` | `isPublic = true OR userId = auth.uid()` | `userId` |
+| `recipeIngredients` | readable with parent recipe | `userId`¹ |
+| `recipeSteps` | readable with parent recipe | `userId`¹ |
+| `recipeStepIngredients` | readable with parent recipe | `userId`¹ |
+| `recipe_translations` | readable with parent recipe | `userId`¹ |
+| `profiles`, `cookingSessions`, `mealPlans`, `userRecipeInteractions` | `userId`/`id = auth.uid()` — RLS already equals the partition | — (omit) |
+
+¹ Uses the denormalized `userId` partition column added in COOK-328. Consumer-side adoption
+(declaring these `scopeColumn`s in CookThis's `SyncTable` list + supplying the `scope` uid closure)
+is ticketed in "Cook This - Release Ready".
 
 ---
 

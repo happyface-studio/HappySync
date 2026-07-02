@@ -20,6 +20,14 @@ public struct SyncTable: Sendable, Hashable {
     /// Columns the server owns (e.g. RPC-managed counters) — stripped from every upsert so a
     /// stale client value never clobbers the authoritative one. They still arrive on download.
     public let serverOwnedColumns: [String]
+    /// Optional partition column scoping downloads to the current user (e.g. `userId`). When set,
+    /// the engine filters both the cursor pull and the Realtime doorbell to `column = <partition
+    /// value>`, where the value is resolved per signed-in user at pull time (see the engine's
+    /// `scope` closure). Leave `nil` when RLS already scopes the table to exactly the synced
+    /// partition; set it when RLS is deliberately broader than the partition — CookThis's `recipes`
+    /// policy is `isPublic = true OR userId = auth.uid()`, so an unfiltered pull would download the
+    /// whole public catalog to every device. See APPS-469 / contract §1.
+    public let scopeColumn: String?
 
     public init(
         name: String,
@@ -27,7 +35,8 @@ public struct SyncTable: Sendable, Hashable {
         cursorColumn: String = "updatedAt",
         dependsOn: [String] = [],
         jsonColumns: [String] = [],
-        serverOwnedColumns: [String] = []
+        serverOwnedColumns: [String] = [],
+        scopeColumn: String? = nil
     ) {
         self.name = name
         self.primaryKey = primaryKey
@@ -35,6 +44,7 @@ public struct SyncTable: Sendable, Hashable {
         self.dependsOn = dependsOn
         self.jsonColumns = jsonColumns
         self.serverOwnedColumns = serverOwnedColumns
+        self.scopeColumn = scopeColumn
     }
 }
 

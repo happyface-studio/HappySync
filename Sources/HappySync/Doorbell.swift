@@ -24,15 +24,32 @@ struct SilentDoorbell: SyncDoorbell {
 /// a dropped socket re-subscribes itself; the engine's periodic pull covers any gap meanwhile.
 struct SupabaseDoorbell: SyncDoorbell {
     let client: SupabaseClient
-    let tables: [String]
+    /// One entry per synced table, carrying its optional partition-scope column (APPS-469). The
+    /// scope *value* (uid) is resolved once per `ring()` via `scope`, not baked in here.
+    let tables: [(name: String, scopeColumn: String?)]
+    /// Resolves the current user's partition value (auth uid), or nil when signed out.
+    let scope: @Sendable () async -> String?
 
     func ring() -> AsyncStream<Void> {
         AsyncStream { continuation in
             let task = Task {
+                let uid = await scope()
                 let channel = client.realtimeV2.channel("happysync")
                 // Listeners must be registered before subscribe(); any change rings the doorbell.
-                let streams = tables.map {
-                    channel.postgresChange(AnyAction.self, schema: "public", table: $0)
+                var streams: [AsyncStream<AnyAction>] = []
+                for table in tables {
+                    if let column = table.scopeColumn {
+                        // Scoped table: only ring for the user's own rows. Signed out → skip it (the
+                        // periodic pull still converges). Subscribing unfiltered would ring on every
+                        // public-catalog change and hammer the pull — the churn APPS-469 fixes.
+                        guard let uid else { continue }
+                        streams.append(channel.postgresChange(
+                            AnyAction.self, schema: "public", table: table.name,
+                            filter: Self.changeFilter(column: column, value: uid)
+                        ))
+                    } else {
+                        streams.append(channel.postgresChange(AnyAction.self, schema: "public", table: table.name))
+                    }
                 }
                 await channel.subscribe()
                 await withTaskGroup(of: Void.self) { group in
@@ -44,4 +61,7 @@ struct SupabaseDoorbell: SyncDoorbell {
             continuation.onTermination = { _ in task.cancel() }
         }
     }
+
+    /// PostgREST-style Realtime filter for a scoped table: `column=eq.value`.
+    static func changeFilter(column: String, value: String) -> String { "\(column)=eq.\(value)" }
 }

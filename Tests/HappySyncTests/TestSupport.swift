@@ -11,6 +11,9 @@ actor FakeRemote: SyncRemote {
     private(set) var upsertCalls: [(table: String, row: [String: AnyJSON])] = []
     private(set) var deleteCalls: [(table: String, pk: String)] = []
     private(set) var fetchCalls = 0
+    /// The scope passed to the most recent `fetch` — lets a test assert the engine forwarded the
+    /// resolved partition filter (APPS-469).
+    private(set) var lastScope: ScopeFilter?
     private var remainingFailures: Int
     private var remainingFetchFailures: Int
     private let dataset: [String: [[String: AnyJSON]]]
@@ -35,10 +38,15 @@ actor FakeRemote: SyncRemote {
         deleteCalls.append((table, pk))
     }
 
-    func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, limit: Int) async throws -> [[String: AnyJSON]] {
+    func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] {
         fetchCalls += 1
+        lastScope = scope
         if remainingFetchFailures > 0 { remainingFetchFailures -= 1; throw Failure.simulated }
-        let sorted = (dataset[table] ?? []).sorted { tuple($0, cursorColumn, primaryKey) < tuple($1, cursorColumn, primaryKey) }
+        let scoped = (dataset[table] ?? []).filter { row in
+            guard let scope else { return true }
+            return row[scope.column]?.stringValue == scope.value
+        }
+        let sorted = scoped.sorted { tuple($0, cursorColumn, primaryKey) < tuple($1, cursorColumn, primaryKey) }
         let filtered: [[String: AnyJSON]]
         if let cursor {
             filtered = sorted.filter { tuple($0, cursorColumn, primaryKey) > (cursor.updatedAt, cursor.id) }
@@ -67,8 +75,13 @@ final class FakeDoorbell: SyncDoorbell, @unchecked Sendable {
 
 /// Engine over a caller-supplied DB (and, by default, a no-op `FakeRemote`) so tests can
 /// pre-create domain tables and only wire a dataset/failure remote when they exercise sync.
-func makeEngine(db: any DatabaseWriter, tables: [SyncTable], remote: any SyncRemote = FakeRemote()) throws -> SyncEngine {
-    try SyncEngine(db: db, remote: remote, tables: tables)
+func makeEngine(
+    db: any DatabaseWriter,
+    tables: [SyncTable],
+    remote: any SyncRemote = FakeRemote(),
+    scope: @escaping @Sendable () async -> String? = { nil }
+) throws -> SyncEngine {
+    try SyncEngine(db: db, remote: remote, tables: tables, scope: scope)
 }
 
 /// A DB with one `recipes` domain table (id, title, updated_at) plus HappySync's internal tables.
