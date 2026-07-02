@@ -50,8 +50,35 @@ try await engine.enqueue(.upsert, table: "recipes", row: recipe)
 try await engine.pullNow()
 
 for await status in engine.status {
-    // drive sync-status UI: .idle / .syncing / .failed
+    // drive sync-status UI: .idle / .syncing / .failed.
+    // Health is `phase == .idle && failedUploads == 0 && deadLetters == 0` — an idle status can
+    // still carry failing/parked uploads (APPS-470).
 }
+```
+
+For a table whose RLS is broader than the sync partition (e.g. a shared `recipes` table readable as
+`isPublic OR userId = auth.uid()`), declare a `scopeColumn` and supply the partition value so the
+engine downloads only the user's rows instead of the whole catalog:
+
+```swift
+SyncTable(name: "recipes", jsonColumns: ["nutrition"], scopeColumn: "userId")
+// …and on the engine:
+SyncEngine(db:, supabase:, tables:, auth: { await session.accessToken },
+           scope: { await session.user?.id.uuidString })
+```
+
+## Teardown
+
+`stop()` is **async and awaits the in-flight sync pass** before returning — after it returns the
+engine has quiesced (no further DB writes, no network calls). A consumer that wipes or replaces the
+database on sign-out / account switch **must `await engine.stop()` before touching the database
+file**, or an in-flight pass could write to the store you're about to delete (and, mid-account-
+switch, upload the old user's rows with the new user's token). `stop()` also unsubscribes the
+Realtime channel; `start()` re-subscribes cleanly.
+
+```swift
+await engine.stop()   // engine is quiesced here
+try await wipeLocalDatabase()
 ```
 
 ## Requirements

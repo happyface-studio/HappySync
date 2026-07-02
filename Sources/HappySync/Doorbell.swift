@@ -32,9 +32,12 @@ struct SupabaseDoorbell: SyncDoorbell {
 
     func ring() -> AsyncStream<Void> {
         AsyncStream { continuation in
+            // Create the channel here (synchronous) so `onTermination` can tear it down — otherwise
+            // the socket keeps the `happysync` channel joined until the process exits, and repeated
+            // start/stop cycles leak a channel each time (APPS-473).
+            let channel = client.realtimeV2.channel("happysync")
             let task = Task {
                 let uid = await scope()
-                let channel = client.realtimeV2.channel("happysync")
                 // Listeners must be registered before subscribe(); any change rings the doorbell.
                 var streams: [AsyncStream<AnyAction>] = []
                 for table in tables {
@@ -58,7 +61,13 @@ struct SupabaseDoorbell: SyncDoorbell {
                     }
                 }
             }
-            continuation.onTermination = { _ in task.cancel() }
+            // On teardown, cancel the listener AND unsubscribe/remove the channel so the socket
+            // doesn't keep it joined. Cleanup runs in a fresh (uncancelled) task so the async
+            // unsubscribe actually completes. A later `ring()` builds a clean channel from scratch.
+            continuation.onTermination = { [client] _ in
+                task.cancel()
+                Task { await channel.unsubscribe(); await client.realtimeV2.removeChannel(channel) }
+            }
         }
     }
 

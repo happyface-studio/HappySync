@@ -88,7 +88,12 @@ public actor SyncEngine {
     private var isRunning = false
     private var lastSyncedAt: Date?
     private var consecutiveFailures = 0
-    private var loopTask: Task<Void, Never>?
+    /// The serialized runner consuming the wake stream. Kept separate from the trigger loops so
+    /// `stop()` can let the in-flight pass finish gracefully (finish the wake stream, don't cancel)
+    /// while cancelling the triggers (APPS-473).
+    private var runnerTask: Task<Void, Never>?
+    /// The doorbell + periodic loops that poke the runner. Cancelled on `stop()`.
+    private var triggersTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
     private var wake: AsyncStream<Void>.Continuation?
 
@@ -167,10 +172,14 @@ public actor SyncEngine {
         wake = continuation
         // ponytail: the running subtasks hold `self` for the engine's lifetime; `stop()` is the
         // teardown that cancels them. Fine for an app-lifetime engine, revisit if it must be GC'd live.
-        loopTask = Task { [weak self] in
+        // The runner is its own task (not in the trigger group) so `stop()` can drain it gracefully.
+        runnerTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runLoop(stream)
+        }
+        triggersTask = Task { [weak self] in
             guard let self else { return }
             await withTaskGroup(of: Void.self) { group in
-                group.addTask { await self.runLoop(stream) }
                 group.addTask { await self.doorbellLoop() }
                 group.addTask { await self.periodicLoop() }
             }
@@ -178,12 +187,19 @@ public actor SyncEngine {
         poke() // converge immediately on start
     }
 
-    /// Stops background sync and finishes all status streams.
-    public func stop() {
+    /// Stops background sync and finishes all status streams. **Awaits the in-flight sync pass**
+    /// before returning: after `await stop()` the engine has quiesced — no further DB writes and no
+    /// network calls — so a consumer can safely wipe or repurpose the database (e.g. on sign-out /
+    /// account switch). Idempotent. See APPS-473 and the README teardown section.
+    public func stop() async {
+        guard isRunning else { return }
         isRunning = false
-        loopTask?.cancel(); loopTask = nil
+        wake?.finish(); wake = nil            // no more passes enqueued; runner exits after the current one
+        triggersTask?.cancel()                // stop the doorbell + periodic loops from poking
         debounceTask?.cancel(); debounceTask = nil
-        wake?.finish(); wake = nil
+        await runnerTask?.value               // await the in-flight pass to finish (uncancelled → completes)
+        await triggersTask?.value             // and the trigger loops (incl. doorbell channel teardown) to unwind
+        runnerTask = nil; triggersTask = nil
         statusBroadcaster.finish()
     }
 

@@ -77,6 +77,45 @@ actor FakeRemote: SyncRemote {
     }
 }
 
+/// A one-shot async signal: `wait()` suspends until someone calls `fire()` (idempotent). Lets a
+/// test rendezvous with background work without polling — e.g. block a fetch mid-pass (APPS-473).
+actor Signal {
+    private var fired = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Non-blocking peek — has `fire()` been called yet?
+    var isFired: Bool { fired }
+
+    func fire() {
+        guard !fired else { return }
+        fired = true
+        for waiter in waiters { waiter.resume() }
+        waiters.removeAll()
+    }
+
+    func wait() async {
+        if fired { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+/// A `SyncRemote` whose `fetch` announces it has started, then blocks on `gate` until the test
+/// releases it — so a test can hold a sync pass in-flight while it exercises `stop()` (APPS-473).
+struct GatedRemote: SyncRemote {
+    let started: Signal
+    let gate: Signal
+    let dataset: [String: [[String: AnyJSON]]]
+
+    func upsert(table: String, row: [String: AnyJSON]) async throws -> [String: AnyJSON] { row }
+    func delete(table: String, primaryKey: String, pk: String) async throws {}
+
+    func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] {
+        await started.fire()
+        await gate.wait()
+        return dataset[table] ?? []
+    }
+}
+
 /// A `SyncDoorbell` test double: each `fire()` rings the doorbell, simulating a Realtime change
 /// event. Backed by a single stream the engine consumes; the continuation is `Sendable`, so the
 /// class is safe to poke from a test without an actor hop.
