@@ -108,10 +108,9 @@ struct SupabaseRemote: SyncRemote {
             query = query.eq(scope.column, value: scope.value)
         }
         if let cursor {
-            // (cursorColumn, id) > (cursor.updatedAt, cursor.id), as a PostgREST or-filter.
-            query = query.or(
-                "\(cursorColumn).gt.\(cursor.updatedAt),and(\(cursorColumn).eq.\(cursor.updatedAt),\(primaryKey).gt.\(cursor.id))"
-            )
+            // (cursorColumn, id) > (cursor.updatedAt, cursor.id), as a PostgREST or-filter with the
+            // values double-quoted so reserved characters can't corrupt the grammar (APPS-474).
+            query = query.or(Self.cursorFilter(cursorColumn: cursorColumn, primaryKey: primaryKey, cursor: cursor))
         }
         return try await query
             .order(cursorColumn, ascending: true)
@@ -122,11 +121,27 @@ struct SupabaseRemote: SyncRemote {
             .value
     }
 
+    /// Builds the tuple-cursor PostgREST `or=` filter `(cursorColumn, id) > (updatedAt, id)`, with
+    /// the cursor values **double-quoted** so reserved characters (`,` `(` `)` `.`) or a `+` in a
+    /// timestamp/pk can't corrupt the filter grammar or be mis-decoded (APPS-474). Pure + internal
+    /// so the encoding is regression-tested without a live PostgREST.
+    static func cursorFilter(cursorColumn: String, primaryKey: String, cursor: SyncCursor) -> String {
+        let ts = quote(cursor.updatedAt)
+        let id = quote(cursor.id)
+        return "\(cursorColumn).gt.\(ts),and(\(cursorColumn).eq.\(ts),\(primaryKey).gt.\(id))"
+    }
+
+    /// PostgREST protects a filter value with double quotes; inside, `\` and `"` are backslash-escaped.
+    static func quote(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
+    }
+
     /// ISO-8601 with fractional seconds — the contract's canonical timestamp format. Used only for
     /// the client-set `deletedAt` marker; row ordering trusts the server-stamped `updatedAt`, not this.
     private static func nowISO8601() -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: Date())
+        SyncTimestamp.string(from: Date())
     }
 }

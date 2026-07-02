@@ -406,7 +406,11 @@ public actor SyncEngine {
         ) else {
             return true // no local row (or never-stamped) → apply
         }
-        return remoteUpdatedAt > local // ISO-8601 UTC sorts lexicographically
+        // Canonicalize both sides to one format before the lexicographic compare: PostgREST
+        // (`…+00:00`, microseconds), client (`…123Z`), and non-fractional legacy strings otherwise
+        // sort inconsistently (e.g. a fractional remote vs a non-fractional local of the same
+        // second). Same-format canonical strings sort chronologically (APPS-474).
+        return SyncTimestamp.canonicalize(remoteUpdatedAt) > SyncTimestamp.canonicalize(local)
     }
 
     private func readCursor(table: String) async throws -> SyncCursor? {

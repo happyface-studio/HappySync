@@ -73,7 +73,7 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
 | Concern | Convention |
 |---|---|
 | Column names | **camelCase, identical** in local SQLite and Postgres — no snake_case mapping layer. |
-| Dates | ISO-8601 **with fractional seconds** (`.withInternetDateTime, .withFractionalSeconds`); fall back to non-fractional on read for legacy rows. |
+| Dates | ISO-8601 **with fractional seconds** (`.withInternetDateTime, .withFractionalSeconds`); fall back to non-fractional on read for legacy rows. This is the **canonical** form: the LWW gate canonicalizes both sides (PostgREST `…+00:00`/microseconds, client `…Z`, legacy non-fractional) to it before the lexicographic compare, so mixed formats/zones still order chronologically (APPS-474). Codable `Date`s encode to it too (APPS-475). |
 | UUID | stored as text locally. |
 | Bool | integer `0/1` locally ↔ `boolean` in Postgres. |
 | Enum | `rawValue` string. |
