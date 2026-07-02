@@ -6,6 +6,8 @@ enum SyncSchema {
     static let outboxTable = "_sync_outbox"
     /// One row per synced table, holding the last applied `(updated_at, id)` cursor (APPS-414).
     static let stateTable = "_sync_state"
+    /// Key/value engine metadata (e.g. `last_synced_at` for the stale-cursor resync, APPS-471).
+    static let metaTable = "_sync_meta"
 
     /// A standalone migrator for HappySync's internal tables. Used when the engine owns the DB.
     static func migrator() -> DatabaseMigrator {
@@ -44,6 +46,15 @@ enum SyncSchema {
                 t.add(column: "last_attempt_at", .datetime)
                 t.add(column: "last_error", .text)
                 t.add(column: "dead_lettered", .integer).notNull().defaults(to: 0)
+            }
+        }
+
+        // APPS-471: durable engine metadata. `last_synced_at` lets the engine detect a device that
+        // has been offline past the server's tombstone-purge horizon and full-resync on reconnect.
+        migrator.registerMigration("happysync_v3_meta") { db in
+            try db.create(table: metaTable) { t in
+                t.column("key", .text).notNull().primaryKey()
+                t.column("value", .text).notNull()
             }
         }
     }

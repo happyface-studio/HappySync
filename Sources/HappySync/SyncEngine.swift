@@ -83,6 +83,14 @@ public actor SyncEngine {
     /// After this many failed upload attempts a transient entry is dead-lettered (parked). A
     /// permanent (4xx) failure parks immediately regardless. See APPS-470.
     private let deadLetterAfter: Int
+    /// If this device hasn't successfully synced within this window, its cursor may point past
+    /// tombstones the server has since purged — so the first sync full-resyncs and reconciles
+    /// instead of trusting the stale cursor. **Must be ≤ the server's tombstone-purge retention**
+    /// (CookThis purges at 90 days). See APPS-471 / contract §1.
+    private let maxOfflineGap: TimeInterval
+    /// Whether the once-per-process stale-cursor check has run (successfully). Gated so the DB read
+    /// only happens on the first pass, not every poke.
+    private var didResyncCheck = false
 
     private nonisolated let statusBroadcaster: StatusBroadcaster
     private var isRunning = false
@@ -111,12 +119,16 @@ public actor SyncEngine {
     ///   - scope: Resolves the current user's download-partition value (auth uid) for tables that
     ///     declare a `scopeColumn`. Defaults to `nil` (no partition beyond RLS). Called per pull, so
     ///     a signed-in user change re-scopes without re-declaring tables. See APPS-469.
+    ///   - maxOfflineGap: If the device hasn't synced within this window, the first sync full-resyncs
+    ///     to reconcile against purged tombstones. **Must be ≤ the server's tombstone-purge
+    ///     retention.** Defaults to 30 days. See APPS-471.
     public init(
         db: any DatabaseWriter,
         supabase: SupabaseClient,
         tables: [SyncTable],
         auth: @escaping @Sendable () async -> String,
-        scope: @escaping @Sendable () async -> String? = { nil }
+        scope: @escaping @Sendable () async -> String? = { nil },
+        maxOfflineGap: TimeInterval = 30 * 24 * 3600
     ) throws {
         try self.init(
             db: db,
@@ -127,7 +139,8 @@ public actor SyncEngine {
                 tables: tables.map { ($0.name, $0.scopeColumn) },
                 scope: scope
             ),
-            scope: scope
+            scope: scope,
+            maxOfflineGap: maxOfflineGap
         )
     }
 
@@ -143,7 +156,8 @@ public actor SyncEngine {
         pollInterval: TimeInterval = 30,
         debounceInterval: TimeInterval = 0.3,
         scope: @escaping @Sendable () async -> String? = { nil },
-        deadLetterAfter: Int = 8
+        deadLetterAfter: Int = 8,
+        maxOfflineGap: TimeInterval = 30 * 24 * 3600
     ) throws {
         self.db = db
         self.remote = remote
@@ -154,6 +168,7 @@ public actor SyncEngine {
         self.debounceInterval = debounceInterval
         self.scope = scope
         self.deadLetterAfter = deadLetterAfter
+        self.maxOfflineGap = maxOfflineGap
         self.statusBroadcaster = StatusBroadcaster(initial: SyncStatus())
 
         try SyncSchema.migrator().migrate(db)
@@ -267,6 +282,13 @@ public actor SyncEngine {
         statusBroadcaster.send(SyncStatus(phase: .syncing, lastSyncedAt: lastSyncedAt))
         let outcome: DrainOutcome
         do {
+            // Once per process: if this device is past the offline horizon, full-resync before the
+            // normal push/pull so a stale cursor can't skip purged tombstones (APPS-471). Gated so a
+            // transient failure here re-checks next pass (lastSyncedAt only advances on full success).
+            if !didResyncCheck {
+                try await resyncIfStale()
+                didResyncCheck = true
+            }
             outcome = try await drainOutbox()
             try await pullNow()
         } catch {
@@ -274,6 +296,7 @@ public actor SyncEngine {
             throw error
         }
         lastSyncedAt = Date()
+        try await writeLastSyncedAt(lastSyncedAt!)
         let deadLetters = try await db.read { db in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 1") ?? 0
         }
@@ -326,9 +349,15 @@ public actor SyncEngine {
     /// tombstones are deferred and applied children-first (so a parent is never deleted out from
     /// under a child). Each page's applies + cursor-advance happen in one transaction; pages are
     /// pulled until one comes back short.
-    public func pullNow() async throws {
+    /// Returns the set of primary keys each table's fetch returned this pull. On a full pull (cursors
+    /// cleared, as the stale-cursor resync does) that's every pk the server currently holds — the
+    /// input the resync reconcile diffs against local rows (APPS-471). On an incremental pull it's
+    /// just the changed pks, which the normal path ignores.
+    @discardableResult
+    public func pullNow() async throws -> [String: Set<String>] {
         let order = topologicalOrder(tables)
         var pendingDeletes: [PendingDelete] = []
+        var seenPks: [String: Set<String>] = [:]
 
         for tableName in order {
             guard let spec = tables.first(where: { $0.name == tableName }) else { continue }
@@ -347,6 +376,10 @@ public actor SyncEngine {
                     primaryKey: spec.primaryKey, scope: scopeFilter, limit: pageSize
                 )
                 if page.isEmpty { break }
+
+                for row in page where !(row[spec.primaryKey]?.stringValue ?? "").isEmpty {
+                    seenPks[spec.name, default: []].insert(row[spec.primaryKey]!.stringValue!)
+                }
 
                 let pageCursor = cursor // immutable copy for the Sendable write closure
                 let (advanced, deletes) = try await db.write { db -> (SyncCursor?, [PendingDelete]) in
@@ -397,6 +430,66 @@ public actor SyncEngine {
                     arguments: [del.pk]
                 )
             }
+        }
+        return seenPks
+    }
+
+    /// Full-resyncs when this device has been offline past `maxOfflineGap` — its cursor may point
+    /// past tombstones the server has since purged, so it would keep deleted rows (and re-upload
+    /// dirty ones) forever. No-op on a fresh install (no recorded sync) or a recently-synced device.
+    func resyncIfStale(now: Date = Date()) async throws {
+        guard let last = try await readLastSyncedAt(), now.timeIntervalSince(last) > maxOfflineGap else { return }
+        try await fullResync()
+    }
+
+    /// Clears every cursor, re-pulls all tables from scratch, and reconciles: drops local rows the
+    /// server no longer has (purged deletes) — **except** rows with a pending outbox entry, which are
+    /// local writes the drain will upload. Keeping dirty rows can resurrect a row deleted elsewhere
+    /// beyond the purge horizon; for single-user LWW that honours the user's own pending edit.
+    func fullResync() async throws {
+        try await db.write { db in try db.execute(sql: "DELETE FROM \(SyncSchema.stateTable)") }
+        let seen = try await pullNow() // full pull (cursors cleared) → every pk the server holds
+        for spec in tables {
+            let seenPks = seen[spec.name] ?? []
+            let (localPks, dirtyPks) = try await db.read { db -> (Set<String>, Set<String>) in
+                let local = Set(try String.fetchAll(db, sql: "SELECT \"\(spec.primaryKey)\" FROM \"\(spec.name)\""))
+                let dirty = Set(try String.fetchAll(
+                    db, sql: "SELECT pk FROM \(SyncSchema.outboxTable) WHERE table_name = ?", arguments: [spec.name]
+                ))
+                return (local, dirty)
+            }
+            let toDelete = localPks.subtracting(seenPks).subtracting(dirtyPks)
+            guard !toDelete.isEmpty else { continue }
+            try await db.write { db in
+                // ponytail: single IN-list. Personal-scale divergence is small; chunk only if a table
+                // ever diverges by more than SQLite's ~32k variable limit.
+                let placeholders = toDelete.map { _ in "?" }.joined(separator: ", ")
+                try db.execute(
+                    sql: "DELETE FROM \"\(spec.name)\" WHERE \"\(spec.primaryKey)\" IN (\(placeholders))",
+                    arguments: StatementArguments(Array(toDelete))
+                )
+            }
+        }
+    }
+
+    private func readLastSyncedAt() async throws -> Date? {
+        try await db.read { db in
+            guard let value = try String.fetchOne(
+                db, sql: "SELECT value FROM \(SyncSchema.metaTable) WHERE key = 'last_synced_at'"
+            ) else { return nil }
+            return SyncTimestamp.date(from: value)
+        }
+    }
+
+    private func writeLastSyncedAt(_ date: Date) async throws {
+        try await db.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO \(SyncSchema.metaTable) (key, value) VALUES ('last_synced_at', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                arguments: [SyncTimestamp.string(from: date)]
+            )
         }
     }
 

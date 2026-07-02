@@ -20,7 +20,11 @@ Per synced table:
 - **`deletedAt timestamptz` tombstone** (nullable). Deletes are soft — set `deletedAt` instead of
   removing the row — so deletions propagate on the next cursor pull. Deleting a parent must
   **tombstone its children too** (don't hard-`ON DELETE CASCADE`); a server trigger is the clean
-  way. Purge old tombstones server-side on a schedule.
+  way. Purge old tombstones server-side on a schedule. **Invariant (APPS-471): the purge retention
+  must exceed the engine's `maxOfflineGap`.** A device offline longer than the retention would never
+  see a purged tombstone; the engine defends against this by full-resyncing + reconciling once
+  `now − lastSyncedAt > maxOfflineGap`, so that window must be set ≤ the server's retention (CookThis
+  purges at 90 days; the engine defaults `maxOfflineGap` to 30).
 - **RLS scoped to `auth.uid()`** — every row read/written is filtered by RLS: it is the **security
   boundary**. It is *not* necessarily the **sync partition**. RLS may legitimately be broader than
   what a device should download: CookThis's `recipes` SELECT policy is `isPublic = true OR userId =
