@@ -16,6 +16,9 @@ struct OutboxEntry: FetchableRecord, Sendable {
     var pk: String
     var op: SyncOp
     var attempts: Int
+    /// When this entry last failed an upload — gates the per-entry backoff window. Nil until the
+    /// first failure (APPS-470).
+    var lastAttemptAt: Date?
 
     init(row: Row) {
         seq = row["seq"]
@@ -23,6 +26,7 @@ struct OutboxEntry: FetchableRecord, Sendable {
         pk = row["pk"]
         op = SyncOp(rawValue: row["op"]) ?? .upsert
         attempts = row["attempts"]
+        lastAttemptAt = row["last_attempt_at"]
     }
 }
 

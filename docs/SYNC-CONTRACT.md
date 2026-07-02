@@ -43,7 +43,15 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
   optimistically. A background drain processes the outbox in `seq` order.
 - **PostgREST upsert** with `Prefer: return=representation` (returns the server-stamped
   `updatedAt`) for `.upsert`; soft-delete for `.delete`. Both are **idempotent by primary key**, so
-  retries are safe; back off exponentially and count `attempts`.
+  retries are safe; back off exponentially **per entry** (`last_attempt_at` gates the window) and
+  count `attempts`.
+- **Failures are visible, not swallowed (APPS-470).** A failed upload surfaces in `SyncStatus`
+  (`failedUploads` while retrying, `deadLetters` once parked) so a user whose writes are all failing
+  never sees a healthy idle. Classify failures: **permanent** (4xx — RLS, constraint, validation)
+  dead-letter immediately; **transient** (network, 5xx, 408/429) retry with backoff until a cap,
+  then dead-letter. A dead-lettered entry stops retrying **and** stops counting as a dirty row, so
+  it never permanently blocks downloads for its key (§3 LWW). Health = `phase == .idle &&
+  failedUploads == 0 && deadLetters == 0`.
 - **FK ordering:** upsert parents before children; tombstone children before parents.
 - The upsert payload **excludes** `serverOwnedColumns` (§4) and re-encodes `jsonColumns` to JSON.
 

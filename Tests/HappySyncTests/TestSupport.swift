@@ -16,19 +16,35 @@ actor FakeRemote: SyncRemote {
     private(set) var lastScope: ScopeFilter?
     private var remainingFailures: Int
     private var remainingFetchFailures: Int
+    private let permanentUpsertFailures: Bool
     private let dataset: [String: [[String: AnyJSON]]]
 
-    init(failUpserts: Int = 0, failFetches: Int = 0, dataset: [String: [[String: AnyJSON]]] = [:]) {
+    /// - failUpserts: number of upserts that throw before succeeding.
+    /// - permanentUpserts: when true, those upsert failures are *permanent* (a classified 4xx-shaped
+    ///   error) so the drain dead-letters them immediately; when false they're transient (retryable).
+    init(
+        failUpserts: Int = 0,
+        failFetches: Int = 0,
+        permanentUpserts: Bool = false,
+        dataset: [String: [[String: AnyJSON]]] = [:]
+    ) {
         remainingFailures = failUpserts
         remainingFetchFailures = failFetches
+        permanentUpsertFailures = permanentUpserts
         self.dataset = dataset
     }
 
     enum Failure: Error { case simulated }
+    /// A permanent (non-retryable) upsert failure — conforms to the engine's retry-classification
+    /// seam so the drain dead-letters it on the first attempt.
+    struct PermanentFailure: ClassifiedSyncError { let isPermanent = true }
 
     func upsert(table: String, row: [String: AnyJSON]) async throws -> [String: AnyJSON] {
         upsertCalls.append((table, row))
-        if remainingFailures > 0 { remainingFailures -= 1; throw Failure.simulated }
+        if remainingFailures > 0 {
+            remainingFailures -= 1
+            throw permanentUpsertFailures ? PermanentFailure() : Failure.simulated
+        }
         var server = row
         server["updatedAt"] = .string(serverUpdatedAt)
         return server
@@ -82,6 +98,14 @@ func makeEngine(
     scope: @escaping @Sendable () async -> String? = { nil }
 ) throws -> SyncEngine {
     try SyncEngine(db: db, remote: remote, tables: tables, scope: scope)
+}
+
+/// Pushes every outbox entry's `last_attempt_at` into the past so the per-entry backoff window no
+/// longer skips it — lets a test drive a retry deterministically without sleeping (APPS-470).
+func agePastBackoff(_ db: any DatabaseWriter) async throws {
+    try await db.write { db in
+        try db.execute(sql: "UPDATE _sync_outbox SET last_attempt_at = ?", arguments: [Date.distantPast])
+    }
 }
 
 /// A DB with one `recipes` domain table (id, title, updated_at) plus HappySync's internal tables.

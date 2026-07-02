@@ -9,6 +9,37 @@ struct ScopeFilter: Sendable, Equatable {
     let value: String
 }
 
+/// A remote failure the drain can classify for retry (APPS-470). Conform a thrown error to signal
+/// whether a retry could ever succeed: **permanent** failures (the server will never accept the
+/// write as-is — RLS, constraint, validation) are dead-lettered immediately; everything else is
+/// treated as transient and retried with backoff. Unrecognized errors default to transient — safer
+/// to retry than to silently drop a user's write.
+protocol ClassifiedSyncError: Error {
+    var isPermanent: Bool { get }
+}
+
+/// Wraps a transport error with a retry classification, preserving the underlying error's text so
+/// the `last_error` telemetry breadcrumb stays useful.
+struct RemoteFailure: ClassifiedSyncError, CustomStringConvertible {
+    let isPermanent: Bool
+    let underlying: Error
+    var description: String { "\(underlying)" }
+}
+
+/// True when a transport error is **permanent** — the server will never accept the write as-is, so
+/// the drain should dead-letter it immediately rather than burn retries on it. A 4xx (except 408
+/// request-timeout and 429 throttle, which are worth retrying) or any structured PostgREST rejection
+/// (unique/FK constraint, RLS, validation) is permanent; network errors and 5xx are transient.
+func remoteErrorIsPermanent(_ error: Error) -> Bool {
+    if let classified = error as? any ClassifiedSyncError { return classified.isPermanent }
+    if let http = error as? HTTPError {
+        let code = http.response.statusCode
+        return (400..<500).contains(code) && code != 408 && code != 429
+    }
+    if error is PostgrestError { return true }
+    return false
+}
+
 /// The server side of the upload path. Abstracted behind a protocol so the drain can be unit-tested
 /// with a fake that records call order and simulates failures — the production conformance is the
 /// only place that touches the network.
@@ -33,13 +64,17 @@ struct SupabaseRemote: SyncRemote {
 
     func upsert(table: String, row: [String: AnyJSON]) async throws -> [String: AnyJSON] {
         let token = await auth()
-        let rows: [[String: AnyJSON]] = try await client
-            .from(table)
-            .upsert(row, returning: .representation)
-            .setHeader(name: "Authorization", value: "Bearer \(token)")
-            .execute()
-            .value
-        return rows.first ?? row
+        do {
+            let rows: [[String: AnyJSON]] = try await client
+                .from(table)
+                .upsert(row, returning: .representation)
+                .setHeader(name: "Authorization", value: "Bearer \(token)")
+                .execute()
+                .value
+            return rows.first ?? row
+        } catch {
+            throw Self.classify(error) // tag permanence so the drain can dead-letter poison writes
+        }
     }
 
     func delete(table: String, primaryKey: String, pk: String) async throws {
@@ -48,12 +83,21 @@ struct SupabaseRemote: SyncRemote {
         // DELETE would simply vanish, never reaching other devices). The server's BEFORE UPDATE
         // trigger stamps updatedAt — advancing the cursor — and an AFTER trigger tombstones the row's
         // children. deletedAt is the marker; the server-stamped updatedAt is what ordering trusts.
-        try await client
-            .from(table)
-            .update(["deletedAt": AnyJSON.string(Self.nowISO8601())])
-            .eq(primaryKey, value: pk)
-            .setHeader(name: "Authorization", value: "Bearer \(token)")
-            .execute()
+        do {
+            try await client
+                .from(table)
+                .update(["deletedAt": AnyJSON.string(Self.nowISO8601())])
+                .eq(primaryKey, value: pk)
+                .setHeader(name: "Authorization", value: "Bearer \(token)")
+                .execute()
+        } catch {
+            throw Self.classify(error)
+        }
+    }
+
+    /// Tags a transport error with its retry classification for the drain (APPS-470).
+    private static func classify(_ error: Error) -> RemoteFailure {
+        RemoteFailure(isPermanent: remoteErrorIsPermanent(error), underlying: error)
     }
 
     func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] {

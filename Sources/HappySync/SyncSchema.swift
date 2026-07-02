@@ -34,5 +34,17 @@ enum SyncSchema {
                 t.column("last_id", .text)
             }
         }
+
+        // APPS-470: per-entry retry bookkeeping. `last_attempt_at` gates exponential backoff so a
+        // failing entry isn't retried on every drain; `dead_lettered` parks a poison entry so it
+        // stops retrying and no longer wedges the LWW dirty gate for its row; `last_error` is a
+        // telemetry breadcrumb the consumer can surface/repair from.
+        migrator.registerMigration("happysync_v2_outbox_retry") { db in
+            try db.alter(table: outboxTable) { t in
+                t.add(column: "last_attempt_at", .datetime)
+                t.add(column: "last_error", .text)
+                t.add(column: "dead_lettered", .integer).notNull().defaults(to: 0)
+            }
+        }
     }
 }

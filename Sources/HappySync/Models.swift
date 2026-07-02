@@ -66,10 +66,19 @@ public struct SyncStatus: Sendable, Equatable {
     public var phase: Phase
     /// Time of the last successful pull/push, or `nil` if never synced.
     public var lastSyncedAt: Date?
+    /// Entries that failed to upload on the last drain and are still being retried with backoff. A
+    /// nonzero value on an otherwise-`idle` status means "some local changes haven't reached the
+    /// server yet" — the sync is degraded, not broken (APPS-470).
+    public var failedUploads: Int
+    /// Entries parked after exhausting retries (or a permanent 4xx). They are no longer retried and
+    /// no longer block downloads for their row; surface them so the consumer can log/repair.
+    public var deadLetters: Int
 
-    public init(phase: Phase = .idle, lastSyncedAt: Date? = nil) {
+    public init(phase: Phase = .idle, lastSyncedAt: Date? = nil, failedUploads: Int = 0, deadLetters: Int = 0) {
         self.phase = phase
         self.lastSyncedAt = lastSyncedAt
+        self.failedUploads = failedUploads
+        self.deadLetters = deadLetters
     }
 }
 

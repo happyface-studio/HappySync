@@ -80,6 +80,9 @@ public actor SyncEngine {
     /// Resolves the current user's download-partition value (auth uid) for tables that declare a
     /// `scopeColumn`, or nil when signed out. Called per pull so a user switch re-scopes (APPS-469).
     private let scope: @Sendable () async -> String?
+    /// After this many failed upload attempts a transient entry is dead-lettered (parked). A
+    /// permanent (4xx) failure parks immediately regardless. See APPS-470.
+    private let deadLetterAfter: Int
 
     private nonisolated let statusBroadcaster: StatusBroadcaster
     private var isRunning = false
@@ -134,7 +137,8 @@ public actor SyncEngine {
         doorbell: any SyncDoorbell = SilentDoorbell(),
         pollInterval: TimeInterval = 30,
         debounceInterval: TimeInterval = 0.3,
-        scope: @escaping @Sendable () async -> String? = { nil }
+        scope: @escaping @Sendable () async -> String? = { nil },
+        deadLetterAfter: Int = 8
     ) throws {
         self.db = db
         self.remote = remote
@@ -144,6 +148,7 @@ public actor SyncEngine {
         self.pollInterval = pollInterval
         self.debounceInterval = debounceInterval
         self.scope = scope
+        self.deadLetterAfter = deadLetterAfter
         self.statusBroadcaster = StatusBroadcaster(initial: SyncStatus())
 
         try SyncSchema.migrator().migrate(db)
@@ -188,8 +193,11 @@ public actor SyncEngine {
     private func runLoop(_ wake: AsyncStream<Void>) async {
         for await _ in wake {
             do {
-                try await runSyncOnce()
-                consecutiveFailures = 0
+                let outcome = try await runSyncOnce()
+                // A pull can succeed while uploads keep failing. Transient upload failures still
+                // drive scheduler backoff (so a flapping upload isn't hammered); dead-lettered
+                // entries don't — they've stopped retrying, so the engine is healthy again (APPS-470).
+                consecutiveFailures = outcome.failed > 0 ? consecutiveFailures + 1 : 0
             } catch {
                 consecutiveFailures += 1 // status already shows .failed; the periodic loop retries with backoff
             }
@@ -234,17 +242,30 @@ public actor SyncEngine {
     /// One full sync pass: push local changes then pull remote ones, driving `status` across the
     /// run (`.syncing` → `.idle` on success with `lastSyncedAt` stamped, or `.failed` then rethrow).
     /// The scheduler serialises these, so a push and pull never overlap.
-    func runSyncOnce() async throws {
+    ///
+    /// The settled `.idle` status still carries `failedUploads`/`deadLetters`: a drain can complete
+    /// (so the *pass* is idle) while individual entries are still failing or parked. Health is
+    /// `phase == .idle && failedUploads == 0 && deadLetters == 0`, not the phase alone (APPS-470).
+    @discardableResult
+    func runSyncOnce() async throws -> DrainOutcome {
         statusBroadcaster.send(SyncStatus(phase: .syncing, lastSyncedAt: lastSyncedAt))
+        let outcome: DrainOutcome
         do {
-            try await drainOutbox()
+            outcome = try await drainOutbox()
             try await pullNow()
         } catch {
             statusBroadcaster.send(SyncStatus(phase: .failed("\(error)"), lastSyncedAt: lastSyncedAt))
             throw error
         }
         lastSyncedAt = Date()
-        statusBroadcaster.send(SyncStatus(phase: .idle, lastSyncedAt: lastSyncedAt))
+        let deadLetters = try await db.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 1") ?? 0
+        }
+        statusBroadcaster.send(SyncStatus(
+            phase: .idle, lastSyncedAt: lastSyncedAt,
+            failedUploads: outcome.failed, deadLetters: deadLetters
+        ))
+        return outcome
     }
 
     /// Records a write in the outbox in the same transaction as the domain write, so the local
@@ -365,9 +386,11 @@ public actor SyncEngine {
     private static func lwwAllows(
         _ db: Database, table: String, cursorColumn: String, primaryKey: String, pk: String, remoteUpdatedAt: String
     ) throws -> Bool {
+        // A dead-lettered entry is excluded: it has stopped retrying, so it must not keep the row
+        // dirty and block every remote update forever (APPS-470).
         let dirty = try Int.fetchOne(
             db,
-            sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE table_name = ? AND pk = ?",
+            sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE table_name = ? AND pk = ? AND dead_lettered = 0",
             arguments: [table, pk]
         ) ?? 0
         if dirty > 0 { return false }
@@ -405,25 +428,56 @@ public actor SyncEngine {
         )
     }
 
-    /// Processes every pending outbox entry once, in FK-safe order. Each op is idempotent by
-    /// primary key, so a failed entry is simply left in place (with its `attempts` bumped) to be
-    /// retried on the next drain; one failure never blocks the others.
-    func drainOutbox() async throws {
+    /// Result of one outbox drain pass (APPS-470): `failed` entries hit a transient error and are
+    /// still being retried with backoff; `deadLettered` entries were parked this pass (permanent
+    /// failure, or the transient retry cap reached) and will not be retried again.
+    struct DrainOutcome: Sendable, Equatable {
+        var failed: Int
+        var deadLettered: Int
+    }
+
+    /// Processes every pending (non-parked) outbox entry once, in FK-safe order. Each op is
+    /// idempotent by primary key. A failed entry stays in place with `attempts`/`last_attempt_at`
+    /// bumped and is skipped until its per-entry backoff window elapses; one that fails permanently
+    /// (4xx) or exhausts `deadLetterAfter` retries is dead-lettered (parked). One failure never
+    /// blocks the others.
+    @discardableResult
+    func drainOutbox(now: Date = Date()) async throws -> DrainOutcome {
         let pending = try await db.read { db in
-            try OutboxEntry.fetchAll(db, sql: "SELECT * FROM \(SyncSchema.outboxTable)")
+            try OutboxEntry.fetchAll(db, sql: "SELECT * FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 0")
         }
+        var outcome = DrainOutcome(failed: 0, deadLettered: 0)
         for entry in orderForUpload(pending, tables: tables) {
+            // Per-entry exponential backoff: skip an entry still inside its retry window so a failing
+            // entry isn't re-attempted on every drain pass (and doorbell ring and poll).
+            if let last = entry.lastAttemptAt, now.timeIntervalSince(last) < backoffDelay(attempts: entry.attempts) {
+                continue
+            }
             do {
                 try await process(entry)
             } catch {
-                // Idempotent retry: keep the entry, count the attempt; backoff is the scheduler's job.
-                try await db.write { db in
-                    try db.execute(
-                        sql: "UPDATE \(SyncSchema.outboxTable) SET attempts = attempts + 1 WHERE seq = ?",
-                        arguments: [entry.seq]
-                    )
-                }
+                let attempts = entry.attempts + 1
+                // Permanent (4xx) → park now; transient → park once it exhausts the retry cap.
+                let park = remoteErrorIsPermanent(error) || attempts >= deadLetterAfter
+                try await recordFailure(entry, attempts: attempts, now: now, park: park, error: error)
+                if park { outcome.deadLettered += 1 } else { outcome.failed += 1 }
             }
+        }
+        return outcome
+    }
+
+    /// Records a failed upload attempt: bumps `attempts`, stamps `last_attempt_at` (for the backoff
+    /// window) and `last_error` (telemetry), and parks the entry when `park`.
+    private func recordFailure(_ entry: OutboxEntry, attempts: Int, now: Date, park: Bool, error: Error) async throws {
+        try await db.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE \(SyncSchema.outboxTable)
+                    SET attempts = ?, last_attempt_at = ?, last_error = ?, dead_lettered = ?
+                    WHERE seq = ?
+                    """,
+                arguments: [attempts, now, "\(error)", park ? 1 : 0, entry.seq]
+            )
         }
     }
 

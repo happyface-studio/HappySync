@@ -182,6 +182,8 @@ import Supabase
     #expect(afterFail.2 == nil) // not stamped clean on failure
 
     // Second drain: succeeds idempotently — entry cleared, row stamped, retried exactly once.
+    // (Age past the per-entry backoff window first, else the retry is intentionally skipped — APPS-470.)
+    try await agePastBackoff(db)
     try await engine.drainOutbox()
     let afterSuccess = try await db.read { db -> (Int, String?) in
         let pending = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM _sync_outbox") ?? -1
