@@ -16,6 +16,9 @@ struct OutboxEntry: FetchableRecord, Sendable {
     var pk: String
     var op: SyncOp
     var attempts: Int
+    /// When this entry last failed an upload — gates the per-entry backoff window. Nil until the
+    /// first failure (APPS-470).
+    var lastAttemptAt: Date?
 
     init(row: Row) {
         seq = row["seq"]
@@ -23,6 +26,38 @@ struct OutboxEntry: FetchableRecord, Sendable {
         pk = row["pk"]
         op = SyncOp(rawValue: row["op"]) ?? .upsert
         attempts = row["attempts"]
+        lastAttemptAt = row["last_attempt_at"]
+    }
+}
+
+/// One (table, pk) collapsed to its net effect (APPS-472): the highest-`seq` entry — whose op is
+/// the net op — plus every `seq` in the group, all cleared together once that net op is applied.
+struct CollapsedOp: Sendable {
+    let net: OutboxEntry
+    let seqs: [Int64]
+}
+
+/// Collapses same-`(table, pk)` outbox entries to their net effect in `seq` order, so a
+/// delete-then-recreate (or any run of edits) on one row uploads once as its final state instead of
+/// replaying every op. Without this, `orderForUpload` runs all upserts before all deletes, so an
+/// offline `delete(pk)` then `upsert(pk)` uploads the row *then* soft-deletes it — the tombstone
+/// propagates back and hard-deletes the re-created row everywhere (APPS-472 data loss).
+///
+/// The net op is simply the op of the highest-`seq` entry (the last thing the user did to the row);
+/// the local DB already holds that net state, so an `.upsert` net reads a fresh payload (which
+/// carries `deletedAt = null`, un-tombstoning the server row) and a `.delete` net soft-deletes.
+func collapseOutbox(_ entries: [OutboxEntry]) -> [CollapsedOp] {
+    var groups: [String: [OutboxEntry]] = [:]
+    var order: [String] = []
+    for entry in entries {
+        let key = "\(entry.tableName)\u{0}\(entry.pk)"
+        if groups[key] == nil { order.append(key) }
+        groups[key, default: []].append(entry)
+    }
+    return order.map { key in
+        let group = groups[key]!
+        let net = group.max { $0.seq < $1.seq }!
+        return CollapsedOp(net: net, seqs: group.map(\.seq))
     }
 }
 
@@ -43,8 +78,8 @@ func orderForUpload(_ entries: [OutboxEntry], tables: [SyncTable]) -> [OutboxEnt
         if rankA != rankB { return rankA < rankB }
         return a.seq < b.seq
     }
-    // ponytail: a delete then re-upsert of the *same* pk inside one drain window is mis-ordered
-    // (upsert wins). Collapse same-pk outbox entries if that case ever shows up.
+    // Same-`(table, pk)` mis-ordering (delete-then-recreate) is handled upstream by
+    // `collapseOutbox`, which nets each key to one op before this FK ordering runs (APPS-472).
 }
 
 /// Exponential backoff between drain passes for an entry that has failed `attempts` times.

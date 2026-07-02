@@ -24,15 +24,35 @@ struct SilentDoorbell: SyncDoorbell {
 /// a dropped socket re-subscribes itself; the engine's periodic pull covers any gap meanwhile.
 struct SupabaseDoorbell: SyncDoorbell {
     let client: SupabaseClient
-    let tables: [String]
+    /// One entry per synced table, carrying its optional partition-scope column (APPS-469). The
+    /// scope *value* (uid) is resolved once per `ring()` via `scope`, not baked in here.
+    let tables: [(name: String, scopeColumn: String?)]
+    /// Resolves the current user's partition value (auth uid), or nil when signed out.
+    let scope: @Sendable () async -> String?
 
     func ring() -> AsyncStream<Void> {
         AsyncStream { continuation in
+            // Create the channel here (synchronous) so `onTermination` can tear it down — otherwise
+            // the socket keeps the `happysync` channel joined until the process exits, and repeated
+            // start/stop cycles leak a channel each time (APPS-473).
+            let channel = client.realtimeV2.channel("happysync")
             let task = Task {
-                let channel = client.realtimeV2.channel("happysync")
+                let uid = await scope()
                 // Listeners must be registered before subscribe(); any change rings the doorbell.
-                let streams = tables.map {
-                    channel.postgresChange(AnyAction.self, schema: "public", table: $0)
+                var streams: [AsyncStream<AnyAction>] = []
+                for table in tables {
+                    if let column = table.scopeColumn {
+                        // Scoped table: only ring for the user's own rows. Signed out → skip it (the
+                        // periodic pull still converges). Subscribing unfiltered would ring on every
+                        // public-catalog change and hammer the pull — the churn APPS-469 fixes.
+                        guard let uid else { continue }
+                        streams.append(channel.postgresChange(
+                            AnyAction.self, schema: "public", table: table.name,
+                            filter: Self.changeFilter(column: column, value: uid)
+                        ))
+                    } else {
+                        streams.append(channel.postgresChange(AnyAction.self, schema: "public", table: table.name))
+                    }
                 }
                 await channel.subscribe()
                 await withTaskGroup(of: Void.self) { group in
@@ -41,7 +61,16 @@ struct SupabaseDoorbell: SyncDoorbell {
                     }
                 }
             }
-            continuation.onTermination = { _ in task.cancel() }
+            // On teardown, cancel the listener AND unsubscribe/remove the channel so the socket
+            // doesn't keep it joined. Cleanup runs in a fresh (uncancelled) task so the async
+            // unsubscribe actually completes. A later `ring()` builds a clean channel from scratch.
+            continuation.onTermination = { [client] _ in
+                task.cancel()
+                Task { await channel.unsubscribe(); await client.realtimeV2.removeChannel(channel) }
+            }
         }
     }
+
+    /// PostgREST-style Realtime filter for a scoped table: `column=eq.value`.
+    static func changeFilter(column: String, value: String) -> String { "\(column)=eq.\(value)" }
 }

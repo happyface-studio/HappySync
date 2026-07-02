@@ -77,12 +77,31 @@ public actor SyncEngine {
     private let doorbell: any SyncDoorbell
     private let pollInterval: TimeInterval
     private let debounceInterval: TimeInterval
+    /// Resolves the current user's download-partition value (auth uid) for tables that declare a
+    /// `scopeColumn`, or nil when signed out. Called per pull so a user switch re-scopes (APPS-469).
+    private let scope: @Sendable () async -> String?
+    /// After this many failed upload attempts a transient entry is dead-lettered (parked). A
+    /// permanent (4xx) failure parks immediately regardless. See APPS-470.
+    private let deadLetterAfter: Int
+    /// If this device hasn't successfully synced within this window, its cursor may point past
+    /// tombstones the server has since purged — so the first sync full-resyncs and reconciles
+    /// instead of trusting the stale cursor. **Must be ≤ the server's tombstone-purge retention**
+    /// (CookThis purges at 90 days). See APPS-471 / contract §1.
+    private let maxOfflineGap: TimeInterval
+    /// Whether the once-per-process stale-cursor check has run (successfully). Gated so the DB read
+    /// only happens on the first pass, not every poke.
+    private var didResyncCheck = false
 
     private nonisolated let statusBroadcaster: StatusBroadcaster
     private var isRunning = false
     private var lastSyncedAt: Date?
     private var consecutiveFailures = 0
-    private var loopTask: Task<Void, Never>?
+    /// The serialized runner consuming the wake stream. Kept separate from the trigger loops so
+    /// `stop()` can let the in-flight pass finish gracefully (finish the wake stream, don't cancel)
+    /// while cancelling the triggers (APPS-473).
+    private var runnerTask: Task<Void, Never>?
+    /// The doorbell + periodic loops that poke the runner. Cancelled on `stop()`.
+    private var triggersTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
     private var wake: AsyncStream<Void>.Continuation?
 
@@ -97,17 +116,31 @@ public actor SyncEngine {
     ///   - supabase: Supabase client for PostgREST upsert/pull and the Realtime doorbell.
     ///   - tables: Synced tables in any order; the engine sorts them by `dependsOn`.
     ///   - auth: Returns a fresh Supabase access token, called before each authenticated batch.
+    ///   - scope: Resolves the current user's download-partition value (auth uid) for tables that
+    ///     declare a `scopeColumn`. Defaults to `nil` (no partition beyond RLS). Called per pull, so
+    ///     a signed-in user change re-scopes without re-declaring tables. See APPS-469.
+    ///   - maxOfflineGap: If the device hasn't synced within this window, the first sync full-resyncs
+    ///     to reconcile against purged tombstones. **Must be ≤ the server's tombstone-purge
+    ///     retention.** Defaults to 30 days. See APPS-471.
     public init(
         db: any DatabaseWriter,
         supabase: SupabaseClient,
         tables: [SyncTable],
-        auth: @escaping @Sendable () async -> String
+        auth: @escaping @Sendable () async -> String,
+        scope: @escaping @Sendable () async -> String? = { nil },
+        maxOfflineGap: TimeInterval = 30 * 24 * 3600
     ) throws {
         try self.init(
             db: db,
             remote: SupabaseRemote(client: supabase, auth: auth),
             tables: tables,
-            doorbell: SupabaseDoorbell(client: supabase, tables: tables.map(\.name))
+            doorbell: SupabaseDoorbell(
+                client: supabase,
+                tables: tables.map { ($0.name, $0.scopeColumn) },
+                scope: scope
+            ),
+            scope: scope,
+            maxOfflineGap: maxOfflineGap
         )
     }
 
@@ -121,7 +154,10 @@ public actor SyncEngine {
         pageSize: Int = 500,
         doorbell: any SyncDoorbell = SilentDoorbell(),
         pollInterval: TimeInterval = 30,
-        debounceInterval: TimeInterval = 0.3
+        debounceInterval: TimeInterval = 0.3,
+        scope: @escaping @Sendable () async -> String? = { nil },
+        deadLetterAfter: Int = 8,
+        maxOfflineGap: TimeInterval = 30 * 24 * 3600
     ) throws {
         self.db = db
         self.remote = remote
@@ -130,6 +166,9 @@ public actor SyncEngine {
         self.doorbell = doorbell
         self.pollInterval = pollInterval
         self.debounceInterval = debounceInterval
+        self.scope = scope
+        self.deadLetterAfter = deadLetterAfter
+        self.maxOfflineGap = maxOfflineGap
         self.statusBroadcaster = StatusBroadcaster(initial: SyncStatus())
 
         try SyncSchema.migrator().migrate(db)
@@ -148,10 +187,14 @@ public actor SyncEngine {
         wake = continuation
         // ponytail: the running subtasks hold `self` for the engine's lifetime; `stop()` is the
         // teardown that cancels them. Fine for an app-lifetime engine, revisit if it must be GC'd live.
-        loopTask = Task { [weak self] in
+        // The runner is its own task (not in the trigger group) so `stop()` can drain it gracefully.
+        runnerTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runLoop(stream)
+        }
+        triggersTask = Task { [weak self] in
             guard let self else { return }
             await withTaskGroup(of: Void.self) { group in
-                group.addTask { await self.runLoop(stream) }
                 group.addTask { await self.doorbellLoop() }
                 group.addTask { await self.periodicLoop() }
             }
@@ -159,12 +202,19 @@ public actor SyncEngine {
         poke() // converge immediately on start
     }
 
-    /// Stops background sync and finishes all status streams.
-    public func stop() {
+    /// Stops background sync and finishes all status streams. **Awaits the in-flight sync pass**
+    /// before returning: after `await stop()` the engine has quiesced — no further DB writes and no
+    /// network calls — so a consumer can safely wipe or repurpose the database (e.g. on sign-out /
+    /// account switch). Idempotent. See APPS-473 and the README teardown section.
+    public func stop() async {
+        guard isRunning else { return }
         isRunning = false
-        loopTask?.cancel(); loopTask = nil
+        wake?.finish(); wake = nil            // no more passes enqueued; runner exits after the current one
+        triggersTask?.cancel()                // stop the doorbell + periodic loops from poking
         debounceTask?.cancel(); debounceTask = nil
-        wake?.finish(); wake = nil
+        await runnerTask?.value               // await the in-flight pass to finish (uncancelled → completes)
+        await triggersTask?.value             // and the trigger loops (incl. doorbell channel teardown) to unwind
+        runnerTask = nil; triggersTask = nil
         statusBroadcaster.finish()
     }
 
@@ -174,8 +224,11 @@ public actor SyncEngine {
     private func runLoop(_ wake: AsyncStream<Void>) async {
         for await _ in wake {
             do {
-                try await runSyncOnce()
-                consecutiveFailures = 0
+                let outcome = try await runSyncOnce()
+                // A pull can succeed while uploads keep failing. Transient upload failures still
+                // drive scheduler backoff (so a flapping upload isn't hammered); dead-lettered
+                // entries don't — they've stopped retrying, so the engine is healthy again (APPS-470).
+                consecutiveFailures = outcome.failed > 0 ? consecutiveFailures + 1 : 0
             } catch {
                 consecutiveFailures += 1 // status already shows .failed; the periodic loop retries with backoff
             }
@@ -220,22 +273,47 @@ public actor SyncEngine {
     /// One full sync pass: push local changes then pull remote ones, driving `status` across the
     /// run (`.syncing` → `.idle` on success with `lastSyncedAt` stamped, or `.failed` then rethrow).
     /// The scheduler serialises these, so a push and pull never overlap.
-    func runSyncOnce() async throws {
+    ///
+    /// The settled `.idle` status still carries `failedUploads`/`deadLetters`: a drain can complete
+    /// (so the *pass* is idle) while individual entries are still failing or parked. Health is
+    /// `phase == .idle && failedUploads == 0 && deadLetters == 0`, not the phase alone (APPS-470).
+    @discardableResult
+    func runSyncOnce() async throws -> DrainOutcome {
         statusBroadcaster.send(SyncStatus(phase: .syncing, lastSyncedAt: lastSyncedAt))
+        let outcome: DrainOutcome
         do {
-            try await drainOutbox()
+            // Once per process: if this device is past the offline horizon, full-resync before the
+            // normal push/pull so a stale cursor can't skip purged tombstones (APPS-471). Gated so a
+            // transient failure here re-checks next pass (lastSyncedAt only advances on full success).
+            if !didResyncCheck {
+                try await resyncIfStale()
+                didResyncCheck = true
+            }
+            outcome = try await drainOutbox()
             try await pullNow()
         } catch {
             statusBroadcaster.send(SyncStatus(phase: .failed("\(error)"), lastSyncedAt: lastSyncedAt))
             throw error
         }
         lastSyncedAt = Date()
-        statusBroadcaster.send(SyncStatus(phase: .idle, lastSyncedAt: lastSyncedAt))
+        try await writeLastSyncedAt(lastSyncedAt!)
+        let deadLetters = try await db.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 1") ?? 0
+        }
+        statusBroadcaster.send(SyncStatus(
+            phase: .idle, lastSyncedAt: lastSyncedAt,
+            failedUploads: outcome.failed, deadLetters: deadLetters
+        ))
+        return outcome
     }
 
     /// Records a write in the outbox in the same transaction as the domain write, so the local
     /// store and the pending-upload queue can never disagree. An `.upsert` writes the row to its
     /// table; a `.delete` removes it locally (the tombstone is propagated to the server on drain).
+    ///
+    /// Supported row value types: `String`, numbers, `Bool`, `Date` (encoded as canonical ISO-8601,
+    /// APPS-475), `null`, and — for columns declared in `jsonColumns` — nested objects/arrays.
+    /// `Data`/blob fields are **not** supported and throw `SyncError.encoding`.
     public func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws {
         guard let spec = tables.first(where: { $0.name == table }) else {
             throw SyncError.unknownTable(table)
@@ -271,19 +349,37 @@ public actor SyncEngine {
     /// tombstones are deferred and applied children-first (so a parent is never deleted out from
     /// under a child). Each page's applies + cursor-advance happen in one transaction; pages are
     /// pulled until one comes back short.
-    public func pullNow() async throws {
+    /// Returns the set of primary keys each table's fetch returned this pull. On a full pull (cursors
+    /// cleared, as the stale-cursor resync does) that's every pk the server currently holds — the
+    /// input the resync reconcile diffs against local rows (APPS-471). On an incremental pull it's
+    /// just the changed pks, which the normal path ignores.
+    @discardableResult
+    public func pullNow() async throws -> [String: Set<String>] {
         let order = topologicalOrder(tables)
         var pendingDeletes: [PendingDelete] = []
+        var seenPks: [String: Set<String>] = [:]
 
         for tableName in order {
             guard let spec = tables.first(where: { $0.name == tableName }) else { continue }
+            var scopeFilter: ScopeFilter?
+            if let scopeColumn = spec.scopeColumn {
+                // Scoped table: resolve the partition value for the signed-in user. Signed out (nil)
+                // → skip the table this pass rather than pull it unfiltered (which would download the
+                // whole public catalog); the periodic loop retries once a value is available.
+                guard let value = await scope() else { continue }
+                scopeFilter = ScopeFilter(column: scopeColumn, value: value)
+            }
             var cursor = try await readCursor(table: spec.name)
             while true {
                 let page = try await remote.fetch(
                     table: spec.name, cursorColumn: spec.cursorColumn, since: cursor,
-                    primaryKey: spec.primaryKey, limit: pageSize
+                    primaryKey: spec.primaryKey, scope: scopeFilter, limit: pageSize
                 )
                 if page.isEmpty { break }
+
+                for row in page where !(row[spec.primaryKey]?.stringValue ?? "").isEmpty {
+                    seenPks[spec.name, default: []].insert(row[spec.primaryKey]!.stringValue!)
+                }
 
                 let pageCursor = cursor // immutable copy for the Sendable write closure
                 let (advanced, deletes) = try await db.write { db -> (SyncCursor?, [PendingDelete]) in
@@ -335,6 +431,66 @@ public actor SyncEngine {
                 )
             }
         }
+        return seenPks
+    }
+
+    /// Full-resyncs when this device has been offline past `maxOfflineGap` — its cursor may point
+    /// past tombstones the server has since purged, so it would keep deleted rows (and re-upload
+    /// dirty ones) forever. No-op on a fresh install (no recorded sync) or a recently-synced device.
+    func resyncIfStale(now: Date = Date()) async throws {
+        guard let last = try await readLastSyncedAt(), now.timeIntervalSince(last) > maxOfflineGap else { return }
+        try await fullResync()
+    }
+
+    /// Clears every cursor, re-pulls all tables from scratch, and reconciles: drops local rows the
+    /// server no longer has (purged deletes) — **except** rows with a pending outbox entry, which are
+    /// local writes the drain will upload. Keeping dirty rows can resurrect a row deleted elsewhere
+    /// beyond the purge horizon; for single-user LWW that honours the user's own pending edit.
+    func fullResync() async throws {
+        try await db.write { db in try db.execute(sql: "DELETE FROM \(SyncSchema.stateTable)") }
+        let seen = try await pullNow() // full pull (cursors cleared) → every pk the server holds
+        for spec in tables {
+            let seenPks = seen[spec.name] ?? []
+            let (localPks, dirtyPks) = try await db.read { db -> (Set<String>, Set<String>) in
+                let local = Set(try String.fetchAll(db, sql: "SELECT \"\(spec.primaryKey)\" FROM \"\(spec.name)\""))
+                let dirty = Set(try String.fetchAll(
+                    db, sql: "SELECT pk FROM \(SyncSchema.outboxTable) WHERE table_name = ?", arguments: [spec.name]
+                ))
+                return (local, dirty)
+            }
+            let toDelete = localPks.subtracting(seenPks).subtracting(dirtyPks)
+            guard !toDelete.isEmpty else { continue }
+            try await db.write { db in
+                // ponytail: single IN-list. Personal-scale divergence is small; chunk only if a table
+                // ever diverges by more than SQLite's ~32k variable limit.
+                let placeholders = toDelete.map { _ in "?" }.joined(separator: ", ")
+                try db.execute(
+                    sql: "DELETE FROM \"\(spec.name)\" WHERE \"\(spec.primaryKey)\" IN (\(placeholders))",
+                    arguments: StatementArguments(Array(toDelete))
+                )
+            }
+        }
+    }
+
+    private func readLastSyncedAt() async throws -> Date? {
+        try await db.read { db in
+            guard let value = try String.fetchOne(
+                db, sql: "SELECT value FROM \(SyncSchema.metaTable) WHERE key = 'last_synced_at'"
+            ) else { return nil }
+            return SyncTimestamp.date(from: value)
+        }
+    }
+
+    private func writeLastSyncedAt(_ date: Date) async throws {
+        try await db.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO \(SyncSchema.metaTable) (key, value) VALUES ('last_synced_at', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                arguments: [SyncTimestamp.string(from: date)]
+            )
+        }
     }
 
     /// Last-write-wins gate, evaluated inside the apply transaction: a remote row is applied only
@@ -343,9 +499,11 @@ public actor SyncEngine {
     private static func lwwAllows(
         _ db: Database, table: String, cursorColumn: String, primaryKey: String, pk: String, remoteUpdatedAt: String
     ) throws -> Bool {
+        // A dead-lettered entry is excluded: it has stopped retrying, so it must not keep the row
+        // dirty and block every remote update forever (APPS-470).
         let dirty = try Int.fetchOne(
             db,
-            sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE table_name = ? AND pk = ?",
+            sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE table_name = ? AND pk = ? AND dead_lettered = 0",
             arguments: [table, pk]
         ) ?? 0
         if dirty > 0 { return false }
@@ -357,7 +515,11 @@ public actor SyncEngine {
         ) else {
             return true // no local row (or never-stamped) → apply
         }
-        return remoteUpdatedAt > local // ISO-8601 UTC sorts lexicographically
+        // Canonicalize both sides to one format before the lexicographic compare: PostgREST
+        // (`…+00:00`, microseconds), client (`…123Z`), and non-fractional legacy strings otherwise
+        // sort inconsistently (e.g. a fractional remote vs a non-fractional local of the same
+        // second). Same-format canonical strings sort chronologically (APPS-474).
+        return SyncTimestamp.canonicalize(remoteUpdatedAt) > SyncTimestamp.canonicalize(local)
     }
 
     private func readCursor(table: String) async throws -> SyncCursor? {
@@ -383,44 +545,93 @@ public actor SyncEngine {
         )
     }
 
-    /// Processes every pending outbox entry once, in FK-safe order. Each op is idempotent by
-    /// primary key, so a failed entry is simply left in place (with its `attempts` bumped) to be
-    /// retried on the next drain; one failure never blocks the others.
-    func drainOutbox() async throws {
+    /// Result of one outbox drain pass (APPS-470): `failed` entries hit a transient error and are
+    /// still being retried with backoff; `deadLettered` entries were parked this pass (permanent
+    /// failure, or the transient retry cap reached) and will not be retried again.
+    struct DrainOutcome: Sendable, Equatable {
+        var failed: Int
+        var deadLettered: Int
+    }
+
+    /// Processes every pending (non-parked) outbox entry once, in FK-safe order. Each op is
+    /// idempotent by primary key. A failed entry stays in place with `attempts`/`last_attempt_at`
+    /// bumped and is skipped until its per-entry backoff window elapses; one that fails permanently
+    /// (4xx) or exhausts `deadLetterAfter` retries is dead-lettered (parked). One failure never
+    /// blocks the others.
+    @discardableResult
+    func drainOutbox(now: Date = Date()) async throws -> DrainOutcome {
         let pending = try await db.read { db in
-            try OutboxEntry.fetchAll(db, sql: "SELECT * FROM \(SyncSchema.outboxTable)")
+            try OutboxEntry.fetchAll(db, sql: "SELECT * FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 0")
         }
-        for entry in orderForUpload(pending, tables: tables) {
+        // Net each (table, pk) to one op first (APPS-472), then FK-order the net ops.
+        let collapsed = collapseOutbox(pending)
+        let groupSeqs = Dictionary(uniqueKeysWithValues: collapsed.map { ($0.net.seq, $0.seqs) })
+        var outcome = DrainOutcome(failed: 0, deadLettered: 0)
+        for entry in orderForUpload(collapsed.map(\.net), tables: tables) {
+            // Per-entry exponential backoff: skip an entry still inside its retry window so a failing
+            // entry isn't re-attempted on every drain pass (and doorbell ring and poll).
+            if let last = entry.lastAttemptAt, now.timeIntervalSince(last) < backoffDelay(attempts: entry.attempts) {
+                continue
+            }
+            let seqs = groupSeqs[entry.seq] ?? [entry.seq]
             do {
-                try await process(entry)
+                try await process(entry, clearing: seqs)
             } catch {
-                // Idempotent retry: keep the entry, count the attempt; backoff is the scheduler's job.
-                try await db.write { db in
+                let attempts = entry.attempts + 1
+                // Permanent (4xx) → park now; transient → park once it exhausts the retry cap.
+                let park = remoteErrorIsPermanent(error) || attempts >= deadLetterAfter
+                try await recordFailure(entry, groupSeqs: seqs, attempts: attempts, now: now, park: park, error: error)
+                if park { outcome.deadLettered += 1 } else { outcome.failed += 1 }
+            }
+        }
+        return outcome
+    }
+
+    /// Records a failed upload attempt: bumps `attempts`, stamps `last_attempt_at` (for the backoff
+    /// window) and `last_error` (telemetry) on the net entry. When parking, the **whole collapsed
+    /// group** is dead-lettered together — else a superseded older op (e.g. an orphaned delete)
+    /// could become the net op on a later drain and mis-apply.
+    private func recordFailure(_ entry: OutboxEntry, groupSeqs: [Int64], attempts: Int, now: Date, park: Bool, error: Error) async throws {
+        try await db.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE \(SyncSchema.outboxTable)
+                    SET attempts = ?, last_attempt_at = ?, last_error = ?, dead_lettered = ?
+                    WHERE seq = ?
+                    """,
+                arguments: [attempts, now, "\(error)", park ? 1 : 0, entry.seq]
+            )
+            if park {
+                let others = groupSeqs.filter { $0 != entry.seq }
+                if !others.isEmpty {
+                    let placeholders = others.map { _ in "?" }.joined(separator: ", ")
                     try db.execute(
-                        sql: "UPDATE \(SyncSchema.outboxTable) SET attempts = attempts + 1 WHERE seq = ?",
-                        arguments: [entry.seq]
+                        sql: "UPDATE \(SyncSchema.outboxTable) SET dead_lettered = 1, last_error = ? WHERE seq IN (\(placeholders))",
+                        arguments: StatementArguments(["\(error)"] as [any DatabaseValueConvertible] + others.map { $0 as any DatabaseValueConvertible })
                     )
                 }
             }
         }
     }
 
-    private func process(_ entry: OutboxEntry) async throws {
+    /// Applies one collapsed op (the net op for a `(table, pk)`) and, on success, clears **every**
+    /// `seqs` entry the group collapsed (APPS-472) — not just the net one.
+    private func process(_ entry: OutboxEntry, clearing seqs: [Int64]) async throws {
         guard let spec = tables.first(where: { $0.name == entry.tableName }) else {
-            try await clear(entry) // table no longer synced — drop the stale entry
+            try await clear(seqs) // table no longer synced — drop the stale entries
             return
         }
         switch entry.op {
         case .upsert:
             guard let payload = try await readPayload(spec: spec, pk: entry.pk) else {
-                try await clear(entry) // row gone locally before upload — nothing to send
+                try await clear(seqs) // row gone locally before upload — nothing to send
                 return
             }
             let server = try await remote.upsert(table: spec.name, row: payload)
-            try await stampAndClear(entry, spec: spec, server: server)
+            try await stampAndClear(entry, spec: spec, server: server, seqs: seqs)
         case .delete:
             try await remote.delete(table: spec.name, primaryKey: spec.primaryKey, pk: entry.pk)
-            try await clear(entry)
+            try await clear(seqs)
         }
     }
 
@@ -439,9 +650,10 @@ public actor SyncEngine {
         }
     }
 
-    /// Writes the server-stamped `updated_at` back and clears the entry in one transaction, so the
-    /// row is marked clean (its cursor won't re-pull it) only after the server confirms.
-    private func stampAndClear(_ entry: OutboxEntry, spec: SyncTable, server: [String: AnyJSON]) async throws {
+    /// Writes the server-stamped `updated_at` back and clears the collapsed group's entries in one
+    /// transaction, so the row is marked clean (its cursor won't re-pull it) only after the server
+    /// confirms.
+    private func stampAndClear(_ entry: OutboxEntry, spec: SyncTable, server: [String: AnyJSON], seqs: [Int64]) async throws {
         let updatedAt: String? = if case .string(let value) = server[spec.cursorColumn] { value } else { nil }
         try await db.write { db in
             if let updatedAt {
@@ -450,19 +662,20 @@ public actor SyncEngine {
                     arguments: [updatedAt, entry.pk]
                 )
             }
-            try db.execute(
-                sql: "DELETE FROM \(SyncSchema.outboxTable) WHERE seq = ?",
-                arguments: [entry.seq]
-            )
+            try Self.deleteEntries(db, seqs: seqs)
         }
     }
 
-    private func clear(_ entry: OutboxEntry) async throws {
-        try await db.write { db in
-            try db.execute(
-                sql: "DELETE FROM \(SyncSchema.outboxTable) WHERE seq = ?",
-                arguments: [entry.seq]
-            )
-        }
+    private func clear(_ seqs: [Int64]) async throws {
+        try await db.write { db in try Self.deleteEntries(db, seqs: seqs) }
+    }
+
+    private static func deleteEntries(_ db: Database, seqs: [Int64]) throws {
+        guard !seqs.isEmpty else { return }
+        let placeholders = seqs.map { _ in "?" }.joined(separator: ", ")
+        try db.execute(
+            sql: "DELETE FROM \(SyncSchema.outboxTable) WHERE seq IN (\(placeholders))",
+            arguments: StatementArguments(seqs)
+        )
     }
 }

@@ -8,7 +8,15 @@ enum RowCoding {
     /// Encodes an `Encodable` row into SQLite column values. Columns listed in `jsonColumns` keep
     /// their nested value as JSON text; everything else maps to a scalar.
     static func encode(_ row: some Encodable, jsonColumns: Set<String>) throws -> [String: DatabaseValue] {
-        let data = try JSONEncoder().encode(row)
+        let encoder = JSONEncoder()
+        // Without this, `.deferredToDate` encodes any `Date` property as a Double (seconds since
+        // reference date) → stored in a TEXT timestamp column and uploaded as a JSON number, breaking
+        // the §4 ISO-8601 field mapping. Encode Dates in the canonical format instead (APPS-475).
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            var container = encoder.singleValueContainer()
+            try container.encode(SyncTimestamp.string(from: date))
+        }
+        let data = try encoder.encode(row)
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw SyncError.encoding("row must encode to a JSON object")
         }
@@ -35,8 +43,9 @@ enum RowCoding {
             if CFGetTypeID(number) == CFBooleanGetTypeID() { return (number.boolValue ? 1 : 0).databaseValue }
             return CFNumberIsFloatType(number) ? number.doubleValue.databaseValue : number.int64Value.databaseValue
         default:
-            // ponytail: Date→ISO8601-fractional mapping lands with the download decode side
-            // (APPS-414) so encode/decode stay symmetric; until then UUID/enum arrive as String.
+            // Dates are already ISO-8601 strings by here (the encoder's date strategy, APPS-475);
+            // UUID/enum arrive as String too. Anything else (e.g. a `Data`/blob field) is
+            // unsupported — see `enqueue`'s supported-types note.
             throw SyncError.encoding("unsupported value \(type(of: value))")
         }
     }

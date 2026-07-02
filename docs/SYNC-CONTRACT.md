@@ -20,9 +20,19 @@ Per synced table:
 - **`deletedAt timestamptz` tombstone** (nullable). Deletes are soft — set `deletedAt` instead of
   removing the row — so deletions propagate on the next cursor pull. Deleting a parent must
   **tombstone its children too** (don't hard-`ON DELETE CASCADE`); a server trigger is the clean
-  way. Purge old tombstones server-side on a schedule.
-- **RLS scoped to `auth.uid()`** — every row read/written is filtered to the owning user. The
-  download query carries no user filter of its own; RLS enforces the partition.
+  way. Purge old tombstones server-side on a schedule. **Invariant (APPS-471): the purge retention
+  must exceed the engine's `maxOfflineGap`.** A device offline longer than the retention would never
+  see a purged tombstone; the engine defends against this by full-resyncing + reconciling once
+  `now − lastSyncedAt > maxOfflineGap`, so that window must be set ≤ the server's retention (CookThis
+  purges at 90 days; the engine defaults `maxOfflineGap` to 30).
+- **RLS scoped to `auth.uid()`** — every row read/written is filtered by RLS: it is the **security
+  boundary**. It is *not* necessarily the **sync partition**. RLS may legitimately be broader than
+  what a device should download: CookThis's `recipes` SELECT policy is `isPublic = true OR userId =
+  auth.uid()`, so an unfiltered pull would download the entire public catalog to every device. When
+  RLS is broader than the partition, the table declares a `scopeColumn` (§5) and the engine filters
+  the download (and the Realtime doorbell) to `scopeColumn = <the user's partition value>`. Leave
+  `scopeColumn` unset only when RLS already scopes the table to exactly the synced partition. See
+  APPS-469.
 - **Realtime publication** — the table is in `supabase_realtime`. Realtime is a **doorbell only**:
   an event triggers a debounced `pullNow()`; payloads are never applied directly.
 - **Server-owned columns are never written by clients** — RPC-managed values (counters, clone
@@ -37,13 +47,23 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
   optimistically. A background drain processes the outbox in `seq` order.
 - **PostgREST upsert** with `Prefer: return=representation` (returns the server-stamped
   `updatedAt`) for `.upsert`; soft-delete for `.delete`. Both are **idempotent by primary key**, so
-  retries are safe; back off exponentially and count `attempts`.
+  retries are safe; back off exponentially **per entry** (`last_attempt_at` gates the window) and
+  count `attempts`.
+- **Failures are visible, not swallowed (APPS-470).** A failed upload surfaces in `SyncStatus`
+  (`failedUploads` while retrying, `deadLetters` once parked) so a user whose writes are all failing
+  never sees a healthy idle. Classify failures: **permanent** (4xx — RLS, constraint, validation)
+  dead-letter immediately; **transient** (network, 5xx, 408/429) retry with backoff until a cap,
+  then dead-letter. A dead-lettered entry stops retrying **and** stops counting as a dirty row, so
+  it never permanently blocks downloads for its key (§3 LWW). Health = `phase == .idle &&
+  failedUploads == 0 && deadLetters == 0`.
 - **FK ordering:** upsert parents before children; tombstone children before parents.
 - The upsert payload **excludes** `serverOwnedColumns` (§4) and re-encodes `jsonColumns` to JSON.
 
 ## 3. Download (cursor pull → local, LWW)
 
-- Per table: `SELECT * WHERE updatedAt > :cursor ORDER BY (updatedAt, id)`, RLS-scoped.
+- Per table: `SELECT * WHERE updatedAt > :cursor [AND scopeColumn = :partition] ORDER BY
+  (updatedAt, id)`, RLS-scoped. The `scopeColumn` predicate is added only for tables that declare
+  one (§1, §5); it is orthogonal to the `(updatedAt, id)` cursor.
 - **Tuple cursor `(updatedAt, id)`** — not a bare timestamp — so rows sharing a millisecond at a
   page boundary aren't dropped. Advance it past the last applied row.
 - **LWW apply:** apply a remote row only if `remote.updatedAt > local.updatedAt` **and** the local
@@ -57,7 +77,7 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
 | Concern | Convention |
 |---|---|
 | Column names | **camelCase, identical** in local SQLite and Postgres — no snake_case mapping layer. |
-| Dates | ISO-8601 **with fractional seconds** (`.withInternetDateTime, .withFractionalSeconds`); fall back to non-fractional on read for legacy rows. |
+| Dates | ISO-8601 **with fractional seconds** (`.withInternetDateTime, .withFractionalSeconds`); fall back to non-fractional on read for legacy rows. This is the **canonical** form: the LWW gate canonicalizes both sides (PostgREST `…+00:00`/microseconds, client `…Z`, legacy non-fractional) to it before the lexicographic compare, so mixed formats/zones still order chronologically (APPS-474). Codable `Date`s encode to it too (APPS-475). |
 | UUID | stored as text locally. |
 | Bool | integer `0/1` locally ↔ `boolean` in Postgres. |
 | Enum | `rawValue` string. |
@@ -74,6 +94,9 @@ declares the same shape):
 - `dependsOn` — tables referenced by FK; drives sync ordering
 - `jsonColumns` — columns needing JSON encode/decode
 - `serverOwnedColumns` — RPC-managed columns stripped from upserts
+- `scopeColumn` — partition column (e.g. `userId`) when RLS is broader than the sync partition;
+  the engine filters downloads + the doorbell to `scopeColumn = <partition value>` (§1). Omit when
+  RLS already scopes the table to exactly the partition.
 
 ---
 
@@ -99,8 +122,25 @@ update trigger needed; cursor on `translatedAt`. ² `cookedCount` is RPC-managed
 (`rpcIncrementCookedCount`) — it must never be in an upsert payload. Verify whether `recipes`
 carries any server-owned counter (clone/cook counts) before cutover.
 
-Already satisfied server-side: RLS-per-user on all 9, `supabase_realtime` publication covers all 9,
-denormalized `userId` partition key on the recipe-child tables (COOK-328), uuid PKs.
+Already satisfied server-side: `supabase_realtime` publication covers all 9, denormalized `userId`
+partition key on the recipe-child tables (COOK-328), uuid PKs.
+
+**RLS ≠ partition (APPS-469).** RLS scopes reads/writes on all 9, but on 5 tables it is *broader*
+than the sync partition, so those must declare a `scopeColumn` or the engine downloads the whole
+public catalog to every device:
+
+| table | RLS SELECT policy | `scopeColumn` |
+|---|---|---|
+| `recipes` | `isPublic = true OR userId = auth.uid()` | `userId` |
+| `recipeIngredients` | readable with parent recipe | `userId`¹ |
+| `recipeSteps` | readable with parent recipe | `userId`¹ |
+| `recipeStepIngredients` | readable with parent recipe | `userId`¹ |
+| `recipe_translations` | readable with parent recipe | `userId`¹ |
+| `profiles`, `cookingSessions`, `mealPlans`, `userRecipeInteractions` | `userId`/`id = auth.uid()` — RLS already equals the partition | — (omit) |
+
+¹ Uses the denormalized `userId` partition column added in COOK-328. Consumer-side adoption
+(declaring these `scopeColumn`s in CookThis's `SyncTable` list + supplying the `scope` uid closure)
+is ticketed in "Cook This - Release Ready".
 
 ---
 
