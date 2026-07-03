@@ -67,6 +67,20 @@ SyncEngine(db:, supabase:, tables:, auth: { await session.accessToken },
            scope: { await session.user?.id.uuidString })
 ```
 
+For a table with a **secondary unique constraint** on the server (beyond its primary key), declare
+`conflictColumns` so the engine upserts with that constraint as the PostgREST conflict target. A
+device that mints a fresh primary key for a row the server already holds under the unique
+constraint (e.g. created on another device, or server-side, and not yet pulled) would otherwise
+409 on every retry and poison its outbox forever:
+
+```swift
+// userRecipeInteractions has UNIQUE(userId, recipeId) on the server:
+SyncTable(name: "userRecipeInteractions", conflictColumns: ["userId", "recipeId"])
+```
+
+The merge re-keys the server row to the client's primary key, so **only declare `conflictColumns`
+on a leaf table** — one whose primary key nothing else foreign-keys — or you orphan its children.
+
 ## Teardown
 
 `stop()` is **async and awaits the in-flight sync pass** before returning — after it returns the

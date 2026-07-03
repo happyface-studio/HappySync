@@ -97,6 +97,11 @@ declares the same shape):
 - `scopeColumn` — partition column (e.g. `userId`) when RLS is broader than the sync partition;
   the engine filters downloads + the doorbell to `scopeColumn = <partition value>` (§1). Omit when
   RLS already scopes the table to exactly the partition.
+- `conflictColumns` — columns of a **secondary unique constraint** to use as the PostgREST upsert
+  conflict target (e.g. `["userId", "recipeId"]`), so a fresh-primary-key insert merges onto the
+  existing server row instead of 409-ing on the duplicate. The merge re-keys the row to the
+  client's primary key, so only declare it on a **leaf** table (no FK children). Omit when the
+  primary key is the only uniqueness the upsert can hit.
 
 ---
 

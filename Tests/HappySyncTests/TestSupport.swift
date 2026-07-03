@@ -8,7 +8,7 @@ import Supabase
 /// page limit — so ordering, retry, LWW, tombstones, and pagination are all observable offline.
 actor FakeRemote: SyncRemote {
     let serverUpdatedAt = "2026-06-30T12:00:00.000Z"
-    private(set) var upsertCalls: [(table: String, row: [String: AnyJSON])] = []
+    private(set) var upsertCalls: [(table: String, row: [String: AnyJSON], onConflict: String?)] = []
     private(set) var deleteCalls: [(table: String, pk: String)] = []
     private(set) var fetchCalls = 0
     /// The scope passed to the most recent `fetch` — lets a test assert the engine forwarded the
@@ -39,8 +39,8 @@ actor FakeRemote: SyncRemote {
     /// seam so the drain dead-letters it on the first attempt.
     struct PermanentFailure: ClassifiedSyncError { let isPermanent = true }
 
-    func upsert(table: String, row: [String: AnyJSON]) async throws -> [String: AnyJSON] {
-        upsertCalls.append((table, row))
+    func upsert(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON] {
+        upsertCalls.append((table, row, onConflict))
         if remainingFailures > 0 {
             remainingFailures -= 1
             throw permanentUpsertFailures ? PermanentFailure() : Failure.simulated
@@ -106,7 +106,7 @@ struct GatedRemote: SyncRemote {
     let gate: Signal
     let dataset: [String: [[String: AnyJSON]]]
 
-    func upsert(table: String, row: [String: AnyJSON]) async throws -> [String: AnyJSON] { row }
+    func upsert(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON] { row }
     func delete(table: String, primaryKey: String, pk: String) async throws {}
 
     func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] {

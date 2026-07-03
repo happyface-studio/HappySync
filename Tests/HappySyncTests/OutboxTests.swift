@@ -161,6 +161,51 @@ import Supabase
     #expect(ids == [.string("a"), .string("b")])
 }
 
+// MARK: - Conflict target (secondary unique constraint)
+
+@Test func drainForwardsConflictColumnsAsOnConflictTarget() async throws {
+    // A table with a server-side secondary unique constraint (userId, recipeId) must upsert with
+    // that constraint as the PostgREST conflict target — else a fresh-id insert 409s forever on a
+    // device that hasn't yet pulled the existing server row (APPS-478).
+    let db = try DatabaseQueue()
+    try await db.write { db in
+        try db.create(table: "userRecipeInteractions") { t in
+            t.column("id", .text).primaryKey()
+            t.column("userId", .text)
+            t.column("recipeId", .text)
+            t.column("updatedAt", .text)
+        }
+    }
+    let remote = FakeRemote()
+    let engine = try SyncEngine(
+        db: db,
+        remote: remote,
+        tables: [SyncTable(name: "userRecipeInteractions", conflictColumns: ["userId", "recipeId"])]
+    )
+    try await engine.enqueue(
+        .upsert,
+        table: "userRecipeInteractions",
+        row: ["id": "x1", "userId": "u1", "recipeId": "r1"] as [String: AnyJSON]
+    )
+
+    try await engine.drainOutbox()
+
+    #expect(await remote.upsertCalls.first?.onConflict == "userId,recipeId")
+}
+
+@Test func drainUsesPrimaryKeyConflictTargetByDefault() async throws {
+    // No conflictColumns declared → the upsert conflicts on the primary key (onConflict nil), the
+    // engine's default. Guards against every table paying the id-churn cost of a merge it doesn't need.
+    let db = try recipesDB()
+    let remote = FakeRemote()
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+
+    try await engine.drainOutbox()
+
+    #expect(await remote.upsertCalls.first?.onConflict == nil)
+}
+
 // MARK: - Retry & backoff
 
 @Test func failedUpsertIsKeptCountedAndRetriedIdempotently() async throws {
