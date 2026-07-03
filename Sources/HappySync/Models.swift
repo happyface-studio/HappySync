@@ -28,6 +28,16 @@ public struct SyncTable: Sendable, Hashable {
     /// policy is `isPublic = true OR userId = auth.uid()`, so an unfiltered pull would download the
     /// whole public catalog to every device. See APPS-469 / contract §1.
     public let scopeColumn: String?
+    /// Columns forming a **secondary unique constraint** on the server that a fresh-primary-key
+    /// insert would violate. When set, the engine upserts with PostgREST `on_conflict=<these>`, so a
+    /// row merges onto the existing server row by this constraint instead of 409-ing on the
+    /// duplicate — e.g. CookThis's `userRecipeInteractions` has `UNIQUE(userId, recipeId)`, and a
+    /// device that hasn't pulled a server-created interaction yet would otherwise mint a new id and
+    /// poison its outbox forever. Empty (the default) means the primary key is the only uniqueness
+    /// the upsert can hit. **Only safe on a leaf table** (nothing foreign-keys its primary key): the
+    /// merge re-keys the server row to the client's id, which would orphan children of a non-leaf
+    /// table. See APPS-478.
+    public let conflictColumns: [String]
 
     public init(
         name: String,
@@ -36,7 +46,8 @@ public struct SyncTable: Sendable, Hashable {
         dependsOn: [String] = [],
         jsonColumns: [String] = [],
         serverOwnedColumns: [String] = [],
-        scopeColumn: String? = nil
+        scopeColumn: String? = nil,
+        conflictColumns: [String] = []
     ) {
         self.name = name
         self.primaryKey = primaryKey
@@ -45,6 +56,7 @@ public struct SyncTable: Sendable, Hashable {
         self.jsonColumns = jsonColumns
         self.serverOwnedColumns = serverOwnedColumns
         self.scopeColumn = scopeColumn
+        self.conflictColumns = conflictColumns
     }
 }
 

@@ -45,8 +45,10 @@ func remoteErrorIsPermanent(_ error: Error) -> Bool {
 /// only place that touches the network.
 protocol SyncRemote: Sendable {
     /// Upserts one row and returns the server's representation, which carries the stamped
-    /// cursor column (`updatedAt`) the drain writes back locally to mark the row clean.
-    func upsert(table: String, row: [String: AnyJSON]) async throws -> [String: AnyJSON]
+    /// cursor column (`updatedAt`) the drain writes back locally to mark the row clean. `onConflict`
+    /// is the comma-joined columns of a secondary unique constraint to use as the PostgREST conflict
+    /// target, or nil to conflict on the primary key (the default). See APPS-478.
+    func upsert(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON]
     /// Propagates a delete for one row, keyed by primary key (soft delete — sets the tombstone).
     func delete(table: String, primaryKey: String, pk: String) async throws
     /// Fetches up to `limit` rows changed since `cursor`, ordered by the `(cursorColumn, id)` tuple
@@ -62,12 +64,14 @@ struct SupabaseRemote: SyncRemote {
     let client: SupabaseClient
     let auth: @Sendable () async -> String
 
-    func upsert(table: String, row: [String: AnyJSON]) async throws -> [String: AnyJSON] {
+    func upsert(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON] {
         let token = await auth()
         do {
+            // onConflict nil → PostgREST conflicts on the primary key (its default); non-nil → the
+            // named secondary unique constraint is the conflict target, merging onto the existing row.
             let rows: [[String: AnyJSON]] = try await client
                 .from(table)
-                .upsert(row, returning: .representation)
+                .upsert(row, onConflict: onConflict, returning: .representation)
                 .setHeader(name: "Authorization", value: "Bearer \(token)")
                 .execute()
                 .value

@@ -627,7 +627,8 @@ public actor SyncEngine {
                 try await clear(seqs) // row gone locally before upload — nothing to send
                 return
             }
-            let server = try await remote.upsert(table: spec.name, row: payload)
+            let onConflict = spec.conflictColumns.isEmpty ? nil : spec.conflictColumns.joined(separator: ",")
+            let server = try await remote.upsert(table: spec.name, row: payload, onConflict: onConflict)
             try await stampAndClear(entry, spec: spec, server: server, seqs: seqs)
         case .delete:
             try await remote.delete(table: spec.name, primaryKey: spec.primaryKey, pk: entry.pk)
