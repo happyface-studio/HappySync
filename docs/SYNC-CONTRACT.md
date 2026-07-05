@@ -73,6 +73,18 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
   it never permanently blocks downloads for its key (§3 LWW). Health = `phase == .idle &&
   failedUploads == 0 && deadLetters == 0`.
 - **FK ordering:** upsert parents before children; tombstone children before parents.
+- **Local cascade on delete (APPS-510).** `enqueue(.delete)` on a parent whose children are enforced
+  by local foreign keys deletes those child rows too — deepest-first, in the **same transaction** —
+  and enqueues a tombstone for each, so the drain soft-deletes them server-side as well. This mirrors
+  the server's child-tombstone trigger (§1), keeping the local and server deleted sets symmetric with
+  **no orphan window** (the UI never shows children of an already-deleted parent) and no round-trip.
+  Without it a parent delete either throws a raw SQLite RESTRICT mid-flow (FKs on) or orphans children
+  until a later pull applies the server tombstone (FKs off). Child rows are found from the schema's
+  **declared foreign keys** (introspected via `PRAGMA foreign_key_list`), so only rows that actually
+  reference a deleted parent go; a table that only *logically* `dependsOn` a parent without a real FK
+  constraint is not cascaded locally — its orphans still reconcile on the next pull. The cascade
+  assumes FKs reference the parent's primary key (the §4 convention). The drain then tombstones the
+  whole set children-before-parents via the FK ordering above, so no separate ordering is needed.
 - The upsert payload **excludes** `serverOwnedColumns` (§4) and re-encodes `jsonColumns` to JSON.
 - **Schema-drift tolerance (APPS-504).** A column the server has dropped or renamed but a shipped
   client still sends makes PostgREST reject the whole upsert (`PGRST204`), which classifies permanent
