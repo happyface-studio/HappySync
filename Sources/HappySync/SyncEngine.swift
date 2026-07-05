@@ -639,7 +639,9 @@ public actor SyncEngine {
     /// Records a failed upload attempt: bumps `attempts`, stamps `last_attempt_at` (for the backoff
     /// window) and `last_error` (telemetry) on the net entry. When parking, the **whole collapsed
     /// group** is dead-lettered together — else a superseded older op (e.g. an orphaned delete)
-    /// could become the net op on a later drain and mis-apply.
+    /// could become the net op on a later drain and mis-apply — and the table's download cursor is
+    /// reset so the next pull re-fetches whatever remote version the LWW gate skipped while the row
+    /// was dirty (APPS-505).
     private func recordFailure(_ entry: OutboxEntry, groupSeqs: [Int64], attempts: Int, now: Date, park: Bool, error: Error) async throws {
         try await db.write { db in
             try db.execute(
@@ -659,8 +661,24 @@ public actor SyncEngine {
                         arguments: StatementArguments(["\(error)"] as [any DatabaseValueConvertible] + others.map { $0 as any DatabaseValueConvertible })
                     )
                 }
+                try Self.resetCursor(db, table: entry.tableName)
             }
         }
+    }
+
+    /// Clears a table's download cursor so the next pull re-scans it from scratch. Invoked when an
+    /// entry dead-letters: while its row was dirty, `lwwAllows` skipped every remote version of that
+    /// row (the queued upload was meant to win), yet the cursor still advanced past them. Once the
+    /// entry parks the row stops being dirty, so those skipped versions now sit *behind* the cursor
+    /// and would never be re-fetched — leaving the local row permanently diverged from the server
+    /// (APPS-505). Re-scanning the whole table is cheap at personal scale, and LWW re-applies only
+    /// the versions that are genuinely newer than the local row. The future dead-letter repair API
+    /// should call this same reset when it discards an entry (APPS-508).
+    private static func resetCursor(_ db: Database, table: String) throws {
+        try db.execute(
+            sql: "DELETE FROM \(SyncSchema.stateTable) WHERE table_name = ?",
+            arguments: [table]
+        )
     }
 
     /// Applies one collapsed op (the net op for a `(table, pk)`) and, on success, clears **every**
