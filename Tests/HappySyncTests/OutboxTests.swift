@@ -277,6 +277,39 @@ import Supabase
     #expect(payload.keys.contains("cookedCount") == false) // server owns it — never uploaded
 }
 
+@Test func drainExcludesColumnsTheServerDoesNotKnow() async throws {
+    // The server has since dropped `legacyNotes`; a shipped client still has it locally. Declaring
+    // `serverColumns` intersects the payload so the upsert doesn't PGRST204 and dead-letter every
+    // write on the table (APPS-504).
+    let db = try DatabaseQueue()
+    try await db.write { db in
+        try db.create(table: "recipes") { t in
+            t.column("id", .text).primaryKey()
+            t.column("title", .text)
+            t.column("legacyNotes", .text) // a column the server no longer has
+            t.column("updatedAt", .text)
+        }
+    }
+    let remote = FakeRemote()
+    let engine = try SyncEngine(
+        db: db,
+        remote: remote,
+        tables: [SyncTable(name: "recipes", serverColumns: ["id", "title", "updatedAt"])]
+    )
+    try await engine.enqueue(
+        .upsert,
+        table: "recipes",
+        row: ["id": "r1", "title": "Soup", "legacyNotes": "old"] as [String: AnyJSON]
+    )
+
+    try await engine.drainOutbox()
+
+    let payload = try #require(await remote.upsertCalls.first?.row)
+    #expect(payload["id"] == .string("r1"))
+    #expect(payload["title"] == .string("Soup"))
+    #expect(payload.keys.contains("legacyNotes") == false) // server dropped it — excluded from upload
+}
+
 @Test func drainPropagatesDeleteAndClearsEntry() async throws {
     let db = try recipesDB()
     try await db.write { db in

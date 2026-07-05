@@ -383,6 +383,10 @@ public actor SyncEngine {
             }
             seenPks[spec.name] = [] // mark the table as fetched — a skipped table has no entry
             var cursor = try await readCursor(table: spec.name)
+            // One introspection per table per pass: the columns the local schema actually has, so we
+            // drop wire columns a server that migrated ahead added but this app build lacks — an old
+            // client silently doesn't see the new column instead of bricking every pull (APPS-504).
+            let knownColumns = try await db.read { db in try RowCoding.tableColumns(db, table: spec.name) }
             while true {
                 let page = try await remote.fetch(
                     table: spec.name, cursorColumn: spec.cursorColumn, since: cursor,
@@ -414,7 +418,8 @@ public actor SyncEngine {
                             } else {
                                 try RowCoding.upsertLocalRow(
                                     db, table: spec.name, primaryKey: spec.primaryKey,
-                                    columns: RowCoding.localColumns(from: row)
+                                    columns: RowCoding.localColumns(from: row),
+                                    restrictingTo: knownColumns
                                 )
                             }
                         }
@@ -673,7 +678,8 @@ public actor SyncEngine {
             return RowCoding.payload(
                 from: row,
                 jsonColumns: Set(spec.jsonColumns),
-                excluding: Set(spec.serverOwnedColumns)
+                excluding: Set(spec.serverOwnedColumns),
+                restrictingTo: spec.serverColumns.isEmpty ? nil : Set(spec.serverColumns)
             )
         }
     }
