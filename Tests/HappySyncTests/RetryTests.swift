@@ -229,3 +229,24 @@ private func httpError(_ code: Int) -> HTTPError {
     #expect(afterPark?.failedUploads == 0) // no longer actively retrying…
     #expect(afterPark?.deadLetters == 1)   // …now surfaced as a dead-letter for the consumer to repair
 }
+
+@Test func statusStaysFailingWhenDrainSkipsEntryInBackoffWindow() async throws {
+    let db = try recipesDB()
+    let remote = FakeRemote(failUpserts: 99) // always fails transiently
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 5)
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+
+    try await engine.runSyncOnce() // attempt 1 fails; entry now inside its per-entry backoff window
+    // Second pass immediately after, without ageing past backoff: the drain skips the entry (still
+    // inside its window), so the *pass* reports no failures — but the write is still failing. The
+    // settled status must read from the DB, not the drain pass (APPS-507).
+    try await engine.runSyncOnce()
+
+    var iter = engine.status.makeAsyncIterator()
+    let settled = await iter.next()
+    #expect(settled?.phase == .idle)         // pull succeeded, so not .failed…
+    #expect(settled?.failedUploads == 1)     // …and the skipped-but-failing upload is still surfaced
+    #expect(settled?.deadLetters == 0)
+    // The drain genuinely skipped the second attempt (proves the pass count would have been 0).
+    #expect(await remote.upsertCalls.count == 1)
+}

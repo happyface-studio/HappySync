@@ -225,11 +225,14 @@ public actor SyncEngine {
     private func runLoop(_ wake: AsyncStream<Void>) async {
         for await _ in wake {
             do {
-                let outcome = try await runSyncOnce()
-                // A pull can succeed while uploads keep failing. Transient upload failures still
-                // drive scheduler backoff (so a flapping upload isn't hammered); dead-lettered
-                // entries don't — they've stopped retrying, so the engine is healthy again (APPS-470).
-                consecutiveFailures = outcome.failed > 0 ? consecutiveFailures + 1 : 0
+                let status = try await runSyncOnce()
+                // A pull can succeed while uploads keep failing. Any still-failing upload (attempts > 0,
+                // not yet parked) keeps the scheduler backed off so a flapping upload isn't hammered —
+                // including on passes where the entry sat inside its backoff window and the drain skipped
+                // it, so backoff no longer collapses to the steady poll mid-failure (APPS-507).
+                // Dead-lettered entries don't count — they've stopped retrying, so the engine is healthy
+                // again (APPS-470).
+                consecutiveFailures = status.failedUploads > 0 ? consecutiveFailures + 1 : 0
             } catch {
                 consecutiveFailures += 1 // status already shows .failed; the periodic loop retries with backoff
             }
@@ -284,12 +287,13 @@ public actor SyncEngine {
     /// The scheduler serialises these, so a push and pull never overlap.
     ///
     /// The settled `.idle` status still carries `failedUploads`/`deadLetters`: a drain can complete
-    /// (so the *pass* is idle) while individual entries are still failing or parked. Health is
+    /// (so the *pass* is idle) while individual entries are still failing or parked. Both counts are
+    /// read from the DB — not the drain pass — so an entry skipped inside its per-entry backoff
+    /// window still surfaces as failing rather than flapping to healthy (APPS-507). Health is
     /// `phase == .idle && failedUploads == 0 && deadLetters == 0`, not the phase alone (APPS-470).
     @discardableResult
-    func runSyncOnce() async throws -> DrainOutcome {
+    func runSyncOnce() async throws -> SyncStatus {
         statusBroadcaster.send(SyncStatus(phase: .syncing, lastSyncedAt: lastSyncedAt))
-        let outcome: DrainOutcome
         do {
             // Once per process: if this device is past the offline horizon, full-resync before the
             // normal push/pull so a stale cursor can't skip purged tombstones (APPS-471). Gated so a
@@ -299,7 +303,7 @@ public actor SyncEngine {
             if !didResyncCheck {
                 didResyncCheck = try await resyncIfStale()
             }
-            outcome = try await drainOutbox()
+            try await drainOutbox()
             try await pullNow()
         } catch {
             statusBroadcaster.send(SyncStatus(phase: .failed("\(error)"), lastSyncedAt: lastSyncedAt))
@@ -312,14 +316,27 @@ public actor SyncEngine {
         if didResyncCheck {
             try await writeLastSyncedAt(lastSyncedAt!)
         }
-        let deadLetters = try await db.read { db in
-            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 1") ?? 0
+        // Settle both counts from the live outbox, not the drain pass just run. The drain skips
+        // entries still inside their per-entry backoff window without counting them, so `outcome.failed`
+        // alternates 1 → 0 across passes for a single persistently-failing entry — reading healthy
+        // while the write is still failing. An entry with `attempts > 0` that isn't dead-lettered is,
+        // by definition, still failing and retrying, whether or not this pass happened to re-attempt
+        // it (APPS-507).
+        let (failedUploads, deadLetters) = try await db.read { db -> (Int, Int) in
+            let failing = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE attempts > 0 AND dead_lettered = 0"
+            ) ?? 0
+            let dead = try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 1"
+            ) ?? 0
+            return (failing, dead)
         }
-        statusBroadcaster.send(SyncStatus(
+        let status = SyncStatus(
             phase: .idle, lastSyncedAt: lastSyncedAt,
-            failedUploads: outcome.failed, deadLetters: deadLetters
-        ))
-        return outcome
+            failedUploads: failedUploads, deadLetters: deadLetters
+        )
+        statusBroadcaster.send(status)
+        return status
     }
 
     /// Records a write in the outbox in the same transaction as the domain write, so the local
