@@ -86,6 +86,54 @@ import Supabase
     #expect(pulls >= 3) // initial sync + repeated periodic polls, with no doorbell at all
 }
 
+// MARK: - Local writes wake the runner (APPS-503)
+
+@Test func enqueueTriggersDrainWithoutSyncNow() async throws {
+    let db = try recipesDB()
+    let remote = FakeRemote()
+    // Long poll, silent doorbell → the only thing that can drive an upload is the enqueue itself.
+    let engine = try SyncEngine(
+        db: db, remote: remote, tables: [SyncTable(name: "recipes")],
+        doorbell: SilentDoorbell(), pollInterval: 999, debounceInterval: 0.02
+    )
+    await engine.start()
+    try await Task.sleep(for: .milliseconds(50)) // initial start-sync settles
+    let baseline = await remote.upsertCalls.count
+
+    // A local write with no syncNow() follow-up must still upload promptly.
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await Task.sleep(for: .milliseconds(80))
+    let after = await remote.upsertCalls.count
+    await engine.stop()
+
+    #expect(after - baseline == 1) // the enqueue alone drove a drain, no explicit nudge
+}
+
+@Test func burstOfEnqueuesCoalescesIntoOneDrainPass() async throws {
+    let db = try recipesDB()
+    let remote = FakeRemote()
+    let engine = try SyncEngine(
+        db: db, remote: remote, tables: [SyncTable(name: "recipes")],
+        doorbell: SilentDoorbell(), pollInterval: 999, debounceInterval: 0.05
+    )
+    await engine.start()
+    try await Task.sleep(for: .milliseconds(80)) // initial start-sync settles
+    let baseline = await remote.fetchCalls
+
+    // e.g. importing a recipe with many ingredients: a burst of writes inside one debounce window.
+    for i in 0..<20 {
+        try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r\(i)", "title": "row \(i)"])
+    }
+    try await Task.sleep(for: .milliseconds(120))
+    let passes = await remote.fetchCalls - baseline // one fetch per sync pass (empty dataset)
+    let uploads = await remote.upsertCalls.count
+    await engine.stop()
+
+    #expect(passes <= 2)   // the whole burst coalesced — not one pass per write
+    #expect(passes >= 1)   // …but it did drain
+    #expect(uploads == 20) // and every queued write was uploaded in that pass
+}
+
 @Test func syncNowForcesAnImmediatePull() async throws {
     let db = try recipesDB()
     let remote = FakeRemote()

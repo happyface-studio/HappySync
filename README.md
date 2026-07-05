@@ -47,6 +47,9 @@ let engine = try SyncEngine(
 
 await engine.start()
 try await engine.enqueue(.upsert, table: "recipes", row: recipe)
+// No syncNow() needed after a write: enqueue wakes the runner itself, so the change uploads
+// promptly (debounced, so a burst coalesces into one drain pass). Call syncNow() only for
+// app-driven nudges like returning to the foreground or pull-to-refresh.
 try await engine.pullNow()
 
 for await status in engine.status {

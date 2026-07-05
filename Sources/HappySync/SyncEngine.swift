@@ -240,12 +240,20 @@ public actor SyncEngine {
     /// poke the runner, so a multi-row remote change triggers exactly one pull.
     private func doorbellLoop() async {
         for await _ in doorbell.ring() {
-            debounceTask?.cancel()
-            debounceTask = Task { [debounceInterval, weak self] in
-                try? await Task.sleep(for: .seconds(debounceInterval))
-                guard !Task.isCancelled else { return }
-                await self?.poke()
-            }
+            armDebouncedPoke()
+        }
+    }
+
+    /// (Re)arms a single trailing debounce that pokes the runner after `debounceInterval`. Shared by
+    /// the doorbell (remote changes) and `enqueue` (local writes), so a burst from either source —
+    /// or a mix of both — coalesces into one drain pass instead of one per event. Cancelled on
+    /// `stop()`.
+    private func armDebouncedPoke() {
+        debounceTask?.cancel()
+        debounceTask = Task { [debounceInterval, weak self] in
+            try? await Task.sleep(for: .seconds(debounceInterval))
+            guard !Task.isCancelled else { return }
+            await self?.poke()
         }
     }
 
@@ -318,6 +326,10 @@ public actor SyncEngine {
     /// store and the pending-upload queue can never disagree. An `.upsert` writes the row to its
     /// table; a `.delete` removes it locally (the tombstone is propagated to the server on drain).
     ///
+    /// On success it wakes the runner through the shared debounce, so the write uploads promptly
+    /// rather than waiting for the next periodic poll (APPS-503). A burst of writes coalesces into
+    /// one drain pass, and the wake is a no-op before `start()` (the runner isn't listening yet).
+    ///
     /// Supported row value types: `String`, numbers, `Bool`, `Date` (encoded as canonical ISO-8601,
     /// APPS-475), `null`, and — for columns declared in `jsonColumns` — nested objects/arrays.
     /// `Data`/blob fields are **not** supported and throw `SyncError.encoding`.
@@ -349,6 +361,7 @@ public actor SyncEngine {
                 arguments: [table, pk, op.rawValue, Date()]
             )
         }
+        armDebouncedPoke() // wake the runner so the write uploads promptly (APPS-503)
     }
 
     /// Pulls rows changed since each table's `(updated_at, id)` cursor and applies them
