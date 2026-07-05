@@ -80,6 +80,9 @@ public actor SyncEngine {
     /// Resolves the current user's download-partition value (auth uid) for tables that declare a
     /// `scopeColumn`, or nil when signed out. Called per pull so a user switch re-scopes (APPS-469).
     private let scope: @Sendable () async -> String?
+    /// Whether any synced table declares a `scopeColumn`. When false the doorbell subscription is
+    /// scope-independent, so an auth change needn't tear down and rebuild its channel (APPS-509).
+    private let hasScopedTables: Bool
     /// After this many failed upload attempts a transient entry is dead-lettered (parked). A
     /// permanent (4xx) failure parks immediately regardless. See APPS-470.
     private let deadLetterAfter: Int
@@ -101,10 +104,23 @@ public actor SyncEngine {
     /// `stop()` can let the in-flight pass finish gracefully (finish the wake stream, don't cancel)
     /// while cancelling the triggers (APPS-473).
     private var runnerTask: Task<Void, Never>?
-    /// The doorbell + periodic loops that poke the runner. Cancelled on `stop()`.
+    /// The periodic loop that pokes the runner. Cancelled on `stop()`.
     private var triggersTask: Task<Void, Never>?
+    /// The Realtime doorbell's consumer. Managed apart from the trigger loops so an auth change can
+    /// tear it down and re-subscribe under the new partition scope — without a stop/start (APPS-509).
+    /// Cancelled on `stop()`.
+    private var doorbellTask: Task<Void, Never>?
+    /// Which partition value the doorbell is currently subscribed under, so a pull that resolves a
+    /// different scope is detected as a transition and re-subscribes (APPS-509).
+    private var doorbellState: DoorbellState = .idle
     private var debounceTask: Task<Void, Never>?
     private var wake: AsyncStream<Void>.Continuation?
+
+    /// Tracks the doorbell's current subscription so an auth change surfaces as a state transition.
+    private enum DoorbellState: Equatable {
+        case idle                    // not subscribed — before start() / after stop()
+        case ringing(scope: String?) // subscribed, filtering this partition (nil = signed out)
+    }
 
     /// Live engine status. Each access returns an independent stream that replays the latest
     /// snapshot, so multiple consumers (status UI, refresh loop) can observe concurrently.
@@ -138,7 +154,7 @@ public actor SyncEngine {
             doorbell: SupabaseDoorbell(
                 client: supabase,
                 tables: tables.map { ($0.name, $0.scopeColumn) },
-                scope: scope
+                channelName: SupabaseDoorbell.makeChannelName()
             ),
             scope: scope,
             maxOfflineGap: maxOfflineGap
@@ -168,6 +184,7 @@ public actor SyncEngine {
         self.pollInterval = pollInterval
         self.debounceInterval = debounceInterval
         self.scope = scope
+        self.hasScopedTables = tables.contains { $0.scopeColumn != nil }
         self.deadLetterAfter = deadLetterAfter
         self.maxOfflineGap = maxOfflineGap
         self.statusBroadcaster = StatusBroadcaster(initial: SyncStatus())
@@ -193,14 +210,14 @@ public actor SyncEngine {
             guard let self else { return }
             await self.runLoop(stream)
         }
+        // The periodic poll pokes the runner on a timer; the Realtime doorbell is subscribed by the
+        // first sync pass and re-subscribed on any auth change, both via `updateDoorbellScope` — so
+        // scoped tables ring for the current user even if start() preceded sign-in (APPS-509).
         triggersTask = Task { [weak self] in
             guard let self else { return }
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask { await self.doorbellLoop() }
-                group.addTask { await self.periodicLoop() }
-            }
+            await self.periodicLoop()
         }
-        poke() // converge immediately on start
+        poke() // converge immediately on start (the first pass also subscribes the doorbell)
     }
 
     /// Stops background sync and finishes all status streams. **Awaits the in-flight sync pass**
@@ -211,11 +228,14 @@ public actor SyncEngine {
         guard isRunning else { return }
         isRunning = false
         wake?.finish(); wake = nil            // no more passes enqueued; runner exits after the current one
-        triggersTask?.cancel()                // stop the doorbell + periodic loops from poking
+        triggersTask?.cancel()                // stop the periodic loop from poking
+        doorbellTask?.cancel()                // tear down the Realtime doorbell channel
         debounceTask?.cancel(); debounceTask = nil
         await runnerTask?.value               // await the in-flight pass to finish (uncancelled → completes)
-        await triggersTask?.value             // and the trigger loops (incl. doorbell channel teardown) to unwind
-        runnerTask = nil; triggersTask = nil
+        await triggersTask?.value             // and the periodic loop to unwind
+        await doorbellTask?.value             // and the doorbell consumer (channel teardown) to unwind
+        runnerTask = nil; triggersTask = nil; doorbellTask = nil
+        doorbellState = .idle                 // a later start() re-subscribes from scratch
         statusBroadcaster.finish()
     }
 
@@ -239,10 +259,29 @@ public actor SyncEngine {
         }
     }
 
-    /// Each doorbell ring (re)arms a trailing debounce; only the last ring in a burst survives to
-    /// poke the runner, so a multi-row remote change triggers exactly one pull.
-    private func doorbellLoop() async {
-        for await _ in doorbell.ring() {
+    /// (Re)subscribes the Realtime doorbell to `scope` whenever it differs from the current
+    /// subscription. Driven from every sync pass, so an auth change the runner resolves — nil→uid at
+    /// sign-in, uid→uid' on a user switch — tears down the stale channel and re-subscribes to the
+    /// right partition, without the app stopping/starting the engine (APPS-509). Unscoped-only
+    /// engines subscribe once: their filter doesn't depend on the uid, so an auth change needn't
+    /// churn the channel.
+    private func updateDoorbellScope(_ scope: String?) {
+        guard isRunning else { return } // the doorbell only runs between start() and stop()
+        let target = hasScopedTables ? scope : nil
+        guard doorbellState != .ringing(scope: target) else { return }
+        doorbellState = .ringing(scope: target)
+        doorbellTask?.cancel() // end the previous subscription — its channel tears down on cancel
+        doorbellTask = Task { [weak self] in
+            guard let self else { return }
+            await self.consumeDoorbell(scope: target)
+        }
+    }
+
+    /// Consumes one doorbell subscription: each ring (re)arms the shared debounce, so a burst of
+    /// remote changes collapses to a single pull. Ends when the subscription is torn down (stop, or
+    /// a re-scope), which cancels this task.
+    private func consumeDoorbell(scope: String?) async {
+        for await _ in doorbell.ring(scope: scope) {
             armDebouncedPoke()
         }
     }
@@ -293,6 +332,10 @@ public actor SyncEngine {
     /// `phase == .idle && failedUploads == 0 && deadLetters == 0`, not the phase alone (APPS-470).
     @discardableResult
     func runSyncOnce() async throws -> SyncStatus {
+        // Keep the Realtime doorbell filtered on the current signed-in user: scope() is resolved
+        // every pass, so an auth change (sign-in, user switch) re-subscribes the doorbell to the
+        // right partition here — before the pull — without a stop/start (APPS-509).
+        updateDoorbellScope(await scope())
         statusBroadcaster.send(SyncStatus(phase: .syncing, lastSyncedAt: lastSyncedAt))
         do {
             // Once per process: if this device is past the offline horizon, full-resync before the
@@ -656,7 +699,9 @@ public actor SyncEngine {
     /// Records a failed upload attempt: bumps `attempts`, stamps `last_attempt_at` (for the backoff
     /// window) and `last_error` (telemetry) on the net entry. When parking, the **whole collapsed
     /// group** is dead-lettered together — else a superseded older op (e.g. an orphaned delete)
-    /// could become the net op on a later drain and mis-apply.
+    /// could become the net op on a later drain and mis-apply — and the table's download cursor is
+    /// reset so the next pull re-fetches whatever remote version the LWW gate skipped while the row
+    /// was dirty (APPS-505).
     private func recordFailure(_ entry: OutboxEntry, groupSeqs: [Int64], attempts: Int, now: Date, park: Bool, error: Error) async throws {
         try await db.write { db in
             try db.execute(
@@ -676,8 +721,24 @@ public actor SyncEngine {
                         arguments: StatementArguments(["\(error)"] as [any DatabaseValueConvertible] + others.map { $0 as any DatabaseValueConvertible })
                     )
                 }
+                try Self.resetCursor(db, table: entry.tableName)
             }
         }
+    }
+
+    /// Clears a table's download cursor so the next pull re-scans it from scratch. Invoked when an
+    /// entry dead-letters: while its row was dirty, `lwwAllows` skipped every remote version of that
+    /// row (the queued upload was meant to win), yet the cursor still advanced past them. Once the
+    /// entry parks the row stops being dirty, so those skipped versions now sit *behind* the cursor
+    /// and would never be re-fetched — leaving the local row permanently diverged from the server
+    /// (APPS-505). Re-scanning the whole table is cheap at personal scale, and LWW re-applies only
+    /// the versions that are genuinely newer than the local row. The future dead-letter repair API
+    /// should call this same reset when it discards an entry (APPS-508).
+    private static func resetCursor(_ db: Database, table: String) throws {
+        try db.execute(
+            sql: "DELETE FROM \(SyncSchema.stateTable) WHERE table_name = ?",
+            arguments: [table]
+        )
     }
 
     /// Applies one collapsed op (the net op for a `(table, pk)`) and, on success, clears **every**
