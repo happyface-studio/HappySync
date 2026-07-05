@@ -89,9 +89,11 @@ public struct SyncStatus: Sendable, Equatable {
     public var phase: Phase
     /// Time of the last successful pull/push, or `nil` if never synced.
     public var lastSyncedAt: Date?
-    /// Entries that failed to upload on the last drain and are still being retried with backoff. A
-    /// nonzero value on an otherwise-`idle` status means "some local changes haven't reached the
-    /// server yet" — the sync is degraded, not broken (APPS-470).
+    /// Outbox entries that have failed at least once and are still being retried with backoff
+    /// (`attempts > 0`, not dead-lettered) — counted from the live outbox, so an entry sitting inside
+    /// its per-entry backoff window still shows up rather than flapping to healthy on a pass that
+    /// skipped it (APPS-507). A nonzero value on an otherwise-`idle` status means "some local changes
+    /// haven't reached the server yet" — the sync is degraded, not broken (APPS-470).
     public var failedUploads: Int
     /// Entries parked after exhausting retries (or a permanent 4xx). They are no longer retried and
     /// no longer block downloads for their row; surface them so the consumer can log/repair.

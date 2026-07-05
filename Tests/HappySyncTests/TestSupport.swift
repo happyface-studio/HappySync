@@ -1,4 +1,5 @@
 import Foundation
+import os
 import GRDB
 import Supabase
 @testable import HappySync
@@ -168,16 +169,43 @@ struct UpsertGatedRemote: SyncRemote {
     func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] { [] }
 }
 
-/// A `SyncDoorbell` test double: each `fire()` rings the doorbell, simulating a Realtime change
-/// event. Backed by a single stream the engine consumes; the continuation is `Sendable`, so the
-/// class is safe to poke from a test without an actor hop.
+/// A `SyncDoorbell` test double. Each `ring(scope:)` starts a fresh subscription (a new stream),
+/// recording the scope it was asked to filter on — so a test can prove the engine re-subscribes on
+/// an auth change (APPS-509). `fire()` rings the current subscription; `fire(subscription:)` rings a
+/// specific past one, to show a torn-down (old-uid) subscription no longer pokes the runner.
 final class FakeDoorbell: SyncDoorbell, @unchecked Sendable {
-    private let stream: AsyncStream<Void>
-    private let continuation: AsyncStream<Void>.Continuation
+    private struct State {
+        var scopes: [String?] = []                              // scope of each ring(), in order
+        var continuations: [AsyncStream<Void>.Continuation] = [] // parallel to `scopes`
+        var liveCount = 0                                        // subscriptions not yet torn down
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
-    init() { (stream, continuation) = AsyncStream.makeStream(of: Void.self) }
-    func ring() -> AsyncStream<Void> { stream }
-    func fire() { continuation.yield(()) }
+    /// The scope of every subscription the engine has opened, in order — `[nil, "u1"]` proves a
+    /// signed-out→signed-in re-scope.
+    var ringScopes: [String?] { state.withLock { $0.scopes } }
+    /// Subscriptions currently live (ring() opened, not yet cancelled) — settles to 1 after a
+    /// re-scope, proving the previous channel was torn down.
+    var liveSubscriptions: Int { state.withLock { $0.liveCount } }
+
+    func ring(scope: String?) -> AsyncStream<Void> {
+        AsyncStream { continuation in
+            state.withLock {
+                $0.scopes.append(scope)
+                $0.continuations.append(continuation)
+                $0.liveCount += 1
+            }
+            continuation.onTermination = { [state] _ in state.withLock { $0.liveCount -= 1 } }
+        }
+    }
+
+    /// Rings the current (latest) subscription — a Realtime change for the signed-in user.
+    func fire() { state.withLock { $0.continuations.last }?.yield(()) }
+
+    /// Rings a specific past subscription by index — to show an old-uid event no longer pokes.
+    func fire(subscription index: Int) {
+        state.withLock { index < $0.continuations.count ? $0.continuations[index] : nil }?.yield(())
+    }
 }
 
 /// Engine over a caller-supplied DB (and, by default, a no-op `FakeRemote`) so tests can

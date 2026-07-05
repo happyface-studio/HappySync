@@ -207,6 +207,34 @@ private func httpError(_ code: Int) -> HTTPError {
     #expect(title == "Server Wins")
 }
 
+@Test func deadLetterRefetchesRemoteVersionSkippedWhileDirty() async throws {
+    let db = try recipesDB()
+    // Device B's newer version sits on the server; Device A's poison local edit is older and parks
+    // permanently. A pull while A's row is still dirty skips B's version but advances the cursor past
+    // it — so after the entry dead-letters, the skipped version must still be re-fetched (APPS-505).
+    let remote = FakeRemote(
+        failUpserts: 1, permanentUpserts: true,
+        dataset: ["recipes": [["id": "r1", "title": "Server Wins", "updatedAt": "2026-06-30T12:00:00.000Z"]]]
+    )
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Poison", "updatedAt": "2026-06-30T09:00:00.000Z"])
+
+    // 1. Pull while the row is dirty: the queued upload should win, so the server version is skipped —
+    //    but the cursor advances past it all the same.
+    try await engine.pullNow()
+    #expect(try await db.read { try String.fetchOne($0, sql: "SELECT title FROM recipes WHERE id='r1'") } == "Poison")
+
+    // 2. The upload dead-letters; the row stops being dirty, and the skipped version is now behind the cursor.
+    let outcome = try await engine.drainOutbox()
+    #expect(outcome.deadLettered == 1)
+
+    // 3. A subsequent pull must still converge on the server version. Without resetting the cursor on
+    //    park, the fetch would resume past T2 and the row would stay diverged forever.
+    try await engine.pullNow()
+    let title = try await db.read { try String.fetchOne($0, sql: "SELECT title FROM recipes WHERE id='r1'") }
+    #expect(title == "Server Wins")
+}
+
 // MARK: - Status visibility
 
 @Test func statusSurfacesFailedThenDeadLetteredUploads() async throws {
@@ -228,4 +256,25 @@ private func httpError(_ code: Int) -> HTTPError {
     let afterPark = await secondStatus.next()
     #expect(afterPark?.failedUploads == 0) // no longer actively retrying…
     #expect(afterPark?.deadLetters == 1)   // …now surfaced as a dead-letter for the consumer to repair
+}
+
+@Test func statusStaysFailingWhenDrainSkipsEntryInBackoffWindow() async throws {
+    let db = try recipesDB()
+    let remote = FakeRemote(failUpserts: 99) // always fails transiently
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 5)
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+
+    try await engine.runSyncOnce() // attempt 1 fails; entry now inside its per-entry backoff window
+    // Second pass immediately after, without ageing past backoff: the drain skips the entry (still
+    // inside its window), so the *pass* reports no failures — but the write is still failing. The
+    // settled status must read from the DB, not the drain pass (APPS-507).
+    try await engine.runSyncOnce()
+
+    var iter = engine.status.makeAsyncIterator()
+    let settled = await iter.next()
+    #expect(settled?.phase == .idle)         // pull succeeded, so not .failed…
+    #expect(settled?.failedUploads == 1)     // …and the skipped-but-failing upload is still surfaced
+    #expect(settled?.deadLetters == 0)
+    // The drain genuinely skipped the second attempt (proves the pass count would have been 0).
+    #expect(await remote.upsertCalls.count == 1)
 }
