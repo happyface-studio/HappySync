@@ -66,6 +66,12 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
   failedUploads == 0 && deadLetters == 0`.
 - **FK ordering:** upsert parents before children; tombstone children before parents.
 - The upsert payload **excludes** `serverOwnedColumns` (§4) and re-encodes `jsonColumns` to JSON.
+- **Schema-drift tolerance (APPS-504).** A column the server has dropped or renamed but a shipped
+  client still sends makes PostgREST reject the whole upsert (`PGRST204`), which classifies permanent
+  and dead-letters every write on the table. The primary defense is operational — the §8 client-first
+  removal rule keeps the column until no client sends it. As an optional client-side backstop a table
+  may declare `serverColumns` (§5); when set, the upload payload is intersected against it so a
+  removed column is dropped locally instead of poisoning the drain.
 
 ## 3. Download (cursor pull → local, LWW)
 
@@ -77,6 +83,12 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
 - **LWW apply:** apply a remote row only if `remote.updatedAt > local.updatedAt` **and** the local
   row is not dirty (a pending local edit is never clobbered — its queued upload wins).
 - **Tombstones** (`deletedAt` set) arrive through the same pull; apply by deleting locally.
+- **Schema-drift tolerance (APPS-504).** A server that migrated ahead of an older app build sends
+  columns the local schema doesn't have yet. The apply **intersects each wire row against the local
+  table's columns** (introspected once per table per pass) and silently drops the unknowns — an old
+  client just doesn't see the new column until it updates, instead of throwing `table … has no column
+  named …` and bricking every subsequent pull. Tombstone/LWW detection still reads `deletedAt` and
+  the cursor column from the wire row, so dropping unknown columns never affects ordering or deletes.
 - Convergence does not depend on Realtime: foreground + periodic pulls converge even if Realtime
   drops. Realtime only makes it feel instant.
 
@@ -110,6 +122,11 @@ declares the same shape):
   existing server row instead of 409-ing on the duplicate. The merge re-keys the row to the
   client's primary key, so only declare it on a **leaf** table (no FK children). Omit when the
   primary key is the only uniqueness the upsert can hit.
+- `serverColumns` — optional allow-list of the columns the server's schema has; when non-empty the
+  upload payload is intersected against it so a dropped/renamed server column can't `PGRST204` the
+  upsert (§2, §8). Omit to upload every non-server-owned local column and rely on the §8 removal
+  rule instead. Downloads need no equivalent — they intersect against the local schema, introspected
+  per pass (§3).
 
 ---
 
@@ -165,3 +182,48 @@ contract (LWW, field mapping, server-owned columns, Realtime doorbell) but **no 
 SQLite**: read/write Postgres directly, optimistic UI, Realtime for live updates. It shares this
 contract, not the Swift engine's code. Promote the §6 manifest to a generated JSON/YAML source only
 when that second consumer makes the duplication real.
+
+---
+
+## 8. Schema evolution
+
+The server (Supabase) and shipped clients are **not lockstep** — App Store review plus staggered
+user updates mean older builds run against a newer server schema for weeks. A migration that assumes
+lockstep is an outage for those clients (APPS-504): before this section, an added server column threw
+`table … has no column named …` on download and bricked every pull, and a dropped server column
+`PGRST204`-rejected every upload and dead-lettered the table. The rules below keep any single
+migration safe for every client version in the field.
+
+**Additive-only.** Never drop-and-recreate or repurpose a column in place. Every change is either an
+add or a (deferred) remove — never a mutation of an existing column's meaning or type.
+
+**Never rename in place.** A rename is a drop + an add, and it breaks clients in *both* directions at
+once (old clients download the new name they can't store and upload the old name the server no longer
+has). To rename `a` → `b`: add `b`, dual-write `a` and `b` server-side, wait for client adoption of
+`b`, then remove `a` by the removal rule below.
+
+**Adding a column — server-first.** Deploy the column server-side (nullable, or with a default)
+*before* any client build reads or writes it. Older clients tolerate it automatically:
+
+- *Download*: the apply intersects wire rows against the local schema and drops the unknown column
+  (§3) — the old client simply doesn't see it until it updates.
+- *Upload*: the old client doesn't have the column, so it never sends it; the server's nullable/
+  default value stands.
+
+**Removing a column — client-first.** A column may be dropped server-side **only after no shipped
+client still writes it.** Until then it must remain on the server (nullable, ignored). The ordering:
+
+1. Ship a client build that no longer sends the column (stop writing it; if needed declare the
+   remaining `serverColumns` so the payload is intersected — §2, §5).
+2. Wait out the update-lag window (weeks for an App Store app) until that build's predecessors are
+   below your support floor.
+3. Only then drop the column server-side.
+
+Skipping step 2 dead-letters every write from clients still sending the column. `serverColumns` is a
+client-side backstop that lets a build stop sending a column immediately, but it does not remove the
+*need* for the server to keep the column until the sending builds are gone — it only bounds the blast
+radius if the ordering slips.
+
+**Server-owned and JSON columns** follow the same rules; a new `serverOwnedColumn` is an additive
+server-first change (old clients never wrote it anyway), and a new `jsonColumn` is additive but also
+needs the client build that knows to encode/decode it before rows depend on the nesting.

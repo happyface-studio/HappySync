@@ -51,12 +51,17 @@ enum RowCoding {
     }
 
     /// Builds the PostgREST wire payload from a local row: `serverOwnedColumns` are dropped (the
-    /// server owns them) and `jsonColumns` are parsed from text back into JSON values.
+    /// server owns them) and `jsonColumns` are parsed from text back into JSON values. When
+    /// `serverColumns` is non-nil, local columns the server's schema doesn't have are dropped too, so
+    /// a column the server has since removed or renamed can't reject the whole upsert (`PGRST204`) and
+    /// dead-letter every write on the table (APPS-504).
     static func payload(
-        from row: Row, jsonColumns: Set<String>, excluding serverOwned: Set<String>
+        from row: Row, jsonColumns: Set<String>, excluding serverOwned: Set<String>,
+        restrictingTo serverColumns: Set<String>? = nil
     ) -> [String: AnyJSON] {
         var payload: [String: AnyJSON] = [:]
         for column in row.columnNames where !serverOwned.contains(column) {
+            if let serverColumns, !serverColumns.contains(column) { continue }
             payload[column] = anyJSON(row[column], json: jsonColumns.contains(column))
         }
         return payload
@@ -113,10 +118,23 @@ enum RowCoding {
         }
     }
 
-    /// Upserts a row into `table` by primary key using the column values as-is.
+    /// The column names of a local table. Used by the download path to intersect wire columns with
+    /// the columns the local schema actually has, so a server that migrated ahead of this app build
+    /// (added a column an older client lacks) doesn't brick every pull (APPS-504).
+    static func tableColumns(_ db: Database, table: String) throws -> Set<String> {
+        Set(try db.columns(in: table).map(\.name))
+    }
+
+    /// Upserts a row into `table` by primary key using the column values as-is. When `knownColumns`
+    /// is non-nil, wire columns the local table doesn't have are silently dropped first — an older
+    /// client simply doesn't see a server-added column until it updates, rather than throwing
+    /// `table … has no column named …` and bricking every subsequent sync pass (APPS-504).
     static func upsertLocalRow(
-        _ db: Database, table: String, primaryKey: String, columns: [String: DatabaseValue]
+        _ db: Database, table: String, primaryKey: String, columns: [String: DatabaseValue],
+        restrictingTo knownColumns: Set<String>? = nil
     ) throws {
+        let columns = knownColumns.map { known in columns.filter { known.contains($0.key) } } ?? columns
+        guard !columns.isEmpty else { return } // nothing the local schema recognizes — skip
         let cols = Array(columns.keys)
         let quotedCols = cols.map { "\"\($0)\"" }.joined(separator: ", ")
         let placeholders = cols.map { _ in "?" }.joined(separator: ", ")

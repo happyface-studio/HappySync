@@ -196,3 +196,46 @@ private func seedRecipe(_ db: DatabaseQueue, id: String, title: String, updatedA
     #expect(count == 3)     // every page applied, nothing dropped at the boundary
     #expect(lastId == "r3") // cursor ends on the final (updatedAt, id)
 }
+
+// MARK: - Schema-drift tolerance
+
+@Test func pullDropsUnknownWireColumnAndAppliesKnownOnes() async throws {
+    // The server migrated ahead of this app build: it now sends a `servings` column the local
+    // recipes(id, title, updatedAt) schema doesn't have. The pull must apply the known columns and
+    // complete — not throw `table recipes has no column named servings` and brick every pass (APPS-504).
+    let db = try recipesDB()
+    let remote = FakeRemote(dataset: [
+        "recipes": [[
+            "id": "r1", "title": "Soup", "updatedAt": "2026-06-30T10:00:00.000Z",
+            "servings": .integer(4),
+        ]]
+    ])
+    let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
+
+    try await engine.pullNow() // must not throw on the unknown column
+
+    let (title, cursor) = try await db.read { db -> (String?, String?) in
+        (try String.fetchOne(db, sql: "SELECT title FROM recipes WHERE id = 'r1'"),
+         try String.fetchOne(db, sql: "SELECT updated_at FROM _sync_state WHERE table_name = 'recipes'"))
+    }
+    #expect(title == "Soup")                       // known columns applied
+    #expect(cursor == "2026-06-30T10:00:00.000Z")  // pass completed and advanced the cursor
+}
+
+@Test func pullToleratesSeveralUnknownColumnsAtOnce() async throws {
+    // Multiple unknown columns in one wire row are all dropped; the known columns still apply. Guards
+    // the intersection when a server migration adds more than one column at a time (APPS-504).
+    let db = try recipesDB()
+    let remote = FakeRemote(dataset: [
+        "recipes": [[
+            "id": "r1", "title": "Curry", "updatedAt": "2026-06-30T10:00:00.000Z",
+            "servings": .integer(4), "spiceLevel": "hot", "calories": .integer(520),
+        ]]
+    ])
+    let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
+
+    try await engine.pullNow()
+
+    let title = try await db.read { try String.fetchOne($0, sql: "SELECT title FROM recipes WHERE id = 'r1'") }
+    #expect(title == "Curry") // known columns applied; the three unknowns silently dropped
+}

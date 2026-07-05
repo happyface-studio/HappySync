@@ -20,6 +20,15 @@ public struct SyncTable: Sendable, Hashable {
     /// Columns the server owns (e.g. RPC-managed counters) — stripped from every upsert so a
     /// stale client value never clobbers the authoritative one. They still arrive on download.
     public let serverOwnedColumns: [String]
+    /// Full set of columns the **server**'s schema has for this table. When non-empty, the upload
+    /// payload is intersected against it, so a column the server has since dropped or renamed can't
+    /// reject the whole upsert (`PGRST204`) and dead-letter every write on the table (APPS-504).
+    /// Empty (the default) uploads every non-server-owned local column and relies instead on the
+    /// §8 contract rule that a removed server column stays nullable-and-ignored until no shipped
+    /// client still sends it. Opt in only when you accept the maintenance cost — a stale list
+    /// silently stops uploading a real column. (Downloads need no such list: they intersect against
+    /// the *local* schema, introspected per pass.)
+    public let serverColumns: [String]
     /// Optional partition column scoping downloads to the current user (e.g. `userId`). When set,
     /// the engine filters both the cursor pull and the Realtime doorbell to `column = <partition
     /// value>`, where the value is resolved per signed-in user at pull time (see the engine's
@@ -47,7 +56,8 @@ public struct SyncTable: Sendable, Hashable {
         jsonColumns: [String] = [],
         serverOwnedColumns: [String] = [],
         scopeColumn: String? = nil,
-        conflictColumns: [String] = []
+        conflictColumns: [String] = [],
+        serverColumns: [String] = []
     ) {
         self.name = name
         self.primaryKey = primaryKey
@@ -57,6 +67,7 @@ public struct SyncTable: Sendable, Hashable {
         self.serverOwnedColumns = serverOwnedColumns
         self.scopeColumn = scopeColumn
         self.conflictColumns = conflictColumns
+        self.serverColumns = serverColumns
     }
 }
 
