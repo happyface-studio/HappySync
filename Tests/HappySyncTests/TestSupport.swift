@@ -17,20 +17,27 @@ actor FakeRemote: SyncRemote {
     private var remainingFailures: Int
     private var remainingFetchFailures: Int
     private let permanentUpsertFailures: Bool
+    private let upsertError: Error?
     private let dataset: [String: [[String: AnyJSON]]]
 
     /// - failUpserts: number of upserts that throw before succeeding.
     /// - permanentUpserts: when true, those upsert failures are *permanent* (a classified 4xx-shaped
     ///   error) so the drain dead-letters them immediately; when false they're transient (retryable).
+    /// - upsertError: a specific transport error to raise on each failed upsert (e.g. `HTTPError(401)`
+    ///   or a `PostgrestError`). It's wrapped in `RemoteFailure` with the production classification,
+    ///   exactly as `SupabaseRemote` does — so the drain sees a faithfully-classified failure. Takes
+    ///   precedence over `permanentUpserts`.
     init(
         failUpserts: Int = 0,
         failFetches: Int = 0,
         permanentUpserts: Bool = false,
+        upsertError: Error? = nil,
         dataset: [String: [[String: AnyJSON]]] = [:]
     ) {
         remainingFailures = failUpserts
         remainingFetchFailures = failFetches
         permanentUpsertFailures = permanentUpserts
+        self.upsertError = upsertError
         self.dataset = dataset
     }
 
@@ -43,6 +50,10 @@ actor FakeRemote: SyncRemote {
         upsertCalls.append((table, row, onConflict))
         if remainingFailures > 0 {
             remainingFailures -= 1
+            if let upsertError {
+                // Mirror SupabaseRemote.classify so the drain sees the same RemoteFailure it would in prod.
+                throw RemoteFailure(isPermanent: remoteErrorIsPermanent(upsertError), underlying: upsertError)
+            }
             throw permanentUpsertFailures ? PermanentFailure() : Failure.simulated
         }
         var server = row

@@ -9,20 +9,55 @@ import Supabase
 
 // MARK: - Permanent vs transient classification (pure)
 
+/// Builds an `HTTPError` carrying `code` so a classification test can exercise a status path.
+private func httpError(_ code: Int) -> HTTPError {
+    HTTPError(
+        data: Data(),
+        response: HTTPURLResponse(url: URL(string: "https://x")!, statusCode: code, httpVersion: nil, headerFields: nil)!
+    )
+}
+
 @Test func remoteErrorClassifiesByHTTPStatus() {
-    func http(_ code: Int) -> HTTPError {
-        HTTPError(
-            data: Data(),
-            response: HTTPURLResponse(url: URL(string: "https://x")!, statusCode: code, httpVersion: nil, headerFields: nil)!
-        )
-    }
-    #expect(remoteErrorIsPermanent(http(409)) == true)   // conflict (unique constraint) → give up
-    #expect(remoteErrorIsPermanent(http(401)) == true)   // unauthorized / RLS reject → give up
-    #expect(remoteErrorIsPermanent(http(422)) == true)   // validation → give up
-    #expect(remoteErrorIsPermanent(http(429)) == false)  // throttled → retry
-    #expect(remoteErrorIsPermanent(http(408)) == false)  // request timeout → retry
-    #expect(remoteErrorIsPermanent(http(503)) == false)  // server down → retry
+    #expect(remoteErrorIsPermanent(httpError(409)) == true)   // conflict (unique constraint) → give up
+    #expect(remoteErrorIsPermanent(httpError(422)) == true)   // validation → give up
+    #expect(remoteErrorIsPermanent(httpError(404)) == true)   // not found → give up
+    #expect(remoteErrorIsPermanent(httpError(401)) == false)  // auth may be mid-refresh → retry (APPS-502)
+    #expect(remoteErrorIsPermanent(httpError(403)) == false)  // token refresh could be pending → retry (APPS-502)
+    #expect(remoteErrorIsPermanent(httpError(429)) == false)  // throttled → retry
+    #expect(remoteErrorIsPermanent(httpError(408)) == false)  // request timeout → retry
+    #expect(remoteErrorIsPermanent(httpError(503)) == false)  // server down → retry
     #expect(remoteErrorIsPermanent(URLError(.notConnectedToInternet)) == false) // offline → retry
+}
+
+@Test func remoteErrorClassifiesPostgrestByCode() {
+    func pg(_ code: String?) -> PostgrestError { PostgrestError(code: code, message: code ?? "no code") }
+    // Permanent: the write is malformed or forbidden; no retry will ever land it.
+    #expect(remoteErrorIsPermanent(pg("23505")) == true)  // unique_violation
+    #expect(remoteErrorIsPermanent(pg("23503")) == true)  // foreign_key_violation
+    #expect(remoteErrorIsPermanent(pg("42501")) == true)  // insufficient_privilege (RLS reject)
+    #expect(remoteErrorIsPermanent(pg("42703")) == true)  // undefined_column
+    // Transient Postgres states — retry rather than drop the write.
+    #expect(remoteErrorIsPermanent(pg("40001")) == false) // serialization_failure
+    #expect(remoteErrorIsPermanent(pg("40P01")) == false) // deadlock_detected
+    #expect(remoteErrorIsPermanent(pg("53300")) == false) // too_many_connections
+    #expect(remoteErrorIsPermanent(pg("08006")) == false) // connection_failure
+    // Unknown / JWT / absent codes default to transient.
+    #expect(remoteErrorIsPermanent(pg("PGRST301")) == false) // JWT expired — recovers on refresh
+    #expect(remoteErrorIsPermanent(pg(nil)) == false)
+}
+
+@Test func remoteErrorRecognisesAuthShapedFailures() {
+    func pg(_ code: String?) -> PostgrestError { PostgrestError(code: code, message: code ?? "") }
+    // Auth-shaped (exempt from the retry budget)…
+    #expect(remoteErrorIsAuthTransient(httpError(401)) == true)
+    #expect(remoteErrorIsAuthTransient(httpError(403)) == true)
+    #expect(remoteErrorIsAuthTransient(pg("PGRST301")) == true) // JWT expired
+    #expect(remoteErrorIsAuthTransient(pg("PGRST302")) == true) // no JWT
+    // …recognised even through the RemoteFailure wrapper the production remote raises.
+    #expect(remoteErrorIsAuthTransient(RemoteFailure(isPermanent: false, underlying: httpError(401))) == true)
+    // Not auth-shaped: a real transient (5xx) and a permanent constraint violation.
+    #expect(remoteErrorIsAuthTransient(httpError(503)) == false)
+    #expect(remoteErrorIsAuthTransient(pg("23505")) == false)
 }
 
 // MARK: - Per-entry backoff
@@ -59,6 +94,84 @@ import Supabase
     try await agePastBackoff(db)
     try await engine.drainOutbox()
     #expect(await remote.upsertCalls.count == 1)
+}
+
+@Test func authFailureIsRetriedNotParked() async throws {
+    let db = try recipesDB()
+    // A single 401 (stale token) on the first attempt, then auth has recovered and the write lands.
+    let remote = FakeRemote(failUpserts: 1, upsertError: httpError(401))
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 2)
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+
+    let outcome = try await engine.drainOutbox() // 401 → transient auth failure, not a dead letter
+    #expect(outcome.deadLettered == 0)
+    #expect(outcome.failed == 1) // surfaced as a failing upload, not hidden…
+    let (parked, attempts) = try await db.read {
+        (try Int.fetchOne($0, sql: "SELECT dead_lettered FROM _sync_outbox WHERE pk='r1'"),
+         try Int.fetchOne($0, sql: "SELECT attempts FROM _sync_outbox WHERE pk='r1'"))
+    }
+    #expect(parked == 0)
+    #expect(attempts == 0) // …and the auth failure didn't charge the retry budget (APPS-502)
+
+    try await agePastBackoff(db)
+    try await engine.drainOutbox() // auth recovered → the write clears the outbox
+    let remaining = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM _sync_outbox WHERE pk='r1'") }
+    #expect(remaining == 0)
+}
+
+@Test func transientPostgrestStateIsRetried() async throws {
+    let db = try recipesDB()
+    // 40001 serialization_failure surfaces as a PostgrestError but is a transient Postgres state.
+    let remote = FakeRemote(failUpserts: 1, upsertError: PostgrestError(code: "40001", message: "serialization_failure"))
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+
+    let outcome = try await engine.drainOutbox()
+    #expect(outcome.deadLettered == 0) // retried with backoff, not parked
+    let parked = try await db.read { try Int.fetchOne($0, sql: "SELECT dead_lettered FROM _sync_outbox WHERE pk='r1'") }
+    #expect(parked == 0)
+
+    try await agePastBackoff(db)
+    try await engine.drainOutbox() // Postgres recovered → the write lands
+    let remaining = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM _sync_outbox WHERE pk='r1'") }
+    #expect(remaining == 0)
+}
+
+@Test func constraintViolationPostgrestParksImmediately() async throws {
+    let db = try recipesDB()
+    // 23505 unique_violation is a PostgrestError the server will never accept as-is → dead-letter now.
+    let remote = FakeRemote(failUpserts: 1, upsertError: PostgrestError(code: "23505", message: "unique_violation"))
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+
+    let outcome = try await engine.drainOutbox()
+    #expect(outcome.deadLettered == 1)
+    let parked = try await db.read { try Int.fetchOne($0, sql: "SELECT dead_lettered FROM _sync_outbox WHERE pk='r1'") }
+    #expect(parked == 1)
+    #expect(await remote.upsertCalls.count == 1) // parked on the first attempt, no retry
+}
+
+@Test func fullOutbox401StormRecoversWithZeroDeadLetters() async throws {
+    let db = try recipesDB()
+    let entryCount = 5
+    // Every upload in the first drain pass 401s (token stale at cold launch); afterwards auth refreshed.
+    let remote = FakeRemote(failUpserts: entryCount, upsertError: httpError(401))
+    // A deliberately tiny cap: proves auth failures don't park even when the budget is nearly spent.
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 2)
+    for i in 0..<entryCount {
+        try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r\(i)", "title": "T\(i)"])
+    }
+
+    try await engine.drainOutbox() // the entire outbox 401s in a single pass
+    let deadAfterStorm = try await db.read {
+        try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM _sync_outbox WHERE dead_lettered = 1")
+    }
+    #expect(deadAfterStorm == 0) // no dead letters despite the whole outbox failing at once
+
+    try await agePastBackoff(db)
+    try await engine.drainOutbox() // auth returns a valid token → every write lands
+    let remaining = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM _sync_outbox") }
+    #expect(remaining == 0)
 }
 
 @Test func transientFailureDeadLettersAfterCap() async throws {

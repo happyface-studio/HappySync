@@ -604,8 +604,12 @@ public actor SyncEngine {
             do {
                 try await process(entry, clearing: seqs)
             } catch {
-                let attempts = entry.attempts + 1
-                // Permanent (4xx) → park now; transient → park once it exhausts the retry cap.
+                // Auth-shaped failures (expired/refreshing token) recover out-of-band, so retry them
+                // without charging the retry budget — a token-refresh stretch mustn't dead-letter
+                // healthy writes and strip their dirty-row protection (APPS-502). Genuine transient
+                // failures still count toward `deadLetterAfter`; permanent ones park at once.
+                let attempts = remoteErrorIsAuthTransient(error) ? entry.attempts : entry.attempts + 1
+                // Permanent (4xx / constraint / RLS) → park now; transient → park once it exhausts the cap.
                 let park = remoteErrorIsPermanent(error) || attempts >= deadLetterAfter
                 try await recordFailure(entry, groupSeqs: seqs, attempts: attempts, now: now, park: park, error: error)
                 if park { outcome.deadLettered += 1 } else { outcome.failed += 1 }

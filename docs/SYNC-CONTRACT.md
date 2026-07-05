@@ -55,9 +55,13 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
   count `attempts`.
 - **Failures are visible, not swallowed (APPS-470).** A failed upload surfaces in `SyncStatus`
   (`failedUploads` while retrying, `deadLetters` once parked) so a user whose writes are all failing
-  never sees a healthy idle. Classify failures: **permanent** (4xx — RLS, constraint, validation)
-  dead-letter immediately; **transient** (network, 5xx, 408/429) retry with backoff until a cap,
-  then dead-letter. A dead-lettered entry stops retrying **and** stops counting as a dirty row, so
+  never sees a healthy idle. Classify failures (APPS-502): **permanent** (constraint `23xxx`, RLS
+  `42501`, undefined-column `42703`, and other 4xx) dead-letter immediately; **transient** (network,
+  5xx, 408/429, transient Postgres states `40001`/`40P01`/`53xxx`/`08xxx`, and any unknown code)
+  retry with backoff until a cap, then dead-letter. **Auth-shaped** failures (401/403, PostgREST
+  `PGRST301`/`PGRST302`) are transient *and* exempt from the retry budget — a stale token recovers
+  out-of-band, so an expired-token stretch must not dead-letter the whole outbox. A dead-lettered
+  entry stops retrying **and** stops counting as a dirty row, so
   it never permanently blocks downloads for its key (§3 LWW). Health = `phase == .idle &&
   failedUploads == 0 && deadLetters == 0`.
 - **FK ordering:** upsert parents before children; tombstone children before parents.
