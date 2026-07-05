@@ -27,16 +27,62 @@ struct RemoteFailure: ClassifiedSyncError, CustomStringConvertible {
 }
 
 /// True when a transport error is **permanent** — the server will never accept the write as-is, so
-/// the drain should dead-letter it immediately rather than burn retries on it. A 4xx (except 408
-/// request-timeout and 429 throttle, which are worth retrying) or any structured PostgREST rejection
-/// (unique/FK constraint, RLS, validation) is permanent; network errors and 5xx are transient.
+/// the drain should dead-letter it immediately rather than burn retries on it. Classification:
+///
+/// * `PostgrestError` — by its Postgres/PostgREST `code`: integrity-constraint violations (class
+///   `23`, e.g. `23505` unique, `23503` FK), `42501` insufficient_privilege (RLS reject) and `42703`
+///   undefined_column are permanent; transient Postgres states (`40001` serialization_failure,
+///   `40P01` deadlock, `53xxx` resource exhaustion, `08xxx` connection errors) and every
+///   unrecognized code — including PostgREST's `PGRSTxxx` auth codes — default to transient.
+/// * `HTTPError` — a 4xx is permanent *except* 401/403 (auth may be mid-refresh; recovers
+///   out-of-band — APPS-502), 408 (request timeout) and 429 (throttle), which are worth retrying;
+///   5xx is transient.
+/// * Anything else (network `URLError`, etc.) is transient.
+///
+/// An unrecognized or absent code defaults to transient — safer to retry than to silently drop a
+/// user's write.
 func remoteErrorIsPermanent(_ error: Error) -> Bool {
     if let classified = error as? any ClassifiedSyncError { return classified.isPermanent }
-    if let http = error as? HTTPError {
-        let code = http.response.statusCode
-        return (400..<500).contains(code) && code != 408 && code != 429
+    if let postgrest = error as? PostgrestError { return postgrestCodeIsPermanent(postgrest.code) }
+    if let http = error as? HTTPError { return httpStatusIsPermanent(http.response.statusCode) }
+    return false
+}
+
+/// Permanence of a `PostgrestError`'s Postgres/PostgREST `code`. See `remoteErrorIsPermanent`.
+private func postgrestCodeIsPermanent(_ code: String?) -> Bool {
+    guard let code else { return false } // no code → default transient
+    if code.hasPrefix("23") { return true } // integrity_constraint_violation (unique, FK, not-null, check)
+    switch code {
+    case "42501": return true // insufficient_privilege — RLS rejected the write
+    case "42703": return true // undefined_column — schema mismatch the server will never accept
+    default: return false      // 40001 / 40P01 / 53xxx / 08xxx transient states + unknown codes → retry
     }
-    if error is PostgrestError { return true }
+}
+
+/// Permanence of an HTTP status. See `remoteErrorIsPermanent`.
+private func httpStatusIsPermanent(_ code: Int) -> Bool {
+    guard (400..<500).contains(code) else { return false } // 5xx and non-4xx → transient
+    switch code {
+    case 401, 403, 408, 429: return false // auth mid-refresh / timeout / throttle → retry
+    default: return true
+    }
+}
+
+/// True when a failure is **auth-shaped** — a 401/403 or a PostgREST JWT rejection — i.e. it stems
+/// from a stale or missing token, not the write itself. These recover out-of-band on the next token
+/// refresh, so the drain retries them **without** charging the `deadLetterAfter` budget: an expired-
+/// token stretch (session-refresh race at cold launch, briefly-revoked session, clock skew) must not
+/// burn a healthy write's retries and dead-letter the whole outbox in a single drain pass (APPS-502).
+func remoteErrorIsAuthTransient(_ error: Error) -> Bool {
+    let underlying = (error as? RemoteFailure)?.underlying ?? error
+    if let postgrest = underlying as? PostgrestError {
+        // PostgREST surfaces an expired/invalid JWT as PGRST301 (and a missing one as PGRST302).
+        return postgrest.code == "PGRST301" || postgrest.code == "PGRST302"
+    }
+    if let http = underlying as? HTTPError {
+        let code = http.response.statusCode
+        return code == 401 || code == 403
+    }
     return false
 }
 
