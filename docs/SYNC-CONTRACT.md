@@ -49,10 +49,18 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
 
 - Writes append to a local **outbox** in the same transaction as the domain write, then return
   optimistically. A background drain processes the outbox in `seq` order.
-- **PostgREST upsert** with `Prefer: return=representation` (returns the server-stamped
-  `updatedAt`) for `.upsert`; soft-delete for `.delete`. Both are **idempotent by primary key**, so
-  retries are safe; back off exponentially **per entry** (`last_attempt_at` gates the window) and
-  count `attempts`.
+- **PostgREST upsert** with `Prefer: return=representation` for `.upsert`; soft-delete for
+  `.delete`. Both are **idempotent by primary key**, so retries are safe; back off exponentially
+  **per entry** (`last_attempt_at` gates the window) and count `attempts`.
+- **The full representation is written back locally (APPS-506).** On a successful upsert the server
+  row — column defaults, trigger-normalized fields, recomputed `serverOwnedColumns`, and (for a
+  `conflictColumns` upsert) the **merged** row re-keyed to the client's pk (APPS-478) — is applied to
+  the local row in the same transaction that clears the outbox entry, not just the cursor column.
+  Otherwise the writing device is the one device that never sees the server's version of its own
+  write: the next pull can't repair it because local `updatedAt` now equals the server's, so LWW
+  (§3) sees `remote == local` and skips the row. The write-back is **skipped for a row that gained a
+  newer outbox entry mid-flight** — the user's pending edit wins, exactly as the §3 LWW dirty-check
+  protects it on download.
 - **Failures are visible, not swallowed (APPS-470).** A failed upload surfaces in `SyncStatus`
   (`failedUploads` while retrying, `deadLetters` once parked) so a user whose writes are all failing
   never sees a healthy idle. Classify failures (APPS-502): **permanent** (constraint `23xxx`, RLS
