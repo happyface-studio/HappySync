@@ -24,7 +24,11 @@ Per synced table:
   must exceed the engine's `maxOfflineGap`.** A device offline longer than the retention would never
   see a purged tombstone; the engine defends against this by full-resyncing + reconciling once
   `now − lastSyncedAt > maxOfflineGap`, so that window must be set ≤ the server's retention (CookThis
-  purges at 90 days; the engine defaults `maxOfflineGap` to 30).
+  purges at 90 days; the engine defaults `maxOfflineGap` to 30). When a table declares a
+  `scopeColumn` (§5) and no partition value has resolved yet (cold launch before session
+  restoration, or signed out), the resync is deferred — reconciling a table that wasn't pulled
+  would wipe its local rows — and the stale check stays armed until a value is available
+  (APPS-501).
 - **RLS scoped to `auth.uid()`** — every row read/written is filtered by RLS: it is the **security
   boundary**. It is *not* necessarily the **sync partition**. RLS may legitimately be broader than
   what a device should download: CookThis's `recipes` SELECT policy is `isPublic = true OR userId =
