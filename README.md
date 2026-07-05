@@ -98,6 +98,32 @@ await engine.stop()   // engine is quiesced here
 try await wipeLocalDatabase()
 ```
 
+## Repairing dead letters
+
+A write that fails permanently (an RLS reject, a constraint violation) — or exhausts its retries —
+is **dead-lettered**: parked in the outbox so it stops retrying and no longer blocks downloads for
+its row. `SyncStatus.deadLetters` counts them; these three methods let you inspect and repair them
+instead of hand-editing `_sync_outbox`:
+
+```swift
+let parked = try await engine.deadLetters()
+for letter in parked {
+    // letter.table / .pk / .op — which write parked, and .lastError — why.
+    print("\(letter.op) \(letter.table)/\(letter.pk) failed: \(letter.lastError ?? "unknown")")
+}
+
+// After fixing the cause (an RLS/policy change, a schema migration, an app update), re-queue the
+// parked writes so the drain uploads them again. Pass specific seqs, or omit for all.
+try await engine.retryDeadLetters()
+
+// Or abandon the local write and accept the server's version. Discard drops the entries, then
+// re-pulls the affected rows so the local copy converges back to what the server holds — including
+// re-pulling changes the row missed while it was parked (APPS-505). Pass specific seqs, or all.
+try await engine.discardDeadLetters([badSeq])
+```
+
+Both mutations refresh the status stream immediately, so `deadLetters` drops as soon as they return.
+
 ## Requirements
 
 - Swift 6, iOS 16+ / macOS 13+
