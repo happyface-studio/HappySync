@@ -88,8 +88,9 @@ public actor SyncEngine {
     /// instead of trusting the stale cursor. **Must be ≤ the server's tombstone-purge retention**
     /// (CookThis purges at 90 days). See APPS-471 / contract §1.
     private let maxOfflineGap: TimeInterval
-    /// Whether the once-per-process stale-cursor check has run (successfully). Gated so the DB read
-    /// only happens on the first pass, not every poke.
+    /// Whether the once-per-process stale-cursor check has **completed**. Stays false while the
+    /// check is deferred (stale device, scoped tables, no partition value yet — APPS-501), so the
+    /// check re-runs on later passes until auth settles and the resync can actually reconcile.
     private var didResyncCheck = false
 
     private nonisolated let statusBroadcaster: StatusBroadcaster
@@ -285,9 +286,10 @@ public actor SyncEngine {
             // Once per process: if this device is past the offline horizon, full-resync before the
             // normal push/pull so a stale cursor can't skip purged tombstones (APPS-471). Gated so a
             // transient failure here re-checks next pass (lastSyncedAt only advances on full success).
+            // `false` means the resync was deferred (scoped tables, no partition value yet) — leave
+            // the gate open so the check re-runs once auth settles (APPS-501).
             if !didResyncCheck {
-                try await resyncIfStale()
-                didResyncCheck = true
+                didResyncCheck = try await resyncIfStale()
             }
             outcome = try await drainOutbox()
             try await pullNow()
@@ -296,7 +298,12 @@ public actor SyncEngine {
             throw error
         }
         lastSyncedAt = Date()
-        try await writeLastSyncedAt(lastSyncedAt!)
+        // While the stale-resync is deferred, don't persist: advancing last_synced_at would make
+        // the device look freshly synced and disarm the stale check — in this process and across
+        // relaunches — even though the scoped tables were never reconciled (APPS-501).
+        if didResyncCheck {
+            try await writeLastSyncedAt(lastSyncedAt!)
+        }
         let deadLetters = try await db.read { db in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 1") ?? 0
         }
@@ -353,6 +360,11 @@ public actor SyncEngine {
     /// cleared, as the stale-cursor resync does) that's every pk the server currently holds — the
     /// input the resync reconcile diffs against local rows (APPS-471). On an incremental pull it's
     /// just the changed pks, which the normal path ignores.
+    ///
+    /// A table that was **skipped** this pass (scoped, no partition value) has no entry at all —
+    /// distinct from an empty set, which means its fetch completed and the server returned zero
+    /// rows. The resync reconcile relies on that distinction to avoid treating "not pulled" as
+    /// "server holds nothing" (APPS-501).
     @discardableResult
     public func pullNow() async throws -> [String: Set<String>] {
         let order = topologicalOrder(tables)
@@ -369,6 +381,7 @@ public actor SyncEngine {
                 guard let value = await scope() else { continue }
                 scopeFilter = ScopeFilter(column: scopeColumn, value: value)
             }
+            seenPks[spec.name] = [] // mark the table as fetched — a skipped table has no entry
             var cursor = try await readCursor(table: spec.name)
             while true {
                 let page = try await remote.fetch(
@@ -437,20 +450,34 @@ public actor SyncEngine {
     /// Full-resyncs when this device has been offline past `maxOfflineGap` — its cursor may point
     /// past tombstones the server has since purged, so it would keep deleted rows (and re-upload
     /// dirty ones) forever. No-op on a fresh install (no recorded sync) or a recently-synced device.
-    func resyncIfStale(now: Date = Date()) async throws {
-        guard let last = try await readLastSyncedAt(), now.timeIntervalSince(last) > maxOfflineGap else { return }
+    ///
+    /// Returns whether the check **completed**. `false` means the device is stale but the resync
+    /// was deferred: a scoped table needs a partition value and `scope()` is still nil (cold launch
+    /// before session restoration, or signed out). Resyncing then would skip those tables' pulls
+    /// and reconcile against "nothing seen", wiping their local rows — so the caller must keep the
+    /// check armed and retry on a later pass (APPS-501).
+    func resyncIfStale(now: Date = Date()) async throws -> Bool {
+        guard let last = try await readLastSyncedAt(), now.timeIntervalSince(last) > maxOfflineGap else { return true }
+        if tables.contains(where: { $0.scopeColumn != nil }), await scope() == nil {
+            return false
+        }
         try await fullResync()
+        return true
     }
 
     /// Clears every cursor, re-pulls all tables from scratch, and reconciles: drops local rows the
     /// server no longer has (purged deletes) — **except** rows with a pending outbox entry, which are
     /// local writes the drain will upload. Keeping dirty rows can resurrect a row deleted elsewhere
     /// beyond the purge horizon; for single-user LWW that honours the user's own pending edit.
+    ///
+    /// Only tables whose full fetch completed reconcile. A table the pull skipped (scoped, no
+    /// partition value) has no `seen` entry — reconciling it against an empty set would delete
+    /// every non-dirty local row (APPS-501).
     func fullResync() async throws {
         try await db.write { db in try db.execute(sql: "DELETE FROM \(SyncSchema.stateTable)") }
         let seen = try await pullNow() // full pull (cursors cleared) → every pk the server holds
         for spec in tables {
-            let seenPks = seen[spec.name] ?? []
+            guard let seenPks = seen[spec.name] else { continue }
             let (localPks, dirtyPks) = try await db.read { db -> (Set<String>, Set<String>) in
                 let local = Set(try String.fetchAll(db, sql: "SELECT \"\(spec.primaryKey)\" FROM \"\(spec.name)\""))
                 let dirty = Set(try String.fetchAll(
