@@ -128,6 +128,47 @@ struct GatedRemote: SyncRemote {
     }
 }
 
+/// A `SyncRemote` whose `upsert` returns a caller-supplied *representation* of the server row —
+/// letting a test prove the drain writes the full server row back locally, not just the cursor:
+/// server-normalized column values and the `conflictColumns` merged row (re-keyed to the client's
+/// pk) included (APPS-506). `fetch`/`delete` are inert.
+actor RepresentationRemote: SyncRemote {
+    private let make: @Sendable ([String: AnyJSON]) -> [String: AnyJSON]
+    private(set) var upsertCalls: [[String: AnyJSON]] = []
+
+    /// - representation: maps the uploaded row to the server's representation returned to the drain.
+    init(representation: @escaping @Sendable ([String: AnyJSON]) -> [String: AnyJSON]) {
+        self.make = representation
+    }
+
+    func upsert(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON] {
+        upsertCalls.append(row)
+        return make(row)
+    }
+    func delete(table: String, primaryKey: String, pk: String) async throws {}
+    func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] { [] }
+}
+
+/// A `SyncRemote` whose `upsert` announces it has started, then blocks on `gate` until the test
+/// releases it — so a test can enqueue a mid-flight local edit while an upload is in flight, then
+/// assert the server write-back doesn't clobber that pending edit (APPS-506). Returns the uploaded
+/// row (with the server cursor stamped) as the representation once released.
+struct UpsertGatedRemote: SyncRemote {
+    let serverUpdatedAt = "2026-06-30T12:00:00.000Z"
+    let started: Signal
+    let gate: Signal
+
+    func upsert(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON] {
+        await started.fire()
+        await gate.wait()
+        var server = row
+        server["updatedAt"] = .string(serverUpdatedAt)
+        return server
+    }
+    func delete(table: String, primaryKey: String, pk: String) async throws {}
+    func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] { [] }
+}
+
 /// A `SyncDoorbell` test double. Each `ring(scope:)` starts a fresh subscription (a new stream),
 /// recording the scope it was asked to filter on — so a test can prove the engine re-subscribes on
 /// an auth change (APPS-509). `fire()` rings the current subscription; `fire(subscription:)` rings a

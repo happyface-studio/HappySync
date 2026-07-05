@@ -779,20 +779,50 @@ public actor SyncEngine {
         }
     }
 
-    /// Writes the server-stamped `updated_at` back and clears the collapsed group's entries in one
-    /// transaction, so the row is marked clean (its cursor won't re-pull it) only after the server
-    /// confirms.
+    /// Writes the server's representation back to the local row and clears the collapsed group's
+    /// entries in one transaction, so the row is marked clean (its cursor won't re-pull it) only
+    /// after the server confirms.
+    ///
+    /// The representation carries what the client can't compute locally: column **defaults** the
+    /// server filled in, **trigger-normalized** fields, recomputed `serverOwnedColumns`, and — for a
+    /// `conflictColumns` upsert — the **merged** server row re-keyed to the client's pk (APPS-478).
+    /// Stamping only the cursor column discarded all of it, and the next pull couldn't repair it:
+    /// local `updatedAt` now equals the server's, so `lwwAllows` sees remote == local (not strictly
+    /// newer) and skips the row forever — the writing device was the one device never to see the
+    /// server's version of its own write (APPS-506). Unknown wire columns are dropped, mirroring the
+    /// download path (APPS-504).
+    ///
+    /// The write-back is skipped when a *newer* outbox entry exists for this pk (one enqueued after
+    /// the `seqs` we're clearing): the user edited the row mid-flight and the local copy already
+    /// holds that pending edit — the same dirty-check the pull's `lwwAllows` gate uses. Clobbering it
+    /// would lose the edit; it uploads on the next drain instead. The confirmed group's entries clear
+    /// either way.
     private func stampAndClear(_ entry: OutboxEntry, spec: SyncTable, server: [String: AnyJSON], seqs: [Int64]) async throws {
-        let updatedAt: String? = if case .string(let value) = server[spec.cursorColumn] { value } else { nil }
         try await db.write { db in
-            if let updatedAt {
-                try db.execute(
-                    sql: "UPDATE \"\(spec.name)\" SET \"\(spec.cursorColumn)\" = ? WHERE \"\(spec.primaryKey)\" = ?",
-                    arguments: [updatedAt, entry.pk]
+            if try Self.writeBackAllowed(db, table: spec.name, pk: entry.pk, excluding: seqs) {
+                try RowCoding.upsertLocalRow(
+                    db, table: spec.name, primaryKey: spec.primaryKey,
+                    columns: RowCoding.localColumns(from: server),
+                    restrictingTo: try RowCoding.tableColumns(db, table: spec.name)
                 )
             }
             try Self.deleteEntries(db, seqs: seqs)
         }
+    }
+
+    /// Whether the server representation may overwrite the local row: false when a live (non
+    /// dead-lettered) outbox entry exists for this pk *other than* the `seqs` being cleared — a
+    /// mid-flight edit whose pending upload must win. Mirrors `lwwAllows`' dirty-check on the pull
+    /// path; the excluded `seqs` are the confirmed group, still present until `deleteEntries` runs.
+    private static func writeBackAllowed(_ db: Database, table: String, pk: String, excluding seqs: [Int64]) throws -> Bool {
+        let placeholders = seqs.map { _ in "?" }.joined(separator: ", ")
+        let notCleared = seqs.isEmpty ? "" : " AND seq NOT IN (\(placeholders))"
+        let dirty = try Int.fetchOne(
+            db,
+            sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE table_name = ? AND pk = ? AND dead_lettered = 0\(notCleared)",
+            arguments: StatementArguments([table, pk] as [any DatabaseValueConvertible] + seqs.map { $0 as any DatabaseValueConvertible })
+        ) ?? 0
+        return dirty == 0
     }
 
     private func clear(_ seqs: [Int64]) async throws {
