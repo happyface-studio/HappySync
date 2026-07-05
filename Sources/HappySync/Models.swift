@@ -107,6 +107,37 @@ public struct SyncStatus: Sendable, Equatable {
     }
 }
 
+/// A dead-lettered outbox entry, surfaced so the consumer can inspect, retry, or discard it
+/// (APPS-508). Parking is otherwise opaque — `SyncStatus.deadLetters` is only a count — and the
+/// underlying `_sync_outbox` row (which the app never touches directly) is where the `(table, pk,
+/// op)` and the `last_error` breadcrumb live. See `SyncEngine.deadLetters()`.
+public struct DeadLetter: Sendable {
+    /// The outbox row's stable identifier — pass it to `retryDeadLetters`/`discardDeadLetters`.
+    public let seq: Int64
+    public let table: String
+    public let pk: String
+    public let op: SyncOp
+    /// How many upload attempts were charged before the entry parked.
+    public let attempts: Int
+    /// The last upload error's text, if one was recorded — the repair breadcrumb.
+    public let lastError: String?
+    /// When the write was first enqueued.
+    public let queuedAt: Date
+
+    public init(
+        seq: Int64, table: String, pk: String, op: SyncOp,
+        attempts: Int, lastError: String?, queuedAt: Date
+    ) {
+        self.seq = seq
+        self.table = table
+        self.pk = pk
+        self.op = op
+        self.attempts = attempts
+        self.lastError = lastError
+        self.queuedAt = queuedAt
+    }
+}
+
 /// Errors thrown by the engine's public API.
 public enum SyncError: Error, Sendable {
     /// Functionality scheduled for a later milestone is not wired up yet.

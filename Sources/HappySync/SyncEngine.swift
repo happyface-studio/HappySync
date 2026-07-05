@@ -382,6 +382,134 @@ public actor SyncEngine {
         return status
     }
 
+    private func deadLetterCount() async throws -> Int {
+        try await db.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 1") ?? 0
+        }
+    }
+
+    // MARK: - Dead-letter repair (APPS-508)
+
+    /// The parked outbox entries, oldest first — each a write that exhausted its retries (or failed
+    /// permanently) and stopped uploading. Surfaces the `(table, pk, op)` and the `last_error`
+    /// breadcrumb the `_sync_outbox` row carries, so the consumer can decide whether to fix the cause
+    /// and `retryDeadLetters`, or `discardDeadLetters` and accept the server's version.
+    public func deadLetters() async throws -> [DeadLetter] {
+        try await db.read { db in
+            try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT seq, table_name, pk, op, attempts, last_error, queued_at
+                    FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 1 ORDER BY seq
+                    """
+            ).map { row in
+                DeadLetter(
+                    seq: row["seq"],
+                    table: row["table_name"],
+                    pk: row["pk"],
+                    op: SyncOp(rawValue: row["op"]) ?? .upsert,
+                    attempts: row["attempts"],
+                    lastError: row["last_error"],
+                    queuedAt: row["queued_at"]
+                )
+            }
+        }
+    }
+
+    /// Un-parks dead-lettered entries so the drain re-uploads them — for after the cause is fixed
+    /// (an RLS/policy change, a schema migration, an app update). Clears `dead_lettered` and resets
+    /// the retry bookkeeping (`attempts`, `last_attempt_at`, `last_error`) so the next drain attempts
+    /// immediately rather than inside a stale backoff window. Pass specific `seqs`, or nil for all.
+    /// Refreshes the broadcast status (so `deadLetters` drops at once) and pokes a drain.
+    public func retryDeadLetters(_ seqs: [Int64]? = nil) async throws {
+        try await db.write { db in
+            var sql = """
+                UPDATE \(SyncSchema.outboxTable)
+                SET dead_lettered = 0, attempts = 0, last_attempt_at = NULL, last_error = NULL
+                WHERE dead_lettered = 1
+                """
+            var arguments = StatementArguments()
+            if let seqs {
+                guard !seqs.isEmpty else { return }
+                let placeholders = seqs.map { _ in "?" }.joined(separator: ", ")
+                sql += " AND seq IN (\(placeholders))"
+                arguments = StatementArguments(seqs)
+            }
+            try db.execute(sql: sql, arguments: arguments)
+        }
+        try await broadcastStatusRefresh()
+        poke() // drain the re-queued entries promptly
+    }
+
+    /// Discards dead-lettered entries and converges their rows back to the server's version — for
+    /// when the local write is the one to abandon. Deletes the parked entries, drops each affected
+    /// local row (unless a newer, still-pending write for it remains), and clears the affected
+    /// tables' cursors so the next pull re-fetches from scratch — otherwise the advanced cursor would
+    /// skip the server rows that were passed over while the entry was dirty (APPS-505). Pass specific
+    /// `seqs`, or nil for all. Refreshes the broadcast status and pokes a pull.
+    public func discardDeadLetters(_ seqs: [Int64]? = nil) async throws {
+        // Which parked entries are we discarding, and which `(table, pk)` do they touch? Dead-letter
+        // sets are small (personal scale), so fetch all parked and filter in memory.
+        let parked = try await db.read { db -> [(seq: Int64, table: String, pk: String)] in
+            try Row.fetchAll(
+                db, sql: "SELECT seq, table_name, pk FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 1"
+            ).map { (seq: $0["seq"] as Int64, table: $0["table_name"] as String, pk: $0["pk"] as String) }
+        }
+        let targets: [(seq: Int64, table: String, pk: String)]
+        if let seqs {
+            let wanted = Set(seqs)
+            targets = parked.filter { wanted.contains($0.seq) }
+        } else {
+            targets = parked
+        }
+        guard !targets.isEmpty else { return }
+
+        let targetSeqs = targets.map { $0.seq }
+        let affectedTables = Set(targets.map { $0.table })
+        // Resolve each target's local-row coordinates now, so the write closure captures only value
+        // types (not the actor) — an unknown table simply has no local row to reset.
+        let rowResets: [(table: String, primaryKey: String, pk: String)] = targets.compactMap { target in
+            tables.first { $0.name == target.table }.map { (table: $0.name, primaryKey: $0.primaryKey, pk: target.pk) }
+        }
+        try await db.write { db in
+            try Self.deleteEntries(db, seqs: targetSeqs)
+            // Drop each affected local row so a re-pull can overwrite it with the server's copy (an
+            // absent local row always loses LWW, so the server version applies cleanly). A row that
+            // still has a live, non-parked outbox entry is left alone — that pending write, and its
+            // dirty-gate protection, must survive the discard.
+            for reset in rowResets {
+                try db.execute(
+                    sql: """
+                        DELETE FROM "\(reset.table)" WHERE "\(reset.primaryKey)" = ?
+                        AND NOT EXISTS (
+                            SELECT 1 FROM \(SyncSchema.outboxTable) WHERE table_name = ? AND pk = ?
+                        )
+                        """,
+                    arguments: [reset.pk, reset.table, reset.pk]
+                )
+            }
+            // Clear the affected tables' cursors so the next pull re-fetches them from scratch,
+            // reinstating server rows the advanced cursor would otherwise skip (APPS-505).
+            let placeholders = affectedTables.map { _ in "?" }.joined(separator: ", ")
+            try db.execute(
+                sql: "DELETE FROM \(SyncSchema.stateTable) WHERE table_name IN (\(placeholders))",
+                arguments: StatementArguments(Array(affectedTables))
+            )
+        }
+        try await broadcastStatusRefresh()
+        poke() // re-pull so the discarded rows converge to the server's version
+    }
+
+    /// Re-broadcasts status after a repair mutation so `deadLetters` reflects the new count at once,
+    /// rather than waiting for the next sync pass. `failedUploads` resets to 0 here; the drain the
+    /// caller pokes re-derives it on its next pass.
+    private func broadcastStatusRefresh() async throws {
+        statusBroadcaster.send(SyncStatus(
+            phase: .idle, lastSyncedAt: lastSyncedAt,
+            failedUploads: 0, deadLetters: try await deadLetterCount()
+        ))
+    }
+
     /// Records a write in the outbox in the same transaction as the domain write, so the local
     /// store and the pending-upload queue can never disagree. An `.upsert` writes the row to its
     /// table; a `.delete` removes it locally (the tombstone is propagated to the server on drain).
