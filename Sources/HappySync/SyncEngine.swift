@@ -342,24 +342,26 @@ public actor SyncEngine {
             throw SyncError.missingPrimaryKey(table: table, column: spec.primaryKey)
         }
         let pk = RowCoding.pkString(pkValue)
+        let queuedAt = Date()
 
         try db.write { db in
             switch op {
             case .upsert:
                 try RowCoding.upsertLocalRow(db, table: table, primaryKey: spec.primaryKey, columns: columns)
             case .delete:
+                // Local cascade (APPS-510): before removing the parent row, delete its child rows —
+                // deepest-first so enforced FKs never RESTRICT the delete — and enqueue a tombstone for
+                // each, so the server soft-deletes them too. This mirrors the server's child-tombstone
+                // trigger (contract §1/§2): local and server converge on the same deleted set with no
+                // orphan window and no round-trip. Children are found from the schema's declared FKs, so
+                // only rows that actually reference a deleted parent are touched.
+                try Self.cascadeDeleteChildren(db, of: spec, parentKeys: [pkValue], tables: tables, queuedAt: queuedAt)
                 try db.execute(
                     sql: "DELETE FROM \"\(table)\" WHERE \"\(spec.primaryKey)\" = ?",
                     arguments: [pkValue]
                 )
             }
-            try db.execute(
-                sql: """
-                    INSERT INTO \(SyncSchema.outboxTable) (table_name, pk, op, queued_at, attempts)
-                    VALUES (?, ?, ?, ?, 0)
-                    """,
-                arguments: [table, pk, op.rawValue, Date()]
-            )
+            try Self.insertOutboxEntry(db, table: table, pk: pk, op: op, queuedAt: queuedAt)
         }
         armDebouncedPoke() // wake the runner so the write uploads promptly (APPS-503)
     }
@@ -728,5 +730,68 @@ public actor SyncEngine {
             sql: "DELETE FROM \(SyncSchema.outboxTable) WHERE seq IN (\(placeholders))",
             arguments: StatementArguments(seqs)
         )
+    }
+
+    /// Appends one pending op to the outbox. Shared by `enqueue` (the caller's op) and the local
+    /// cascade (child tombstones), so every queued upload records identically (APPS-510).
+    private static func insertOutboxEntry(_ db: Database, table: String, pk: String, op: SyncOp, queuedAt: Date) throws {
+        try db.execute(
+            sql: """
+                INSERT INTO \(SyncSchema.outboxTable) (table_name, pk, op, queued_at, attempts)
+                VALUES (?, ?, ?, ?, 0)
+                """,
+            arguments: [table, pk, op.rawValue, queuedAt]
+        )
+    }
+
+    /// Local cascade delete (APPS-510). Deletes every synced child row that foreign-keys onto one of
+    /// `parentKeys` in `parent`, recursing grandchildren-first so enforced FK constraints never
+    /// RESTRICT the delete, and enqueues a `.delete` tombstone for each removed child so the drain
+    /// soft-deletes it server-side too. Mirrors the server child-tombstone trigger (contract §1/§2):
+    /// local and server converge on the same deleted set with no orphan window and no round-trip.
+    ///
+    /// Child FK columns are read from the schema's declared foreign keys (`PRAGMA foreign_key_list`),
+    /// so no extra descriptor is needed and only rows that actually reference a deleted parent go — a
+    /// table that only *logically* `dependsOn` a parent (no SQLite FK constraint) is left alone here;
+    /// its orphans still reconcile on the next pull via the server tombstone. A child reachable by two
+    /// paths (e.g. `recipeStepIngredients` under both `recipeSteps` and `recipeIngredients`) is deleted
+    /// by whichever path reaches it first — the other path's `SELECT` no longer finds the removed row,
+    /// so no duplicate tombstone is queued. FKs are assumed to reference the parent's primary key (the
+    /// §4 convention), which is what `parentKeys` carries.
+    private static func cascadeDeleteChildren(
+        _ db: Database, of parent: SyncTable, parentKeys: [DatabaseValue], tables: [SyncTable], queuedAt: Date
+    ) throws {
+        guard !parentKeys.isEmpty else { return }
+        let parentPlaceholders = parentKeys.map { _ in "?" }.joined(separator: ", ")
+        for child in tables where child.dependsOn.contains(parent.name) {
+            for fkColumn in try foreignKeyColumns(db, of: child.name, referencing: parent.name) {
+                let childKeys = try DatabaseValue.fetchAll(
+                    db,
+                    sql: "SELECT \"\(child.primaryKey)\" FROM \"\(child.name)\" WHERE \"\(fkColumn)\" IN (\(parentPlaceholders))",
+                    arguments: StatementArguments(parentKeys)
+                )
+                guard !childKeys.isEmpty else { continue }
+                // Grandchildren first: recurse before removing this level, so the deepest rows go
+                // before the rows they reference.
+                try cascadeDeleteChildren(db, of: child, parentKeys: childKeys, tables: tables, queuedAt: queuedAt)
+                let childPlaceholders = childKeys.map { _ in "?" }.joined(separator: ", ")
+                try db.execute(
+                    sql: "DELETE FROM \"\(child.name)\" WHERE \"\(child.primaryKey)\" IN (\(childPlaceholders))",
+                    arguments: StatementArguments(childKeys)
+                )
+                for key in childKeys {
+                    try insertOutboxEntry(db, table: child.name, pk: RowCoding.pkString(key), op: .delete, queuedAt: queuedAt)
+                }
+            }
+        }
+    }
+
+    /// The columns of `child` that declare a foreign key onto `parent`, read from the live schema via
+    /// `PRAGMA foreign_key_list`. Empty when no such constraint exists (FKs off, or a logical-only
+    /// dependency) — the cascade then skips that child (APPS-510).
+    private static func foreignKeyColumns(_ db: Database, of child: String, referencing parent: String) throws -> [String] {
+        try Row.fetchAll(db, sql: "PRAGMA foreign_key_list(\"\(child)\")")
+            .filter { ($0["table"] as String?) == parent }
+            .compactMap { $0["from"] as String? }
     }
 }

@@ -84,6 +84,28 @@ SyncTable(name: "userRecipeInteractions", conflictColumns: ["userId", "recipeId"
 The merge re-keys the server row to the client's primary key, so **only declare `conflictColumns`
 on a leaf table** — one whose primary key nothing else foreign-keys — or you orphan its children.
 
+## Deletes
+
+`enqueue(.delete, …)` removes the row locally and queues a tombstone that soft-deletes it server-side
+on the next drain. When the row is a **parent** with child rows enforced by local foreign keys, the
+engine **cascades**: it deletes the child rows too — deepest-first, in the same transaction — and
+queues a tombstone for each. So you don't enqueue child deletes yourself, a parent delete never
+throws a raw SQLite FK error mid-flow, and there's no window where the UI shows orphaned children of a
+recipe that no longer exists. This mirrors the server's child-tombstone trigger, so local and server
+converge on the same deleted set with no round-trip.
+
+```swift
+// Deleting a recipe removes its recipeIngredients / recipeSteps / recipeStepIngredients locally and
+// queues a tombstone for each — no need to enqueue the child deletes yourself.
+try await engine.enqueue(.delete, table: "recipes", row: ["id": recipeID])
+```
+
+Children are discovered from the schema's **declared foreign keys** (GRDB enforces them by default),
+so only rows that actually reference the deleted parent are removed. A table that only *logically*
+`dependsOn` a parent without a real FK constraint isn't cascaded — its orphans reconcile on the next
+pull via the server tombstone instead. The cascade assumes foreign keys reference the parent's
+primary key.
+
 ## Teardown
 
 `stop()` is **async and awaits the in-flight sync pass** before returning — after it returns the
