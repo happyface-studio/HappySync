@@ -161,6 +161,100 @@ import Supabase
     #expect(ids == [.string("a"), .string("b")])
 }
 
+// MARK: - Server representation write-back (APPS-506)
+
+@Test func drainWritesBackServerNormalizedColumnValues() async throws {
+    let db = try recipesDB()
+    // The server normalizes `title` on write (a trigger/default the client can't compute) and stamps
+    // the cursor. The whole representation must land locally — not just the cursor column.
+    let remote = RepresentationRemote { row in
+        var server = row
+        server["title"] = .string("Normalized Soup")
+        server["updatedAt"] = .string("2026-06-30T12:00:00.000Z")
+        return server
+    }
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+
+    try await engine.drainOutbox()
+
+    let (title, updatedAt, pending) = try await db.read { db -> (String?, String?, Int) in
+        let title = try String.fetchOne(db, sql: "SELECT title FROM recipes WHERE id = 'r1'")
+        let updatedAt = try String.fetchOne(db, sql: "SELECT updatedAt FROM recipes WHERE id = 'r1'")
+        let pending = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM _sync_outbox") ?? -1
+        return (title, updatedAt, pending)
+    }
+    #expect(title == "Normalized Soup")               // server-normalized value reached the writing device
+    #expect(updatedAt == "2026-06-30T12:00:00.000Z")  // cursor still stamped clean
+    #expect(pending == 0)                             // entry cleared after server confirmed
+}
+
+@Test func drainDoesNotOverwriteAnEditEnqueuedWhileUploadInFlight() async throws {
+    let db = try recipesDB()
+    let started = Signal(), gate = Signal()
+    let remote = UpsertGatedRemote(started: started, gate: gate)
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+
+    // Drive the drain concurrently; it uploads "Soup" then blocks in `upsert` awaiting the server.
+    let drain = Task { try await engine.drainOutbox() }
+    await started.wait()
+    // The user edits the same row while that upload is in flight → a newer outbox entry for r1.
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "User edit"])
+    await gate.fire() // let the in-flight upload complete and write back
+    try await drain.value
+
+    let (title, pending) = try await db.read { db -> (String?, Int) in
+        let title = try String.fetchOne(db, sql: "SELECT title FROM recipes WHERE id = 'r1'")
+        let pending = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM _sync_outbox WHERE pk = 'r1'") ?? -1
+        return (title, pending)
+    }
+    #expect(title == "User edit") // mid-flight edit preserved — the stale write-back was skipped
+    #expect(pending == 1)         // the newer edit is still queued; it uploads on the next drain
+}
+
+@Test func drainAdoptsMergedServerStateForConflictUpsert() async throws {
+    // A conflictColumns upsert can merge onto an existing server row and return it re-keyed to the
+    // client's pk with server-owned fields recomputed (APPS-478). The drain must adopt that merged
+    // state locally rather than keep what this client sent (APPS-506).
+    let db = try DatabaseQueue()
+    try await db.write { db in
+        try db.create(table: "userRecipeInteractions") { t in
+            t.column("id", .text).primaryKey()
+            t.column("userId", .text)
+            t.column("recipeId", .text)
+            t.column("cookedCount", .integer)
+            t.column("updatedAt", .text)
+        }
+    }
+    let remote = RepresentationRemote { row in
+        var server = row
+        server["cookedCount"] = .integer(7) // the merged server total, not the 1 this client sent
+        server["updatedAt"] = .string("2026-06-30T12:00:00.000Z")
+        return server
+    }
+    let engine = try SyncEngine(
+        db: db,
+        remote: remote,
+        tables: [SyncTable(name: "userRecipeInteractions", conflictColumns: ["userId", "recipeId"])]
+    )
+    try await engine.enqueue(
+        .upsert,
+        table: "userRecipeInteractions",
+        row: ["id": "x1", "userId": "u1", "recipeId": "r1", "cookedCount": 1] as [String: AnyJSON]
+    )
+
+    try await engine.drainOutbox()
+
+    let (count, pending) = try await db.read { db -> (Int?, Int) in
+        let count = try Int.fetchOne(db, sql: "SELECT cookedCount FROM userRecipeInteractions WHERE id = 'x1'")
+        let pending = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM _sync_outbox") ?? -1
+        return (count, pending)
+    }
+    #expect(count == 7) // local row adopted the merged server value
+    #expect(pending == 0)
+}
+
 // MARK: - Conflict target (secondary unique constraint)
 
 @Test func drainForwardsConflictColumnsAsOnConflictTarget() async throws {

@@ -6,38 +6,46 @@ import Supabase
 /// correctness stays in the idempotent cursor-pull. Abstracted behind a protocol so the scheduler
 /// can be driven by a fake in tests; the production conformance is the only place touching Realtime.
 protocol SyncDoorbell: Sendable {
-    /// A stream that yields `()` whenever a watched row changes. Consumed once by the engine.
-    func ring() -> AsyncStream<Void>
+    /// A stream that yields `()` whenever a watched row changes, filtered to the partition `scope`
+    /// (the signed-in user's uid, or nil when signed out). The engine re-invokes this with a new
+    /// scope on an auth change, terminating the previous stream first — so scoped tables ring for
+    /// the current user even when `start()` preceded sign-in (APPS-509).
+    func ring(scope: String?) -> AsyncStream<Void>
 }
 
 /// A doorbell that never rings — the default when no Realtime client is wired. The engine still
 /// converges through its periodic pull, so this is a safe fallback rather than a broken one.
 struct SilentDoorbell: SyncDoorbell {
-    func ring() -> AsyncStream<Void> { AsyncStream { _ in } }
+    func ring(scope: String?) -> AsyncStream<Void> { AsyncStream { _ in } }
 }
 
 /// `SyncDoorbell` over a Supabase Realtime channel. Subscribes to `postgres_changes` for the
 /// synced tables (RLS scopes events to the user's own rows) and rings on any insert/update/delete.
+/// The partition value (uid) is passed in per subscription rather than resolved here, so the engine
+/// can re-`ring()` with a new value when auth changes (APPS-509).
 ///
 /// ponytail: not unit-tested — the doorbell only *triggers* a pull, and the pull (which carries all
 /// correctness) is covered with a fake. RealtimeClientV2 handles reconnect + auth-token refresh, so
 /// a dropped socket re-subscribes itself; the engine's periodic pull covers any gap meanwhile.
 struct SupabaseDoorbell: SyncDoorbell {
     let client: SupabaseClient
-    /// One entry per synced table, carrying its optional partition-scope column (APPS-469). The
-    /// scope *value* (uid) is resolved once per `ring()` via `scope`, not baked in here.
+    /// One entry per synced table, carrying its optional partition-scope column (APPS-469).
     let tables: [(name: String, scopeColumn: String?)]
-    /// Resolves the current user's partition value (auth uid), or nil when signed out.
-    let scope: @Sendable () async -> String?
+    /// Realtime channel name, made unique per engine instance so two engines sharing one Supabase
+    /// client don't join the same channel and cross-ring (APPS-509). Build with `makeChannelName()`.
+    let channelName: String
 
-    func ring() -> AsyncStream<Void> {
+    /// A unique-per-engine channel name: a stable base plus a random token. Two engines on one
+    /// Supabase client subscribe to distinct Realtime channels instead of colliding (APPS-509).
+    static func makeChannelName() -> String { "happysync-\(UUID().uuidString)" }
+
+    func ring(scope uid: String?) -> AsyncStream<Void> {
         AsyncStream { continuation in
             // Create the channel here (synchronous) so `onTermination` can tear it down — otherwise
-            // the socket keeps the `happysync` channel joined until the process exits, and repeated
-            // start/stop cycles leak a channel each time (APPS-473).
-            let channel = client.realtimeV2.channel("happysync")
+            // the socket keeps the channel joined until the process exits, and repeated start/stop
+            // (or auth re-scope) cycles leak a channel each time (APPS-473).
+            let channel = client.realtimeV2.channel(channelName)
             let task = Task {
-                let uid = await scope()
                 // Listeners must be registered before subscribe(); any change rings the doorbell.
                 var streams: [AsyncStream<AnyAction>] = []
                 for table in tables {
