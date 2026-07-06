@@ -750,11 +750,12 @@ public actor SyncEngine {
         ) else {
             return true // no local row (or never-stamped) → apply
         }
-        // Canonicalize both sides to one format before the lexicographic compare: PostgREST
-        // (`…+00:00`, microseconds), client (`…123Z`), and non-fractional legacy strings otherwise
-        // sort inconsistently (e.g. a fractional remote vs a non-fractional local of the same
-        // second). Same-format canonical strings sort chronologically (APPS-474).
-        return SyncTimestamp.canonicalize(remoteUpdatedAt) > SyncTimestamp.canonicalize(local)
+        // Compare the two instants at microsecond precision: PostgREST (`…+00:00`, microseconds),
+        // client (`…123Z`), and non-fractional legacy strings otherwise sort inconsistently, and a
+        // string compare truncates to milliseconds — so two writes in the same millisecond would tie
+        // and the newer be skipped forever (APPS-474, APPS-511). Strict `>`; an equal instant (an own
+        // upload echo) doesn't re-apply. See contract §4.
+        return SyncTimestamp.isStrictlyNewer(remoteUpdatedAt, than: local)
     }
 
     private func readCursor(table: String) async throws -> SyncCursor? {
