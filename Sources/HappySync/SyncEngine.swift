@@ -174,7 +174,7 @@ public actor SyncEngine {
             doorbell: SupabaseDoorbell(
                 client: supabase,
                 tables: tables.map { ($0.name, $0.scopeColumn) },
-                channelName: SupabaseDoorbell.makeChannelName()
+                channelBase: SupabaseDoorbell.makeChannelName()
             ),
             scope: scope,
             maxOfflineGap: maxOfflineGap
@@ -524,13 +524,17 @@ public actor SyncEngine {
             // Drop each affected local row so a re-pull can overwrite it with the server's copy (an
             // absent local row always loses LWW, so the server version applies cleanly). A row that
             // still has a live, non-parked outbox entry is left alone — that pending write, and its
-            // dirty-gate protection, must survive the discard.
+            // dirty-gate protection, must survive the discard. The guard keys specifically on a
+            // *non-parked* sibling (`dead_lettered = 0`): a lingering parked sibling has stopped
+            // retrying, so resetting its row to the server's version is the correct convergence, not
+            // a clobbered pending write (APPS-508 follow-up).
             for reset in rowResets {
                 try db.execute(
                     sql: """
                         DELETE FROM "\(reset.table)" WHERE "\(reset.primaryKey)" = ?
                         AND NOT EXISTS (
-                            SELECT 1 FROM \(SyncSchema.outboxTable) WHERE table_name = ? AND pk = ?
+                            SELECT 1 FROM \(SyncSchema.outboxTable)
+                            WHERE table_name = ? AND pk = ? AND dead_lettered = 0
                         )
                         """,
                     arguments: [reset.pk, reset.table, reset.pk]
@@ -591,7 +595,10 @@ public actor SyncEngine {
                 // trigger (contract §1/§2): local and server converge on the same deleted set with no
                 // orphan window and no round-trip. Children are found from the schema's declared FKs, so
                 // only rows that actually reference a deleted parent are touched.
-                try Self.cascadeDeleteChildren(db, of: spec, parentKeys: [pkValue], tables: tables, queuedAt: queuedAt)
+                // Seed the visited set with the parent's own key so a self-referential FK that points
+                // back at it can't re-enter and recurse forever (APPS-510 cycle guard).
+                var visited: Set<String> = ["\(table)\u{0}\(pk)"]
+                try Self.cascadeDeleteChildren(db, of: spec, parentKeys: [pkValue], tables: tables, queuedAt: queuedAt, visited: &visited)
                 try db.execute(
                     sql: "DELETE FROM \"\(table)\" WHERE \"\(spec.primaryKey)\" = ?",
                     arguments: [pkValue]
@@ -1079,22 +1086,31 @@ public actor SyncEngine {
     /// by whichever path reaches it first — the other path's `SELECT` no longer finds the removed row,
     /// so no duplicate tombstone is queued. FKs are assumed to reference the parent's primary key (the
     /// §4 convention), which is what `parentKeys` carries.
+    ///
+    /// `visited` carries every `(table, pk)` already scheduled for deletion this cascade, keyed as
+    /// `"table\0pk"`. A row is followed at most once, so a self-referential table holding a data cycle
+    /// (r1 → r2 → r1) terminates instead of recursing until the stack overflows.
     private static func cascadeDeleteChildren(
-        _ db: Database, of parent: SyncTable, parentKeys: [DatabaseValue], tables: [SyncTable], queuedAt: Date
+        _ db: Database, of parent: SyncTable, parentKeys: [DatabaseValue], tables: [SyncTable],
+        queuedAt: Date, visited: inout Set<String>
     ) throws {
         guard !parentKeys.isEmpty else { return }
         let parentPlaceholders = parentKeys.map { _ in "?" }.joined(separator: ", ")
         for child in tables where child.dependsOn.contains(parent.name) {
             for fkColumn in try foreignKeyColumns(db, of: child.name, referencing: parent.name) {
-                let childKeys = try DatabaseValue.fetchAll(
+                let found = try DatabaseValue.fetchAll(
                     db,
                     sql: "SELECT \"\(child.primaryKey)\" FROM \"\(child.name)\" WHERE \"\(fkColumn)\" IN (\(parentPlaceholders))",
                     arguments: StatementArguments(parentKeys)
                 )
+                // Drop any row already scheduled this cascade (reached via another path or a data
+                // cycle): `insert(_:).inserted` marks it visited and keeps only the first sighting,
+                // so a cyclic FK graph can't recurse unbounded and a second path queues no duplicate.
+                let childKeys = found.filter { visited.insert("\(child.name)\u{0}\(RowCoding.pkString($0))").inserted }
                 guard !childKeys.isEmpty else { continue }
                 // Grandchildren first: recurse before removing this level, so the deepest rows go
                 // before the rows they reference.
-                try cascadeDeleteChildren(db, of: child, parentKeys: childKeys, tables: tables, queuedAt: queuedAt)
+                try cascadeDeleteChildren(db, of: child, parentKeys: childKeys, tables: tables, queuedAt: queuedAt, visited: &visited)
                 let childPlaceholders = childKeys.map { _ in "?" }.joined(separator: ", ")
                 try db.execute(
                     sql: "DELETE FROM \"\(child.name)\" WHERE \"\(child.primaryKey)\" IN (\(childPlaceholders))",
@@ -1107,12 +1123,26 @@ public actor SyncEngine {
         }
     }
 
-    /// The columns of `child` that declare a foreign key onto `parent`, read from the live schema via
-    /// `PRAGMA foreign_key_list`. Empty when no such constraint exists (FKs off, or a logical-only
-    /// dependency) — the cascade then skips that child (APPS-510).
+    /// The single-column foreign keys of `child` that reference `parent`, read from the live schema
+    /// via `PRAGMA foreign_key_list` and grouped by FK id. Empty when no such constraint exists (FKs
+    /// off, or a logical-only dependency) — the cascade then skips that child (APPS-510).
+    ///
+    /// A *composite* FK — several columns sharing one FK id — is deliberately excluded, not expanded:
+    /// the §4 contract keys parents by a single primary key, so a well-formed child FK onto a synced
+    /// parent is single-column. Treating a composite FK as independent single-column FKs would match
+    /// (and delete) any row where *any one* column matched a parent key — an over-broad cascade. Until
+    /// composite PKs are in contract, such an FK is skipped here; its orphans still reconcile on the
+    /// next pull via the server tombstone.
     private static func foreignKeyColumns(_ db: Database, of child: String, referencing parent: String) throws -> [String] {
-        try Row.fetchAll(db, sql: "PRAGMA foreign_key_list(\"\(child)\")")
-            .filter { ($0["table"] as String?) == parent }
-            .compactMap { $0["from"] as String? }
+        var columnsByFK: [Int: [String]] = [:]
+        var order: [Int] = []
+        for row in try Row.fetchAll(db, sql: "PRAGMA foreign_key_list(\"\(child)\")")
+        where (row["table"] as String?) == parent {
+            guard let id = row["id"] as Int?, let from = row["from"] as String? else { continue }
+            if columnsByFK[id] == nil { order.append(id) }
+            columnsByFK[id, default: []].append(from)
+        }
+        // Keep only single-column FKs (the in-contract shape); a composite FK id is dropped.
+        return order.compactMap { columnsByFK[$0]!.count == 1 ? columnsByFK[$0]![0] : nil }
     }
 }

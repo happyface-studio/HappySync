@@ -199,3 +199,33 @@ private func queuedDeletes(_ db: any DatabaseReader) async throws -> [String] {
     #expect(mealPlans == 1) // not cascaded (no FK constraint to follow)
     #expect(try await queuedDeletes(db) == ["recipes/r1"])
 }
+
+@Test func cascadeTerminatesOnASelfReferentialDataCycle() async throws {
+    // A self-referential table holding a data cycle (n1 → n2 → n1) must not recurse unbounded into a
+    // stack overflow: the visited-key guard follows each row at most once (APPS-510). FK enforcement
+    // is disabled here so the cyclic data can exist and delete at all — SQLite forbids removing either
+    // row of a 2-cycle under enforced FKs — which isolates what the guard is for: terminating the
+    // recursion. Without the guard this test would spin forever rather than complete.
+    var config = Configuration()
+    config.foreignKeysEnabled = false
+    let db = try DatabaseQueue(configuration: config)
+    try await db.write { db in
+        try db.create(table: "nodes") { t in
+            t.column("id", .text).primaryKey()
+            t.column("parentId", .text).references("nodes") // declared so PRAGMA foreign_key_list finds it
+            t.column("updatedAt", .text)
+        }
+        try db.execute(sql: "INSERT INTO nodes (id, parentId) VALUES ('n1', 'n2'), ('n2', 'n1')") // n1 → n2 → n1
+    }
+    let engine = try SyncEngine(
+        db: db, remote: FakeRemote(), tables: [SyncTable(name: "nodes", dependsOn: ["nodes"])]
+    )
+
+    try await engine.enqueue(.delete, table: "nodes", row: ["id": "n1"])
+
+    // Both rows are gone and each is tombstoned exactly once — the cycle terminated cleanly.
+    let remaining = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM nodes")! }
+    #expect(remaining == 0)
+    #expect(Set(try await queuedDeletes(db)) == ["nodes/n1", "nodes/n2"])
+    #expect(try await queuedDeletes(db).count == 2) // no duplicate tombstone from the cycle
+}

@@ -83,8 +83,12 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
   **declared foreign keys** (introspected via `PRAGMA foreign_key_list`), so only rows that actually
   reference a deleted parent go; a table that only *logically* `dependsOn` a parent without a real FK
   constraint is not cascaded locally — its orphans still reconcile on the next pull. The cascade
-  assumes FKs reference the parent's primary key (the §4 convention). The drain then tombstones the
-  whole set children-before-parents via the FK ordering above, so no separate ordering is needed.
+  assumes FKs reference the parent's **single-column** primary key (the §4 convention): a *composite*
+  FK is out of contract and skipped (its orphans reconcile on the next pull) rather than expanded into
+  independent single-column matches. A visited-key guard makes each row delete at most once, so a
+  self-referential table holding a data cycle terminates instead of recursing unbounded. The drain
+  then tombstones the whole set children-before-parents via the FK ordering above, so no separate
+  ordering is needed.
 - The upsert payload **excludes** `serverOwnedColumns` (§4) and re-encodes `jsonColumns` to JSON.
 - **Schema-drift tolerance (APPS-504).** A column the server has dropped or renamed but a shipped
   client still sends makes PostgREST reject the whole upsert (`PGRST204`), which classifies permanent

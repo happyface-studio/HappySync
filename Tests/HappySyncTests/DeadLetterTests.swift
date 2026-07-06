@@ -172,3 +172,32 @@ import Supabase
     let live = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM _sync_outbox WHERE pk='r1' AND dead_lettered = 0") }
     #expect(live == 1) // the pending write is still queued
 }
+
+@Test func selectiveDiscardResetsRowDespiteAParkedSibling() async throws {
+    let db = try recipesDB()
+    // Two *parked* entries on the same row. Discarding one seq must still reset the local row toward
+    // the server's version: the sibling that stays parked has stopped retrying, so — unlike a live
+    // pending write — it isn't a reason to leave the row diverged (APPS-508 follow-up).
+    let remote = FakeRemote(
+        dataset: ["recipes": [["id": "r1", "title": "Server", "updatedAt": "2026-06-30T12:00:00.000Z"]]]
+    )
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "First", "updatedAt": "2026-07-01T09:00:00.000Z"])
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Second", "updatedAt": "2026-07-01T10:00:00.000Z"])
+    // Park both by hand — two dead-lettered siblings on one (table, pk).
+    try await db.write { try $0.execute(sql: "UPDATE _sync_outbox SET dead_lettered = 1 WHERE pk='r1'") }
+
+    let parked = try await engine.deadLetters().sorted { $0.seq < $1.seq }
+    #expect(parked.count == 2)
+
+    try await engine.discardDeadLetters([parked[0].seq]) // discard only the first parked entry
+
+    // The other entry is still parked (a lingering sibling dead-letter)…
+    let remainingParked = try await engine.deadLetters()
+    #expect(remainingParked.count == 1)
+    #expect(remainingParked.first?.seq == parked[1].seq)
+    // …yet the local row was reset despite it, so a re-pull converges the row to the server's copy.
+    try await engine.pullNow()
+    let title = try await db.read { try String.fetchOne($0, sql: "SELECT title FROM recipes WHERE id='r1'") }
+    #expect(title == "Server")
+}
