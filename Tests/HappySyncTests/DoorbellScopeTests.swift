@@ -55,8 +55,9 @@ private func scopedRecipesDB() throws -> DatabaseQueue {
     #expect(await eventually { doorbell.ringScopes == [nil, "u1"] }) // re-subscribed to the user's partition
     #expect(await eventually { doorbell.liveSubscriptions == 1 })    // …and tore down the signed-out subscription
 
-    // A Realtime change on the user's own recipe now rings through to a pull.
-    let baseline = await remote.fetchCalls
+    // A Realtime change on the user's own recipe now rings through to a pull. Baseline only once the
+    // sign-in pull has settled, so the fire's pull is what we observe (not the sign-in pull).
+    let baseline = await settledFetchCalls(remote)
     doorbell.fire()
     #expect(await eventually { await remote.fetchCalls == baseline + 1 }) // the scoped subscription rings without a stop/start
     await engine.stop()
@@ -83,8 +84,9 @@ private func scopedRecipesDB() throws -> DatabaseQueue {
     #expect(await eventually { doorbell.ringScopes == ["u1", "u2"] }) // re-filtered to u2
     #expect(await eventually { doorbell.liveSubscriptions == 1 })     // only the u2 subscription is live; u1 torn down
 
-    // An event on the old (u1) subscription must no longer poke the runner.
-    let baseline = await remote.fetchCalls
+    // An event on the old (u1) subscription must no longer poke the runner. Baseline only once the
+    // switch's pull has settled, so a still-in-flight switch pull isn't mistaken for the old-uid fire.
+    let baseline = await settledFetchCalls(remote)
     doorbell.fire(subscription: 0) // ring the torn-down u1 stream
     try await Task.sleep(for: .milliseconds(150)) // give any (erroneous) poke ample time to occur
     #expect(await remote.fetchCalls == baseline) // old-uid event is ignored

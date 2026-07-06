@@ -266,6 +266,28 @@ func eventually(timeout: Duration = .seconds(5), _ condition: @Sendable () async
     return await condition()
 }
 
+/// Returns `remote.fetchCalls` once it has stopped changing for `stableFor` — i.e. no sync pass is in
+/// flight or pending — so a test can capture a baseline that a still-settling background pull won't
+/// later perturb. Robust replacement for "sleep a bit, then read the count" before a *negative*
+/// assertion (issue #19): the subscription-state conditions flip at the start of a pass, before its
+/// pull lands, so reading the count right after them races the pull.
+func settledFetchCalls(_ remote: FakeRemote, stableFor: Duration = .milliseconds(150), timeout: Duration = .seconds(5)) async -> Int {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    var last = await remote.fetchCalls
+    var lastChange = ContinuousClock.now
+    while ContinuousClock.now < deadline {
+        try? await Task.sleep(for: .milliseconds(10))
+        let current = await remote.fetchCalls
+        if current != last {
+            last = current
+            lastChange = ContinuousClock.now
+        } else if lastChange.duration(to: ContinuousClock.now) >= stableFor {
+            return current
+        }
+    }
+    return await remote.fetchCalls
+}
+
 /// Pushes every outbox entry's `last_attempt_at` into the past so the per-entry backoff window no
 /// longer skips it — lets a test drive a retry deterministically without sleeping (APPS-470).
 func agePastBackoff(_ db: any DatabaseWriter) async throws {
