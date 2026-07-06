@@ -157,6 +157,17 @@ Both mutations refresh the status stream immediately, so `deadLetters` drops as 
 [CookThis](https://github.com/happyface-studio/CookThis) is the first consumer. The API stays
 deliberately generic, but is pressure-tested against one real app before it's treated as stable.
 
+## Documentation & Claude skill
+
+- **[Wiki](https://github.com/happyface-studio/HappySync/wiki)** — Getting Started, Server Setup,
+  API Reference, Operations & Troubleshooting, and Architecture. (Sources live in [`wiki/`](wiki).)
+- **[Sync contract](docs/SYNC-CONTRACT.md)** — the language-neutral contract every client and the
+  server must honor.
+- **Claude skill** — [`.claude/skills/happysync/`](.claude/skills/happysync) is an installable
+  [Claude Code](https://claude.com/claude-code) skill that teaches an AI assistant to integrate and
+  operate HappySync correctly. Copy it into your app's `.claude/skills/` (or `~/.claude/skills/`)
+  and invoke `/happysync`. See the [Claude Skill wiki page](https://github.com/happyface-studio/HappySync/wiki/Claude-Skill).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
