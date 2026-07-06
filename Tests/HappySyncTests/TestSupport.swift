@@ -253,6 +253,19 @@ func makeEngine(
     try SyncEngine(db: db, remote: remote, tables: tables, scope: scope)
 }
 
+/// Polls `condition` every few milliseconds until it holds or `timeout` elapses; returns whether it
+/// held. Lets a scheduler/doorbell test wait for background convergence on a generous deadline
+/// instead of asserting a fixed-sleep window that starves under a loaded CI runner and flakes
+/// (issue #19). Prefer this over `Task.sleep` + a delta assertion for anything timing-driven.
+func eventually(timeout: Duration = .seconds(5), _ condition: @Sendable () async -> Bool) async -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    while ContinuousClock.now < deadline {
+        if await condition() { return true }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+    return await condition()
+}
+
 /// Pushes every outbox entry's `last_attempt_at` into the past so the per-entry backoff window no
 /// longer skips it — lets a test drive a retry deterministically without sleeping (APPS-470).
 func agePastBackoff(_ db: any DatabaseWriter) async throws {

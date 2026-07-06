@@ -48,23 +48,18 @@ private func scopedRecipesDB() throws -> DatabaseQueue {
     )
 
     await engine.start()
-    try await Task.sleep(for: .milliseconds(60)) // the first pass subscribes the doorbell
-    #expect(doorbell.ringScopes == [nil]) // started signed-out: subscribed, scoped table skipped
+    #expect(await eventually { doorbell.ringScopes == [nil] }) // started signed-out: subscribed, scoped table skipped
 
     scope.value = "u1"     // the user signs in — no manual stop()/start()
     await engine.syncNow() // the next convergence pass (foreground or poll would do the same)
-    try await Task.sleep(for: .milliseconds(60))
-    #expect(doorbell.ringScopes == [nil, "u1"]) // engine re-subscribed to the user's partition
-    #expect(doorbell.liveSubscriptions == 1)    // …and tore down the signed-out subscription
+    #expect(await eventually { doorbell.ringScopes == [nil, "u1"] }) // re-subscribed to the user's partition
+    #expect(await eventually { doorbell.liveSubscriptions == 1 })    // …and tore down the signed-out subscription
 
     // A Realtime change on the user's own recipe now rings through to a pull.
     let baseline = await remote.fetchCalls
     doorbell.fire()
-    try await Task.sleep(for: .milliseconds(60))
-    let after = await remote.fetchCalls
+    #expect(await eventually { await remote.fetchCalls == baseline + 1 }) // the scoped subscription rings without a stop/start
     await engine.stop()
-
-    #expect(after - baseline == 1) // the scoped subscription rings without a stop/start
 }
 
 @Test func userSwitchReFiltersDoorbellAndOldEventsStopPoking() async throws {
@@ -81,28 +76,23 @@ private func scopedRecipesDB() throws -> DatabaseQueue {
     )
 
     await engine.start()
-    try await Task.sleep(for: .milliseconds(60))
-    #expect(doorbell.ringScopes == ["u1"]) // subscribed filtering u1's rows
+    #expect(await eventually { doorbell.ringScopes == ["u1"] }) // subscribed filtering u1's rows
 
     scope.value = "u2"     // a different user signs in
     await engine.syncNow()
-    try await Task.sleep(for: .milliseconds(60))
-    #expect(doorbell.ringScopes == ["u1", "u2"]) // re-filtered to u2
-    #expect(doorbell.liveSubscriptions == 1)     // only the u2 subscription is live; u1 torn down
+    #expect(await eventually { doorbell.ringScopes == ["u1", "u2"] }) // re-filtered to u2
+    #expect(await eventually { doorbell.liveSubscriptions == 1 })     // only the u2 subscription is live; u1 torn down
 
     // An event on the old (u1) subscription must no longer poke the runner.
     let baseline = await remote.fetchCalls
     doorbell.fire(subscription: 0) // ring the torn-down u1 stream
-    try await Task.sleep(for: .milliseconds(60))
+    try await Task.sleep(for: .milliseconds(150)) // give any (erroneous) poke ample time to occur
     #expect(await remote.fetchCalls == baseline) // old-uid event is ignored
 
     // …while an event on the current (u2) subscription still pokes.
     doorbell.fire()
-    try await Task.sleep(for: .milliseconds(60))
-    let after = await remote.fetchCalls
+    #expect(await eventually { await remote.fetchCalls == baseline + 1 }) // exactly the u2 event drove a pull
     await engine.stop()
-
-    #expect(after == baseline + 1) // exactly the u2 event drove a pull
 }
 
 @Test func channelNameIsUniquePerEngineInstance() {
@@ -120,19 +110,21 @@ private func scopedRecipesDB() throws -> DatabaseQueue {
     let db = try recipesDB()
     let doorbell = FakeDoorbell()
     let scope = ScopeBox()
+    let remote = FakeRemote()
     let engine = try SyncEngine(
-        db: db, remote: FakeRemote(),
+        db: db, remote: remote,
         tables: [SyncTable(name: "recipes")], // unscoped
         doorbell: doorbell, pollInterval: 999, debounceInterval: 0.02,
         scope: { scope.value }
     )
 
     await engine.start()
-    try await Task.sleep(for: .milliseconds(60))
+    #expect(await eventually { doorbell.ringScopes == [nil] }) // subscribed once at start
+    let baseline = await remote.fetchCalls
     scope.value = "u1"     // sign in
     await engine.syncNow()
-    try await Task.sleep(for: .milliseconds(60))
+    #expect(await eventually { await remote.fetchCalls > baseline }) // the post-sign-in pass ran…
     await engine.stop()
 
-    #expect(doorbell.ringScopes == [nil]) // one subscription, unaffected by the auth change
+    #expect(doorbell.ringScopes == [nil]) // …yet still one subscription, unaffected by the auth change
 }
