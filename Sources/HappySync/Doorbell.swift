@@ -31,20 +31,29 @@ struct SupabaseDoorbell: SyncDoorbell {
     let client: SupabaseClient
     /// One entry per synced table, carrying its optional partition-scope column (APPS-469).
     let tables: [(name: String, scopeColumn: String?)]
-    /// Realtime channel name, made unique per engine instance so two engines sharing one Supabase
-    /// client don't join the same channel and cross-ring (APPS-509). Build with `makeChannelName()`.
-    let channelName: String
+    /// Stable per-engine channel-name base. Made unique per engine instance so two engines sharing
+    /// one Supabase client don't collide (APPS-509); each `ring()` then appends a fresh per-ring
+    /// token so successive subscriptions never share a topic (see `ring`). Build with
+    /// `makeChannelName()`.
+    let channelBase: String
 
-    /// A unique-per-engine channel name: a stable base plus a random token. Two engines on one
-    /// Supabase client subscribe to distinct Realtime channels instead of colliding (APPS-509).
+    /// A unique-per-engine channel-name base: a stable prefix plus a random token. Two engines on
+    /// one Supabase client subscribe to distinct Realtime channels instead of colliding (APPS-509).
     static func makeChannelName() -> String { "happysync-\(UUID().uuidString)" }
 
     func ring(scope uid: String?) -> AsyncStream<Void> {
         AsyncStream { continuation in
+            // Derive a fresh topic per subscription (base + per-ring token). Reusing one per-engine
+            // topic across re-scopes let the previous channel's async teardown (onTermination →
+            // detached unsubscribe/removeChannel) race the next synchronous subscribe on the *same*
+            // topic, leaving the doorbell mis-subscribed under rapid auth churn until the next
+            // periodic pull recovered. A distinct topic per subscription makes teardown and the new
+            // subscribe touch different channels, so they can't collide (APPS-509 follow-up).
+            let topic = "\(channelBase)-\(UUID().uuidString)"
             // Create the channel here (synchronous) so `onTermination` can tear it down — otherwise
             // the socket keeps the channel joined until the process exits, and repeated start/stop
             // (or auth re-scope) cycles leak a channel each time (APPS-473).
-            let channel = client.realtimeV2.channel(channelName)
+            let channel = client.realtimeV2.channel(topic)
             let task = Task {
                 // Listeners must be registered before subscribe(); any change rings the doorbell.
                 var streams: [AsyncStream<AnyAction>] = []

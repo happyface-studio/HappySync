@@ -199,3 +199,30 @@ private func queuedDeletes(_ db: any DatabaseReader) async throws -> [String] {
     #expect(mealPlans == 1) // not cascaded (no FK constraint to follow)
     #expect(try await queuedDeletes(db) == ["recipes/r1"])
 }
+
+@Test func cascadeTerminatesOnASelfReferentialDataCycle() async throws {
+    // A self-referential table holding a data cycle (n1 → n2 → n1) must not recurse unbounded into a
+    // stack overflow: the visited-key guard follows each row at most once (APPS-510).
+    let db = try DatabaseQueue()
+    try await db.write { db in
+        try db.create(table: "nodes") { t in
+            t.column("id", .text).primaryKey()
+            t.column("parentId", .text).references("nodes")
+            t.column("updatedAt", .text)
+        }
+        // Build the cycle in two steps so the immediate FK check never sees a dangling reference.
+        try db.execute(sql: "INSERT INTO nodes (id, parentId) VALUES ('n1', NULL), ('n2', 'n1')")
+        try db.execute(sql: "UPDATE nodes SET parentId = 'n2' WHERE id = 'n1'") // now n1 → n2 → n1
+    }
+    let engine = try SyncEngine(
+        db: db, remote: FakeRemote(), tables: [SyncTable(name: "nodes", dependsOn: ["nodes"])]
+    )
+
+    try await engine.enqueue(.delete, table: "nodes", row: ["id": "n1"])
+
+    // Both rows are gone and each is tombstoned exactly once — the cycle terminated cleanly.
+    let remaining = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM nodes")! }
+    #expect(remaining == 0)
+    #expect(Set(try await queuedDeletes(db)) == ["nodes/n1", "nodes/n2"])
+    #expect(try await queuedDeletes(db).count == 2) // no duplicate tombstone from the cycle
+}
