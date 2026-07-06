@@ -120,6 +120,16 @@ public actor SyncEngine {
     private var doorbellState: DoorbellState = .idle
     private var debounceTask: Task<Void, Never>?
     private var wake: AsyncStream<Void>.Continuation?
+    /// Set by `stop()` before it awaits the in-flight pass, so `runSyncOnce` can unwind cooperatively
+    /// at the next transaction boundary instead of running a first-ever pull / `fullResync` / large
+    /// drain to completion on a slow network — bounding teardown latency for sign-out/account-switch,
+    /// which must `await stop()` before wiping the DB (APPS-513). Cleared by `start()`.
+    private var stopping = false
+
+    /// Thrown at a cooperative checkpoint when `stop()` has begun teardown, so an in-flight pass
+    /// unwinds at the next transaction boundary rather than completing. Caught in `runSyncOnce`, which
+    /// settles without flipping to `.failed` — every unit already committed is consistent (APPS-513).
+    private struct StopRequested: Error {}
 
     /// Tracks the doorbell's current subscription so an auth change surfaces as a state transition.
     private enum DoorbellState: Equatable {
@@ -205,6 +215,7 @@ public actor SyncEngine {
     public func start() {
         guard !isRunning else { return }
         isRunning = true
+        stopping = false // a fresh run: clear any teardown flag a prior stop() left set (APPS-513)
 
         let (stream, continuation) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
         wake = continuation
@@ -232,6 +243,7 @@ public actor SyncEngine {
     public func stop() async {
         guard isRunning else { return }
         isRunning = false
+        stopping = true                       // let the in-flight pass bail at its next checkpoint (APPS-513)
         wake?.finish(); wake = nil            // no more passes enqueued; runner exits after the current one
         triggersTask?.cancel()                // stop the periodic loop from poking
         doorbellTask?.cancel()                // tear down the Realtime doorbell channel
@@ -352,13 +364,21 @@ public actor SyncEngine {
             // date comparison with no extra I/O.
             let needsResyncCheck = resyncBaseline.map { now.timeIntervalSince($0) > maxOfflineGap } ?? true
             if needsResyncCheck {
-                // `false` = deferred (scoped tables, scope() still nil): leave the check armed and don't
-                // advance the baseline / last_synced_at, so a relaunch or later pass re-runs it once auth
-                // settles (APPS-501). A transient failure here throws and re-checks next pass anyway.
-                resyncDeferred = try await resyncIfStale(now: now) == false
+                // A completed check returns true; `false` = deferred (scoped tables, scope() still nil):
+                // leave the check armed and don't advance the baseline / last_synced_at, so a relaunch or
+                // later pass re-runs it once auth settles (APPS-501). A transient failure here throws and
+                // re-checks next pass anyway.
+                let checkCompleted = try await resyncIfStale(now: now)
+                resyncDeferred = !checkCompleted
             }
             try await drainOutbox()
             try await pullNow()
+        } catch is StopRequested {
+            // stop() flipped `stopping` mid-pass; the pass unwound at a transaction boundary. Every
+            // unit is transactional, so what already committed is consistent and the next start()
+            // resumes from the advanced cursor. Leave the last settled status (don't flip to .failed)
+            // and don't advance the sync baseline — this pass didn't complete (APPS-513).
+            return SyncStatus(phase: .idle, lastSyncedAt: lastSyncedAt)
         } catch {
             statusBroadcaster.send(SyncStatus(phase: .failed("\(error)"), lastSyncedAt: lastSyncedAt))
             throw error
@@ -591,6 +611,7 @@ public actor SyncEngine {
         var seenPks: [String: Set<String>] = [:]
 
         for tableName in order {
+            try await abortIfStopping(pendingDeletes, order: order) // teardown: bail between tables (APPS-513)
             guard let spec = tables.first(where: { $0.name == tableName }) else { continue }
             var scopeFilter: ScopeFilter?
             if let scopeColumn = spec.scopeColumn {
@@ -607,6 +628,7 @@ public actor SyncEngine {
             // client silently doesn't see the new column instead of bricking every pull (APPS-504).
             let knownColumns = try await db.read { db in try RowCoding.tableColumns(db, table: spec.name) }
             while true {
+                try await abortIfStopping(pendingDeletes, order: order) // teardown: bail between pages (APPS-513)
                 let page = try await remote.fetch(
                     table: spec.name, cursorColumn: spec.cursorColumn, since: cursor,
                     primaryKey: spec.primaryKey, scope: scopeFilter, limit: pageSize
@@ -654,6 +676,17 @@ public actor SyncEngine {
         }
 
         // Phase 2: tombstones, children-first (reverse FK order).
+        try await applyDeferredDeletes(pendingDeletes, order: order)
+        return seenPks
+    }
+
+    /// Applies deferred tombstones children-first (reverse FK order), re-checking the LWW gate in case
+    /// a local edit landed between phases. Factored out of `pullNow` so the cooperative-teardown
+    /// checkpoint can flush the tombstones deferred so far before bailing: the pull's cursor has
+    /// already advanced past those tombstoned rows, so leaving them un-applied would keep the rows
+    /// locally and never re-fetch them (APPS-513).
+    private func applyDeferredDeletes(_ pendingDeletes: [PendingDelete], order: [String]) async throws {
+        guard !pendingDeletes.isEmpty else { return }
         let rank = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
         for del in pendingDeletes.sorted(by: { (rank[$0.table] ?? 0) > (rank[$1.table] ?? 0) }) {
             try await db.write { db in
@@ -668,7 +701,16 @@ public actor SyncEngine {
                 )
             }
         }
-        return seenPks
+    }
+
+    /// Cooperative-teardown checkpoint for the pull loop (APPS-513). When `stop()` has begun, flush the
+    /// tombstones deferred so far — so the advanced cursor doesn't outrun them — then unwind via
+    /// `StopRequested`. Called between pages and between tables, bounding teardown to a single page
+    /// rather than the whole (possibly first-ever / full-resync) pull.
+    private func abortIfStopping(_ pendingDeletes: [PendingDelete], order: [String]) async throws {
+        guard stopping else { return }
+        try await applyDeferredDeletes(pendingDeletes, order: order)
+        throw StopRequested()
     }
 
     /// Full-resyncs when this device has been offline past `maxOfflineGap` — its cursor may point
@@ -701,6 +743,7 @@ public actor SyncEngine {
         try await db.write { db in try db.execute(sql: "DELETE FROM \(SyncSchema.stateTable)") }
         let seen = try await pullNow() // full pull (cursors cleared) → every pk the server holds
         for spec in tables {
+            if stopping { throw StopRequested() } // teardown: bail between reconcile steps (APPS-513)
             guard let seenPks = seen[spec.name] else { continue }
             let (localPks, dirtyPks) = try await db.read { db -> (Set<String>, Set<String>) in
                 let local = Set(try String.fetchAll(db, sql: "SELECT \"\(spec.primaryKey)\" FROM \"\(spec.name)\""))
@@ -820,6 +863,7 @@ public actor SyncEngine {
         let groupSeqs = Dictionary(uniqueKeysWithValues: collapsed.map { ($0.net.seq, $0.seqs) })
         var outcome = DrainOutcome(failed: 0, deadLettered: 0)
         for entry in orderForUpload(collapsed.map(\.net), tables: tables) {
+            if stopping { throw StopRequested() } // teardown: bail between entries — each clear is transactional (APPS-513)
             // Per-entry exponential backoff: skip an entry still inside its retry window so a failing
             // entry isn't re-attempted on every drain pass (and doorbell ring and poll).
             if let last = entry.lastAttemptAt, now.timeIntervalSince(last) < backoffDelay(attempts: entry.attempts) {

@@ -169,6 +169,40 @@ struct UpsertGatedRemote: SyncRemote {
     func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] { [] }
 }
 
+/// A `SyncRemote` that serves its `rows` one page at a time (honouring the `(updatedAt, id)` tuple
+/// cursor) and blocks the `gateOnFetch`-th `fetch` on a gate — so a test can hold a multi-page pull
+/// mid-flight and prove `stop()` bails at the next page boundary instead of draining every page
+/// (APPS-513). Drive it with `pageSize: 1` so each fetch is one page.
+actor PagedGatedRemote: SyncRemote {
+    private let rows: [[String: AnyJSON]]
+    private let gateOnFetch: Int
+    private let started: Signal
+    private let gate: Signal
+    private(set) var fetchCount = 0
+
+    init(rows: [[String: AnyJSON]], gateOnFetch: Int, started: Signal, gate: Signal) {
+        self.rows = rows
+        self.gateOnFetch = gateOnFetch
+        self.started = started
+        self.gate = gate
+    }
+
+    func upsert(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON] { row }
+    func delete(table: String, primaryKey: String, pk: String) async throws {}
+
+    func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] {
+        fetchCount += 1
+        if fetchCount == gateOnFetch { await started.fire(); await gate.wait() } // block this page mid-pull
+        let sorted = rows.sorted { tuple($0, cursorColumn, primaryKey) < tuple($1, cursorColumn, primaryKey) }
+        let filtered = cursor.map { c in sorted.filter { tuple($0, cursorColumn, primaryKey) > (c.updatedAt, c.id) } } ?? sorted
+        return Array(filtered.prefix(limit))
+    }
+
+    private func tuple(_ row: [String: AnyJSON], _ cursorColumn: String, _ primaryKey: String) -> (String, String) {
+        (row[cursorColumn]?.stringValue ?? "", row[primaryKey]?.stringValue ?? "")
+    }
+}
+
 /// A `SyncDoorbell` test double. Each `ring(scope:)` starts a fresh subscription (a new stream),
 /// recording the scope it was asked to filter on — so a test can prove the engine re-subscribes on
 /// an auth change (APPS-509). `fire()` rings the current subscription; `fire(subscription:)` rings a
