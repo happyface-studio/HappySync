@@ -102,6 +102,11 @@ public actor SyncEngine {
     private var resyncBaseline: Date?
 
     private nonisolated let statusBroadcaster: StatusBroadcaster
+    /// Structured logging for field diagnosis (APPS-514): pass lifecycle, dead-letters, stale-cursor
+    /// resync, doorbell (re)subscription, and scoped-table skips. **Never logs row payloads or tokens**
+    /// (user content) — only table names, counts, primary keys (redacted in release builds by the
+    /// default `.private` interpolation), and error text.
+    private let log = Logger(subsystem: "studio.happyface.happysync", category: "engine")
     private var isRunning = false
     private var lastSyncedAt: Date?
     private var consecutiveFailures = 0
@@ -287,6 +292,9 @@ public actor SyncEngine {
         let target = hasScopedTables ? scope : nil
         guard doorbellState != .ringing(scope: target) else { return }
         doorbellState = .ringing(scope: target)
+        // Log the transition without the raw partition value (an auth uid — PII): only whether the
+        // subscription is scoped (APPS-514).
+        log.info("doorbell subscribing (scoped: \(target != nil, privacy: .public)); previous subscription torn down")
         doorbellTask?.cancel() // end the previous subscription — its channel tears down on cancel
         doorbellTask = Task { [weak self] in
             guard let self else { return }
@@ -353,6 +361,7 @@ public actor SyncEngine {
         // every pass, so an auth change (sign-in, user switch) re-subscribes the doorbell to the
         // right partition here — before the pull — without a stop/start (APPS-509).
         updateDoorbellScope(await scope())
+        log.debug("sync pass starting")
         statusBroadcaster.send(SyncStatus(phase: .syncing, lastSyncedAt: lastSyncedAt))
         var resyncDeferred = false
         do {
@@ -378,8 +387,10 @@ public actor SyncEngine {
             // unit is transactional, so what already committed is consistent and the next start()
             // resumes from the advanced cursor. Leave the last settled status (don't flip to .failed)
             // and don't advance the sync baseline — this pass didn't complete (APPS-513).
+            log.info("sync pass aborted for teardown")
             return SyncStatus(phase: .idle, lastSyncedAt: lastSyncedAt)
         } catch {
+            log.error("sync pass failed: \(String(describing: error), privacy: .public)")
             statusBroadcaster.send(SyncStatus(phase: .failed("\(error)"), lastSyncedAt: lastSyncedAt))
             throw error
         }
@@ -414,6 +425,7 @@ public actor SyncEngine {
             phase: .idle, lastSyncedAt: lastSyncedAt,
             failedUploads: failedUploads, deadLetters: deadLetters
         )
+        log.info("sync pass idle: failedUploads=\(failedUploads, privacy: .public) deadLetters=\(deadLetters, privacy: .public)")
         statusBroadcaster.send(status)
         return status
     }
@@ -618,7 +630,12 @@ public actor SyncEngine {
                 // Scoped table: resolve the partition value for the signed-in user. Signed out (nil)
                 // → skip the table this pass rather than pull it unfiltered (which would download the
                 // whole public catalog); the periodic loop retries once a value is available.
-                guard let value = await scope() else { continue }
+                guard let value = await scope() else {
+                    // Surface the skip — otherwise a persistently-nil scope silently hides a real bug
+                    // (e.g. the app never wiring up scope()) as an apparently-healthy, empty sync (APPS-514).
+                    log.notice("pull: skipping scoped table \(spec.name, privacy: .public) — no partition value")
+                    continue
+                }
                 scopeFilter = ScopeFilter(column: scopeColumn, value: value)
             }
             seenPks[spec.name] = [] // mark the table as fetched — a skipped table has no entry
@@ -725,8 +742,10 @@ public actor SyncEngine {
     func resyncIfStale(now: Date = Date()) async throws -> Bool {
         guard let last = try await readLastSyncedAt(), now.timeIntervalSince(last) > maxOfflineGap else { return true }
         if tables.contains(where: { $0.scopeColumn != nil }), await scope() == nil {
+            log.notice("stale cursor: resync deferred — no partition value yet (signed out / session not restored)")
             return false
         }
+        log.notice("stale cursor: full resync — offline \(Int(now.timeIntervalSince(last)), privacy: .public)s exceeds maxOfflineGap \(Int(maxOfflineGap), privacy: .public)s")
         try await fullResync()
         return true
     }
@@ -914,6 +933,11 @@ public actor SyncEngine {
                 }
                 try Self.resetCursor(db, table: entry.tableName)
             }
+        }
+        if park {
+            // Diagnostic breadcrumb for a parked write — table/pk/op/attempts + classified error, never
+            // the row payload (user content). pk is redacted in release by the default privacy (APPS-514).
+            log.error("dead-lettered \(entry.tableName, privacy: .public) pk=\(entry.pk) op=\(entry.op.rawValue, privacy: .public) attempts=\(attempts, privacy: .public): \(String(describing: error), privacy: .public)")
         }
     }
 

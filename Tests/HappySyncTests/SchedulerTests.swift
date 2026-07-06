@@ -7,12 +7,48 @@ import Supabase
 // MARK: - Retry-delay policy
 
 @Test func nextDelayUsesPollIntervalWhenHealthy() {
-    #expect(nextDelay(consecutiveFailures: 0, pollInterval: 30) == 30)
+    #expect(nextDelay(consecutiveFailures: 0, pollInterval: 30) == 30) // healthy → exact poll, no jitter
 }
 
 @Test func nextDelayBacksOffAfterFailures() {
-    #expect(nextDelay(consecutiveFailures: 2, pollInterval: 30) == 4)  // backoffDelay(2) = 2^2
-    #expect(nextDelay(consecutiveFailures: 10, pollInterval: 30) == 64) // clamped at 2^6
+    // Exponential backoff carries ±20% jitter (APPS-514), so assert within the base's jitter bounds.
+    let d2 = nextDelay(consecutiveFailures: 2, pollInterval: 30)
+    #expect(d2 >= 4 * 0.8 && d2 <= 4 * 1.2)     // base backoffDelay(2) = 2^2 = 4
+    let d10 = nextDelay(consecutiveFailures: 10, pollInterval: 30)
+    #expect(d10 >= 64 * 0.8 && d10 <= 64 * 1.2) // clamped at 2^6 = 64
+}
+
+// APPS-514: ±20% jitter, deterministic under a seeded RNG.
+
+/// A deterministic `RandomNumberGenerator` (SplitMix64) so the jitter is reproducible in tests.
+private struct SeededGenerator: RandomNumberGenerator {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state = state &+ 0x9E3779B97F4A7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+        return z ^ (z >> 31)
+    }
+}
+
+@Test func backoffJitterStaysWithinTwentyPercentOfBase() {
+    var rng = SeededGenerator(seed: 42)
+    for attempts in 1...8 {
+        let base = pow(2.0, Double(min(max(attempts, 1), 6)))
+        for _ in 0..<200 {
+            let delay = backoffDelay(attempts: attempts, using: &rng)
+            #expect(delay >= base * 0.8)
+            #expect(delay <= base * 1.2)
+        }
+    }
+}
+
+@Test func backoffJitterIsReproducibleForASeed() {
+    var a = SeededGenerator(seed: 7)
+    var b = SeededGenerator(seed: 7)
+    #expect(backoffDelay(attempts: 3, using: &a) == backoffDelay(attempts: 3, using: &b))
 }
 
 // MARK: - Status transitions
