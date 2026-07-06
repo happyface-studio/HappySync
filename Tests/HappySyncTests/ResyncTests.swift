@@ -167,3 +167,31 @@ private actor ScopeBox {
     #expect(stored != nil)
     #expect(SyncTimestamp.date(from: stored ?? "") != nil) // stored in canonical form
 }
+
+// APPS-512: the stale-cursor check must re-arm, not run once per process. A long-lived process
+// (menu-bar Mac app, a laptop that mostly sleeps) can pass the check on day 0, then sit offline past
+// maxOfflineGap while alive; on reconnect it must full-resync rather than trust a cursor that may
+// point past purged tombstones.
+@Test func staleCheckReArmsForLongLivedProcess() async throws {
+    let db = try recipesDB()
+    // r2 was deleted server-side and its tombstone has been purged (it's absent from the server).
+    try await db.write { try $0.execute(sql: "INSERT INTO recipes (id, title, updatedAt) VALUES ('r2','purged','2026-01-01T00:00:00.000Z')") }
+    let remote = FakeRemote(dataset: [
+        "recipes": [["id": "r1", "title": "r1", "updatedAt": "2026-01-01T00:00:00.000Z"]]
+    ])
+    let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
+
+    // Pass 1 at T0: the device synced moments ago → passes the check, no reconcile; r2 survives.
+    let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+    try await markLastSynced(db, t0)
+    try await engine.runSyncOnce(now: t0)
+    let afterFresh = try await db.read { try String.fetchAll($0, sql: "SELECT id FROM recipes ORDER BY id") }
+    #expect(afterFresh == ["r1", "r2"]) // the fresh pass did not reconcile r2 away
+
+    // The process stays alive but goes offline: last_synced_at stays frozen at T0. Pass 2 runs past
+    // the offline gap — a once-per-process gate would skip the check; the re-arm must resync instead.
+    let later = t0.addingTimeInterval(31 * 24 * 3600) // > the default 30-day maxOfflineGap
+    try await engine.runSyncOnce(now: later)
+    let afterStale = try await db.read { try String.fetchAll($0, sql: "SELECT id FROM recipes ORDER BY id") }
+    #expect(afterStale == ["r1"]) // r2 (purged delete) dropped by the re-armed full resync
+}

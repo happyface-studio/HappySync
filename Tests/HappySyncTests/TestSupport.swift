@@ -169,6 +169,40 @@ struct UpsertGatedRemote: SyncRemote {
     func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] { [] }
 }
 
+/// A `SyncRemote` that serves its `rows` one page at a time (honouring the `(updatedAt, id)` tuple
+/// cursor) and blocks the `gateOnFetch`-th `fetch` on a gate — so a test can hold a multi-page pull
+/// mid-flight and prove `stop()` bails at the next page boundary instead of draining every page
+/// (APPS-513). Drive it with `pageSize: 1` so each fetch is one page.
+actor PagedGatedRemote: SyncRemote {
+    private let rows: [[String: AnyJSON]]
+    private let gateOnFetch: Int
+    private let started: Signal
+    private let gate: Signal
+    private(set) var fetchCount = 0
+
+    init(rows: [[String: AnyJSON]], gateOnFetch: Int, started: Signal, gate: Signal) {
+        self.rows = rows
+        self.gateOnFetch = gateOnFetch
+        self.started = started
+        self.gate = gate
+    }
+
+    func upsert(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON] { row }
+    func delete(table: String, primaryKey: String, pk: String) async throws {}
+
+    func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] {
+        fetchCount += 1
+        if fetchCount == gateOnFetch { await started.fire(); await gate.wait() } // block this page mid-pull
+        let sorted = rows.sorted { tuple($0, cursorColumn, primaryKey) < tuple($1, cursorColumn, primaryKey) }
+        let filtered = cursor.map { c in sorted.filter { tuple($0, cursorColumn, primaryKey) > (c.updatedAt, c.id) } } ?? sorted
+        return Array(filtered.prefix(limit))
+    }
+
+    private func tuple(_ row: [String: AnyJSON], _ cursorColumn: String, _ primaryKey: String) -> (String, String) {
+        (row[cursorColumn]?.stringValue ?? "", row[primaryKey]?.stringValue ?? "")
+    }
+}
+
 /// A `SyncDoorbell` test double. Each `ring(scope:)` starts a fresh subscription (a new stream),
 /// recording the scope it was asked to filter on — so a test can prove the engine re-subscribes on
 /// an auth change (APPS-509). `fire()` rings the current subscription; `fire(subscription:)` rings a
@@ -217,6 +251,41 @@ func makeEngine(
     scope: @escaping @Sendable () async -> String? = { nil }
 ) throws -> SyncEngine {
     try SyncEngine(db: db, remote: remote, tables: tables, scope: scope)
+}
+
+/// Polls `condition` every few milliseconds until it holds or `timeout` elapses; returns whether it
+/// held. Lets a scheduler/doorbell test wait for background convergence on a generous deadline
+/// instead of asserting a fixed-sleep window that starves under a loaded CI runner and flakes
+/// (issue #19). Prefer this over `Task.sleep` + a delta assertion for anything timing-driven.
+func eventually(timeout: Duration = .seconds(5), _ condition: @Sendable () async -> Bool) async -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    while ContinuousClock.now < deadline {
+        if await condition() { return true }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+    return await condition()
+}
+
+/// Returns `remote.fetchCalls` once it has stopped changing for `stableFor` — i.e. no sync pass is in
+/// flight or pending — so a test can capture a baseline that a still-settling background pull won't
+/// later perturb. Robust replacement for "sleep a bit, then read the count" before a *negative*
+/// assertion (issue #19): the subscription-state conditions flip at the start of a pass, before its
+/// pull lands, so reading the count right after them races the pull.
+func settledFetchCalls(_ remote: FakeRemote, stableFor: Duration = .milliseconds(150), timeout: Duration = .seconds(5)) async -> Int {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    var last = await remote.fetchCalls
+    var lastChange = ContinuousClock.now
+    while ContinuousClock.now < deadline {
+        try? await Task.sleep(for: .milliseconds(10))
+        let current = await remote.fetchCalls
+        if current != last {
+            last = current
+            lastChange = ContinuousClock.now
+        } else if lastChange.duration(to: ContinuousClock.now) >= stableFor {
+            return current
+        }
+    }
+    return await remote.fetchCalls
 }
 
 /// Pushes every outbox entry's `last_attempt_at` into the past so the per-entry backoff window no

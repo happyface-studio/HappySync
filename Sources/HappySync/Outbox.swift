@@ -82,11 +82,21 @@ func orderForUpload(_ entries: [OutboxEntry], tables: [SyncTable]) -> [OutboxEnt
     // `collapseOutbox`, which nets each key to one op before this FK ordering runs (APPS-472).
 }
 
-/// Exponential backoff between drain passes for an entry that has failed `attempts` times.
-/// Capped so a permanently-failing entry doesn't push the retry interval to infinity.
-func backoffDelay(attempts: Int) -> TimeInterval {
+/// Exponential backoff between drain passes for an entry that has failed `attempts` times, with
+/// **±20% jitter** so a user's devices that failed together — a shared outage, one expired session —
+/// don't retry in lockstep and thundering-herd the server the moment it recovers (APPS-514). Capped
+/// so a permanently-failing entry doesn't push the interval to infinity. The RNG is injectable so the
+/// jitter is deterministic under test.
+func backoffDelay<G: RandomNumberGenerator>(attempts: Int, using rng: inout G) -> TimeInterval {
     let capped = min(attempts, 6) // 2^6 = 64s ceiling
-    return pow(2.0, Double(max(capped, 1))) // 1→2s, 2→4s, 3→8s … 6→64s
+    let base = pow(2.0, Double(max(capped, 1))) // 1→2s, 2→4s, 3→8s … 6→64s
+    return base * (1 + Double.random(in: -0.2...0.2, using: &rng)) // ±20%
+}
+
+/// Production overload, jittering with the system RNG.
+func backoffDelay(attempts: Int) -> TimeInterval {
+    var rng = SystemRandomNumberGenerator()
+    return backoffDelay(attempts: attempts, using: &rng)
 }
 
 /// How long the scheduler waits before the next automatic sync: the steady-state `pollInterval`

@@ -60,6 +60,57 @@ import Supabase
     #expect(SyncTimestamp.canonicalize("not-a-timestamp") == "not-a-timestamp") // never drop a value
 }
 
+// APPS-511: the LWW compare must preserve microseconds. Canonicalize/ISO8601DateFormatter truncate
+// to milliseconds, so two writes inside the same millisecond (PostgREST emits 6 fractional digits)
+// would tie under a strict string `>` and the newer be skipped forever.
+
+@Test func isStrictlyNewerComparesMicrosecondsWithinSameMillisecond() {
+    // Same millisecond, distinct microseconds — a millisecond-truncated compare would call these equal.
+    #expect(SyncTimestamp.isStrictlyNewer("2026-07-02T12:00:00.123789Z", than: "2026-07-02T12:00:00.123456Z"))
+    #expect(!SyncTimestamp.isStrictlyNewer("2026-07-02T12:00:00.123456Z", than: "2026-07-02T12:00:00.123789Z"))
+}
+
+@Test func isStrictlyNewerNormalizesFormatsAndZones() {
+    // PostgREST µs/+00:00 vs client ms/Z, both a millisecond apart.
+    #expect(SyncTimestamp.isStrictlyNewer("2026-07-02T10:00:00.001000+00:00", than: "2026-07-02T10:00:00.000Z"))
+    // Identical instant expressed in a +02:00 zone, plus one microsecond → newer.
+    #expect(SyncTimestamp.isStrictlyNewer("2026-07-02T12:00:00.500001+02:00", than: "2026-07-02T10:00:00.500Z"))
+    // Non-fractional legacy local vs a µs-later remote of the same second.
+    #expect(SyncTimestamp.isStrictlyNewer("2026-07-02T10:00:00.000001Z", than: "2026-07-02T10:00:00Z"))
+}
+
+@Test func isStrictlyNewerTreatsEqualInstantAsNotNewer() {
+    // Own-echo: the local row already holds the server's updatedAt. Equal → not newer (strict), so
+    // the pull doesn't needlessly re-apply it.
+    #expect(!SyncTimestamp.isStrictlyNewer("2026-07-02T10:00:00.123456Z", than: "2026-07-02T10:00:00.123456Z"))
+    // Millisecond vs zero-padded microsecond of the same instant are equal too.
+    #expect(!SyncTimestamp.isStrictlyNewer("2026-07-02T10:00:00.123Z", than: "2026-07-02T10:00:00.123000Z"))
+}
+
+@Test func isStrictlyNewerFallsBackToStringCompareWhenUnparseable() {
+    // Either side unparseable → canonical-string fallback; never crashes, never drops the compare.
+    #expect(SyncTimestamp.isStrictlyNewer("zzz", than: "aaa"))
+    #expect(!SyncTimestamp.isStrictlyNewer("aaa", than: "zzz"))
+}
+
+@Test func lwwAppliesRemoteNewerBySubMillisecond() async throws {
+    let db = try recipesDB()
+    // Local holds the server's µs-precise updatedAt; a second server write in the SAME millisecond
+    // (distinct µs) must still apply — millisecond truncation would skip it forever (APPS-511).
+    try await db.write {
+        try $0.execute(sql: "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1','Local','2026-07-02T10:00:00.123456Z')")
+    }
+    let remote = FakeRemote(dataset: [
+        "recipes": [["id": "r1", "title": "Remote", "updatedAt": "2026-07-02T10:00:00.123789Z"]]
+    ])
+    let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
+
+    try await engine.pullNow()
+
+    let title = try await db.read { try String.fetchOne($0, sql: "SELECT title FROM recipes WHERE id='r1'") }
+    #expect(title == "Remote") // sub-millisecond newer, still applied
+}
+
 @Test func lwwAppliesFractionalRemoteOverNonFractionalLocalSameSecond() async throws {
     let db = try recipesDB()
     // Legacy local row stored WITHOUT fractional seconds; the remote is the same second + 1ms

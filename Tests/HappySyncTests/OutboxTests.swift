@@ -335,10 +335,13 @@ import Supabase
 }
 
 @Test func backoffGrowsExponentiallyAndCaps() {
-    #expect(backoffDelay(attempts: 1) == 2)
-    #expect(backoffDelay(attempts: 2) == 4)
-    #expect(backoffDelay(attempts: 3) == 8)
-    #expect(backoffDelay(attempts: 10) == 64) // capped at 2^6
+    // Base doubles each attempt and caps at 2^6; ±20% jitter (APPS-514) keeps each within
+    // [0.8, 1.2] of its base.
+    func withinJitter(_ delay: TimeInterval, base: Double) -> Bool { delay >= base * 0.8 && delay <= base * 1.2 }
+    #expect(withinJitter(backoffDelay(attempts: 1), base: 2))
+    #expect(withinJitter(backoffDelay(attempts: 2), base: 4))
+    #expect(withinJitter(backoffDelay(attempts: 3), base: 8))
+    #expect(withinJitter(backoffDelay(attempts: 10), base: 64)) // capped at 2^6
 }
 
 // MARK: - Server-owned columns & deletes

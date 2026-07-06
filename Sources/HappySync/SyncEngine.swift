@@ -91,12 +91,22 @@ public actor SyncEngine {
     /// instead of trusting the stale cursor. **Must be ≤ the server's tombstone-purge retention**
     /// (CookThis purges at 90 days). See APPS-471 / contract §1.
     private let maxOfflineGap: TimeInterval
-    /// Whether the once-per-process stale-cursor check has **completed**. Stays false while the
-    /// check is deferred (stale device, scoped tables, no partition value yet — APPS-501), so the
-    /// check re-runs on later passes until auth settles and the resync can actually reconcile.
-    private var didResyncCheck = false
+    /// The wall-clock time the stale-cursor check last **confirmed the device fresh** (APPS-471), or
+    /// nil when it hasn't completed — the first pass, or a pass that deferred it (stale device, scoped
+    /// tables, no partition value yet — APPS-501). Re-evaluated every pass rather than gated
+    /// once-per-process: nil forces a re-check, and a non-nil baseline older than `maxOfflineGap`
+    /// re-arms it, so a long-lived process (menu-bar Mac app, a laptop that mostly sleeps) that passes
+    /// the check then sits offline past the gap while alive resyncs on reconnect instead of trusting a
+    /// cursor that may point past purged tombstones (APPS-512). In steady state the baseline is recent,
+    /// so this is a date comparison with no extra I/O.
+    private var resyncBaseline: Date?
 
     private nonisolated let statusBroadcaster: StatusBroadcaster
+    /// Structured logging for field diagnosis (APPS-514): pass lifecycle, dead-letters, stale-cursor
+    /// resync, doorbell (re)subscription, and scoped-table skips. **Never logs row payloads or tokens**
+    /// (user content) — only table names, counts, primary keys (redacted in release builds by the
+    /// default `.private` interpolation), and error text.
+    private let log = Logger(subsystem: "studio.happyface.happysync", category: "engine")
     private var isRunning = false
     private var lastSyncedAt: Date?
     private var consecutiveFailures = 0
@@ -115,6 +125,16 @@ public actor SyncEngine {
     private var doorbellState: DoorbellState = .idle
     private var debounceTask: Task<Void, Never>?
     private var wake: AsyncStream<Void>.Continuation?
+    /// Set by `stop()` before it awaits the in-flight pass, so `runSyncOnce` can unwind cooperatively
+    /// at the next transaction boundary instead of running a first-ever pull / `fullResync` / large
+    /// drain to completion on a slow network — bounding teardown latency for sign-out/account-switch,
+    /// which must `await stop()` before wiping the DB (APPS-513). Cleared by `start()`.
+    private var stopping = false
+
+    /// Thrown at a cooperative checkpoint when `stop()` has begun teardown, so an in-flight pass
+    /// unwinds at the next transaction boundary rather than completing. Caught in `runSyncOnce`, which
+    /// settles without flipping to `.failed` — every unit already committed is consistent (APPS-513).
+    private struct StopRequested: Error {}
 
     /// Tracks the doorbell's current subscription so an auth change surfaces as a state transition.
     private enum DoorbellState: Equatable {
@@ -200,6 +220,7 @@ public actor SyncEngine {
     public func start() {
         guard !isRunning else { return }
         isRunning = true
+        stopping = false // a fresh run: clear any teardown flag a prior stop() left set (APPS-513)
 
         let (stream, continuation) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
         wake = continuation
@@ -227,6 +248,7 @@ public actor SyncEngine {
     public func stop() async {
         guard isRunning else { return }
         isRunning = false
+        stopping = true                       // let the in-flight pass bail at its next checkpoint (APPS-513)
         wake?.finish(); wake = nil            // no more passes enqueued; runner exits after the current one
         triggersTask?.cancel()                // stop the periodic loop from poking
         doorbellTask?.cancel()                // tear down the Realtime doorbell channel
@@ -270,6 +292,9 @@ public actor SyncEngine {
         let target = hasScopedTables ? scope : nil
         guard doorbellState != .ringing(scope: target) else { return }
         doorbellState = .ringing(scope: target)
+        // Log the transition without the raw partition value (an auth uid — PII): only whether the
+        // subscription is scoped (APPS-514).
+        log.info("doorbell subscribing (scoped: \(target != nil, privacy: .public)); previous subscription torn down")
         doorbellTask?.cancel() // end the previous subscription — its channel tears down on cancel
         doorbellTask = Task { [weak self] in
             guard let self else { return }
@@ -331,33 +356,55 @@ public actor SyncEngine {
     /// window still surfaces as failing rather than flapping to healthy (APPS-507). Health is
     /// `phase == .idle && failedUploads == 0 && deadLetters == 0`, not the phase alone (APPS-470).
     @discardableResult
-    func runSyncOnce() async throws -> SyncStatus {
+    func runSyncOnce(now: Date = Date()) async throws -> SyncStatus {
         // Keep the Realtime doorbell filtered on the current signed-in user: scope() is resolved
         // every pass, so an auth change (sign-in, user switch) re-subscribes the doorbell to the
         // right partition here — before the pull — without a stop/start (APPS-509).
         updateDoorbellScope(await scope())
+        log.debug("sync pass starting")
         statusBroadcaster.send(SyncStatus(phase: .syncing, lastSyncedAt: lastSyncedAt))
+        var resyncDeferred = false
         do {
-            // Once per process: if this device is past the offline horizon, full-resync before the
-            // normal push/pull so a stale cursor can't skip purged tombstones (APPS-471). Gated so a
-            // transient failure here re-checks next pass (lastSyncedAt only advances on full success).
-            // `false` means the resync was deferred (scoped tables, no partition value yet) — leave
-            // the gate open so the check re-runs once auth settles (APPS-501).
-            if !didResyncCheck {
-                didResyncCheck = try await resyncIfStale()
+            // Stale-cursor guard (APPS-471): if this device is past the offline horizon, full-resync
+            // before the normal push/pull so a stale cursor can't skip purged tombstones. Re-evaluated
+            // every pass — run it when the check hasn't completed yet (baseline nil: first pass, or a
+            // prior deferral) or when the device has since gone stale (a long-lived process offline past
+            // the gap while alive — APPS-512). In steady state the baseline is recent, so this is just a
+            // date comparison with no extra I/O.
+            let needsResyncCheck = resyncBaseline.map { now.timeIntervalSince($0) > maxOfflineGap } ?? true
+            if needsResyncCheck {
+                // A completed check returns true; `false` = deferred (scoped tables, scope() still nil):
+                // leave the check armed and don't advance the baseline / last_synced_at, so a relaunch or
+                // later pass re-runs it once auth settles (APPS-501). A transient failure here throws and
+                // re-checks next pass anyway.
+                let checkCompleted = try await resyncIfStale(now: now)
+                resyncDeferred = !checkCompleted
             }
             try await drainOutbox()
             try await pullNow()
+        } catch is StopRequested {
+            // stop() flipped `stopping` mid-pass; the pass unwound at a transaction boundary. Every
+            // unit is transactional, so what already committed is consistent and the next start()
+            // resumes from the advanced cursor. Leave the last settled status (don't flip to .failed)
+            // and don't advance the sync baseline — this pass didn't complete (APPS-513).
+            log.info("sync pass aborted for teardown")
+            return SyncStatus(phase: .idle, lastSyncedAt: lastSyncedAt)
         } catch {
+            log.error("sync pass failed: \(String(describing: error), privacy: .public)")
             statusBroadcaster.send(SyncStatus(phase: .failed("\(error)"), lastSyncedAt: lastSyncedAt))
             throw error
         }
-        lastSyncedAt = Date()
-        // While the stale-resync is deferred, don't persist: advancing last_synced_at would make
-        // the device look freshly synced and disarm the stale check — in this process and across
-        // relaunches — even though the scoped tables were never reconciled (APPS-501).
-        if didResyncCheck {
-            try await writeLastSyncedAt(lastSyncedAt!)
+        lastSyncedAt = now
+        // Persist and re-baseline only when the resync check actually completed. While it's deferred,
+        // advancing either would make the device look freshly synced and disarm the stale check — in
+        // this process and across relaunches — even though the scoped tables were never reconciled
+        // (APPS-501). Re-baselining every completed pass keeps the APPS-512 re-arm cheap: `now - baseline`
+        // stays small while the device syncs, and only crosses `maxOfflineGap` once it's been offline.
+        if resyncDeferred {
+            resyncBaseline = nil
+        } else {
+            try await writeLastSyncedAt(now)
+            resyncBaseline = now
         }
         // Settle both counts from the live outbox, not the drain pass just run. The drain skips
         // entries still inside their per-entry backoff window without counting them, so `outcome.failed`
@@ -378,6 +425,7 @@ public actor SyncEngine {
             phase: .idle, lastSyncedAt: lastSyncedAt,
             failedUploads: failedUploads, deadLetters: deadLetters
         )
+        log.info("sync pass idle: failedUploads=\(failedUploads, privacy: .public) deadLetters=\(deadLetters, privacy: .public)")
         statusBroadcaster.send(status)
         return status
     }
@@ -575,13 +623,19 @@ public actor SyncEngine {
         var seenPks: [String: Set<String>] = [:]
 
         for tableName in order {
+            try await abortIfStopping(pendingDeletes, order: order) // teardown: bail between tables (APPS-513)
             guard let spec = tables.first(where: { $0.name == tableName }) else { continue }
             var scopeFilter: ScopeFilter?
             if let scopeColumn = spec.scopeColumn {
                 // Scoped table: resolve the partition value for the signed-in user. Signed out (nil)
                 // → skip the table this pass rather than pull it unfiltered (which would download the
                 // whole public catalog); the periodic loop retries once a value is available.
-                guard let value = await scope() else { continue }
+                guard let value = await scope() else {
+                    // Surface the skip — otherwise a persistently-nil scope silently hides a real bug
+                    // (e.g. the app never wiring up scope()) as an apparently-healthy, empty sync (APPS-514).
+                    log.notice("pull: skipping scoped table \(spec.name, privacy: .public) — no partition value")
+                    continue
+                }
                 scopeFilter = ScopeFilter(column: scopeColumn, value: value)
             }
             seenPks[spec.name] = [] // mark the table as fetched — a skipped table has no entry
@@ -591,6 +645,7 @@ public actor SyncEngine {
             // client silently doesn't see the new column instead of bricking every pull (APPS-504).
             let knownColumns = try await db.read { db in try RowCoding.tableColumns(db, table: spec.name) }
             while true {
+                try await abortIfStopping(pendingDeletes, order: order) // teardown: bail between pages (APPS-513)
                 let page = try await remote.fetch(
                     table: spec.name, cursorColumn: spec.cursorColumn, since: cursor,
                     primaryKey: spec.primaryKey, scope: scopeFilter, limit: pageSize
@@ -638,6 +693,17 @@ public actor SyncEngine {
         }
 
         // Phase 2: tombstones, children-first (reverse FK order).
+        try await applyDeferredDeletes(pendingDeletes, order: order)
+        return seenPks
+    }
+
+    /// Applies deferred tombstones children-first (reverse FK order), re-checking the LWW gate in case
+    /// a local edit landed between phases. Factored out of `pullNow` so the cooperative-teardown
+    /// checkpoint can flush the tombstones deferred so far before bailing: the pull's cursor has
+    /// already advanced past those tombstoned rows, so leaving them un-applied would keep the rows
+    /// locally and never re-fetch them (APPS-513).
+    private func applyDeferredDeletes(_ pendingDeletes: [PendingDelete], order: [String]) async throws {
+        guard !pendingDeletes.isEmpty else { return }
         let rank = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
         for del in pendingDeletes.sorted(by: { (rank[$0.table] ?? 0) > (rank[$1.table] ?? 0) }) {
             try await db.write { db in
@@ -652,7 +718,16 @@ public actor SyncEngine {
                 )
             }
         }
-        return seenPks
+    }
+
+    /// Cooperative-teardown checkpoint for the pull loop (APPS-513). When `stop()` has begun, flush the
+    /// tombstones deferred so far — so the advanced cursor doesn't outrun them — then unwind via
+    /// `StopRequested`. Called between pages and between tables, bounding teardown to a single page
+    /// rather than the whole (possibly first-ever / full-resync) pull.
+    private func abortIfStopping(_ pendingDeletes: [PendingDelete], order: [String]) async throws {
+        guard stopping else { return }
+        try await applyDeferredDeletes(pendingDeletes, order: order)
+        throw StopRequested()
     }
 
     /// Full-resyncs when this device has been offline past `maxOfflineGap` — its cursor may point
@@ -667,8 +742,10 @@ public actor SyncEngine {
     func resyncIfStale(now: Date = Date()) async throws -> Bool {
         guard let last = try await readLastSyncedAt(), now.timeIntervalSince(last) > maxOfflineGap else { return true }
         if tables.contains(where: { $0.scopeColumn != nil }), await scope() == nil {
+            log.notice("stale cursor: resync deferred — no partition value yet (signed out / session not restored)")
             return false
         }
+        log.notice("stale cursor: full resync — offline \(Int(now.timeIntervalSince(last)), privacy: .public)s exceeds maxOfflineGap \(Int(self.maxOfflineGap), privacy: .public)s")
         try await fullResync()
         return true
     }
@@ -685,6 +762,7 @@ public actor SyncEngine {
         try await db.write { db in try db.execute(sql: "DELETE FROM \(SyncSchema.stateTable)") }
         let seen = try await pullNow() // full pull (cursors cleared) → every pk the server holds
         for spec in tables {
+            if stopping { throw StopRequested() } // teardown: bail between reconcile steps (APPS-513)
             guard let seenPks = seen[spec.name] else { continue }
             let (localPks, dirtyPks) = try await db.read { db -> (Set<String>, Set<String>) in
                 let local = Set(try String.fetchAll(db, sql: "SELECT \"\(spec.primaryKey)\" FROM \"\(spec.name)\""))
@@ -750,11 +828,12 @@ public actor SyncEngine {
         ) else {
             return true // no local row (or never-stamped) → apply
         }
-        // Canonicalize both sides to one format before the lexicographic compare: PostgREST
-        // (`…+00:00`, microseconds), client (`…123Z`), and non-fractional legacy strings otherwise
-        // sort inconsistently (e.g. a fractional remote vs a non-fractional local of the same
-        // second). Same-format canonical strings sort chronologically (APPS-474).
-        return SyncTimestamp.canonicalize(remoteUpdatedAt) > SyncTimestamp.canonicalize(local)
+        // Compare the two instants at microsecond precision: PostgREST (`…+00:00`, microseconds),
+        // client (`…123Z`), and non-fractional legacy strings otherwise sort inconsistently, and a
+        // string compare truncates to milliseconds — so two writes in the same millisecond would tie
+        // and the newer be skipped forever (APPS-474, APPS-511). Strict `>`; an equal instant (an own
+        // upload echo) doesn't re-apply. See contract §4.
+        return SyncTimestamp.isStrictlyNewer(remoteUpdatedAt, than: local)
     }
 
     private func readCursor(table: String) async throws -> SyncCursor? {
@@ -803,6 +882,7 @@ public actor SyncEngine {
         let groupSeqs = Dictionary(uniqueKeysWithValues: collapsed.map { ($0.net.seq, $0.seqs) })
         var outcome = DrainOutcome(failed: 0, deadLettered: 0)
         for entry in orderForUpload(collapsed.map(\.net), tables: tables) {
+            if stopping { throw StopRequested() } // teardown: bail between entries — each clear is transactional (APPS-513)
             // Per-entry exponential backoff: skip an entry still inside its retry window so a failing
             // entry isn't re-attempted on every drain pass (and doorbell ring and poll).
             if let last = entry.lastAttemptAt, now.timeIntervalSince(last) < backoffDelay(attempts: entry.attempts) {
@@ -853,6 +933,11 @@ public actor SyncEngine {
                 }
                 try Self.resetCursor(db, table: entry.tableName)
             }
+        }
+        if park {
+            // Diagnostic breadcrumb for a parked write — table/pk/op/attempts + classified error, never
+            // the row payload (user content). pk is redacted in release by the default privacy (APPS-514).
+            log.error("dead-lettered \(entry.tableName, privacy: .public) pk=\(entry.pk) op=\(entry.op.rawValue, privacy: .public) attempts=\(attempts, privacy: .public): \(String(describing: error), privacy: .public)")
         }
     }
 
