@@ -91,10 +91,15 @@ public actor SyncEngine {
     /// instead of trusting the stale cursor. **Must be ≤ the server's tombstone-purge retention**
     /// (CookThis purges at 90 days). See APPS-471 / contract §1.
     private let maxOfflineGap: TimeInterval
-    /// Whether the once-per-process stale-cursor check has **completed**. Stays false while the
-    /// check is deferred (stale device, scoped tables, no partition value yet — APPS-501), so the
-    /// check re-runs on later passes until auth settles and the resync can actually reconcile.
-    private var didResyncCheck = false
+    /// The wall-clock time the stale-cursor check last **confirmed the device fresh** (APPS-471), or
+    /// nil when it hasn't completed — the first pass, or a pass that deferred it (stale device, scoped
+    /// tables, no partition value yet — APPS-501). Re-evaluated every pass rather than gated
+    /// once-per-process: nil forces a re-check, and a non-nil baseline older than `maxOfflineGap`
+    /// re-arms it, so a long-lived process (menu-bar Mac app, a laptop that mostly sleeps) that passes
+    /// the check then sits offline past the gap while alive resyncs on reconnect instead of trusting a
+    /// cursor that may point past purged tombstones (APPS-512). In steady state the baseline is recent,
+    /// so this is a date comparison with no extra I/O.
+    private var resyncBaseline: Date?
 
     private nonisolated let statusBroadcaster: StatusBroadcaster
     private var isRunning = false
@@ -331,20 +336,26 @@ public actor SyncEngine {
     /// window still surfaces as failing rather than flapping to healthy (APPS-507). Health is
     /// `phase == .idle && failedUploads == 0 && deadLetters == 0`, not the phase alone (APPS-470).
     @discardableResult
-    func runSyncOnce() async throws -> SyncStatus {
+    func runSyncOnce(now: Date = Date()) async throws -> SyncStatus {
         // Keep the Realtime doorbell filtered on the current signed-in user: scope() is resolved
         // every pass, so an auth change (sign-in, user switch) re-subscribes the doorbell to the
         // right partition here — before the pull — without a stop/start (APPS-509).
         updateDoorbellScope(await scope())
         statusBroadcaster.send(SyncStatus(phase: .syncing, lastSyncedAt: lastSyncedAt))
+        var resyncDeferred = false
         do {
-            // Once per process: if this device is past the offline horizon, full-resync before the
-            // normal push/pull so a stale cursor can't skip purged tombstones (APPS-471). Gated so a
-            // transient failure here re-checks next pass (lastSyncedAt only advances on full success).
-            // `false` means the resync was deferred (scoped tables, no partition value yet) — leave
-            // the gate open so the check re-runs once auth settles (APPS-501).
-            if !didResyncCheck {
-                didResyncCheck = try await resyncIfStale()
+            // Stale-cursor guard (APPS-471): if this device is past the offline horizon, full-resync
+            // before the normal push/pull so a stale cursor can't skip purged tombstones. Re-evaluated
+            // every pass — run it when the check hasn't completed yet (baseline nil: first pass, or a
+            // prior deferral) or when the device has since gone stale (a long-lived process offline past
+            // the gap while alive — APPS-512). In steady state the baseline is recent, so this is just a
+            // date comparison with no extra I/O.
+            let needsResyncCheck = resyncBaseline.map { now.timeIntervalSince($0) > maxOfflineGap } ?? true
+            if needsResyncCheck {
+                // `false` = deferred (scoped tables, scope() still nil): leave the check armed and don't
+                // advance the baseline / last_synced_at, so a relaunch or later pass re-runs it once auth
+                // settles (APPS-501). A transient failure here throws and re-checks next pass anyway.
+                resyncDeferred = try await resyncIfStale(now: now) == false
             }
             try await drainOutbox()
             try await pullNow()
@@ -352,12 +363,17 @@ public actor SyncEngine {
             statusBroadcaster.send(SyncStatus(phase: .failed("\(error)"), lastSyncedAt: lastSyncedAt))
             throw error
         }
-        lastSyncedAt = Date()
-        // While the stale-resync is deferred, don't persist: advancing last_synced_at would make
-        // the device look freshly synced and disarm the stale check — in this process and across
-        // relaunches — even though the scoped tables were never reconciled (APPS-501).
-        if didResyncCheck {
-            try await writeLastSyncedAt(lastSyncedAt!)
+        lastSyncedAt = now
+        // Persist and re-baseline only when the resync check actually completed. While it's deferred,
+        // advancing either would make the device look freshly synced and disarm the stale check — in
+        // this process and across relaunches — even though the scoped tables were never reconciled
+        // (APPS-501). Re-baselining every completed pass keeps the APPS-512 re-arm cheap: `now - baseline`
+        // stays small while the device syncs, and only crosses `maxOfflineGap` once it's been offline.
+        if resyncDeferred {
+            resyncBaseline = nil
+        } else {
+            try await writeLastSyncedAt(now)
+            resyncBaseline = now
         }
         // Settle both counts from the live outbox, not the drain pass just run. The drain skips
         // entries still inside their per-entry backoff window without counting them, so `outcome.failed`
