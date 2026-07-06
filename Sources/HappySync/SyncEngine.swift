@@ -745,7 +745,7 @@ public actor SyncEngine {
             log.notice("stale cursor: resync deferred — no partition value yet (signed out / session not restored)")
             return false
         }
-        log.notice("stale cursor: full resync — offline \(Int(now.timeIntervalSince(last)), privacy: .public)s exceeds maxOfflineGap \(Int(maxOfflineGap), privacy: .public)s")
+        log.notice("stale cursor: full resync — offline \(Int(now.timeIntervalSince(last)), privacy: .public)s exceeds maxOfflineGap \(Int(self.maxOfflineGap), privacy: .public)s")
         try await fullResync()
         return true
     }
