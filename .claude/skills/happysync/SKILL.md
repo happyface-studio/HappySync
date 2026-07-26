@@ -116,7 +116,9 @@ Common fields:
   closure so the pull and doorbell filter to the user's rows instead of the whole catalog.
 - `conflictColumns: [String]` — a server-side secondary `UNIQUE` constraint used as the upsert
   conflict target. **Leaf tables only** (the merge re-keys the server row to the client's pk).
-- `serverOwnedColumns: [String]` — RPC-managed columns stripped from every upsert.
+- `cursorColumn: String` — the server-stamped change time the cursor rides (default `updatedAt`).
+  The engine strips it from every upsert: it's server-owned by contract, so nothing to declare.
+- `serverOwnedColumns: [String]` — *extra* RPC-managed columns stripped from every upsert.
 - `serverColumns: [String]` — optional allow-list to survive a dropped/renamed server column.
 
 Full field semantics and gotchas: `references/api.md`. The complete, language-neutral wire
@@ -134,7 +136,9 @@ contract: the repo's `docs/SYNC-CONTRACT.md`.
 
 ## Rules of thumb
 
-- **Never trust a client `updatedAt`.** The server trigger stamps it; LWW depends on it.
+- **Never trust a client `updatedAt`.** The server trigger stamps it; LWW depends on it. The engine
+  already strips the cursor column from every upload, so the only half left to get right is the
+  trigger.
 - **Don't apply Realtime payloads.** The doorbell only triggers a pull.
 - **`await stop()` before touching the DB file** on sign-out/account switch, or an in-flight pass
   writes to the store you're deleting (or uploads the old user's rows with the new user's token).

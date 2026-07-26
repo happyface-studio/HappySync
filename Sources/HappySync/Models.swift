@@ -17,8 +17,10 @@ public struct SyncTable: Sendable, Hashable {
     public let dependsOn: [String]
     /// Columns stored as JSON/JSONB that need encode/decode rather than scalar mapping.
     public let jsonColumns: [String]
-    /// Columns the server owns (e.g. RPC-managed counters) — stripped from every upsert so a
+    /// Extra columns the server owns (e.g. RPC-managed counters) — stripped from every upsert so a
     /// stale client value never clobbers the authoritative one. They still arrive on download.
+    /// The `cursorColumn` is server-owned by contract and stripped unconditionally; it does not need
+    /// to be listed here (see `uploadExcludedColumns`).
     public let serverOwnedColumns: [String]
     /// Full set of columns the **server**'s schema has for this table. When non-empty, the upload
     /// payload is intersected against it, so a column the server has since dropped or renamed can't
@@ -68,6 +70,23 @@ public struct SyncTable: Sendable, Hashable {
         self.scopeColumn = scopeColumn
         self.conflictColumns = conflictColumns
         self.serverColumns = serverColumns
+    }
+
+    /// Columns never included in an upload payload: the declared `serverOwnedColumns` **plus the
+    /// `cursorColumn`**, which the server stamps by contract §1/§4 and a client must therefore never
+    /// send. Stripping it is defence in depth for the one server-side requirement the engine can't
+    /// verify: with the `BEFORE INSERT/UPDATE` trigger in place a client-sent value is merely
+    /// overwritten, but on a table whose trigger was never added (or was dropped by a migration) the
+    /// uploaded value sticks and the *client's* clock silently becomes the LWW ordering authority —
+    /// rows that won't converge, a device that never sees its own write, a skewed device that always
+    /// wins or always loses. Enforced here rather than defaulted into `serverOwnedColumns` so the
+    /// public field keeps meaning "extra columns the server owns" and a consumer can't opt out of the
+    /// contract by passing an explicit list.
+    ///
+    /// `deletedAt` is deliberately **not** stripped: `collapseOutbox` relies on an upsert carrying
+    /// `deletedAt = null` to un-tombstone a re-created row.
+    var uploadExcludedColumns: Set<String> {
+        Set(serverOwnedColumns).union([cursorColumn])
     }
 }
 
