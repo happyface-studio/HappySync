@@ -35,9 +35,10 @@ public init(
     name: String,                          // identical local + remote table name
     primaryKey: String = "id",
     cursorColumn: String = "updatedAt",    // change-time column the cursor orders/filters/advances by
+                                           // — server-stamped: never included in an upload payload
     dependsOn: [String] = [],              // FK parents; drives sync + delete ordering
     jsonColumns: [String] = [],            // JSON text locally ↔ json/jsonb remote
-    serverOwnedColumns: [String] = [],     // RPC-managed; stripped from upserts, applied on download
+    serverOwnedColumns: [String] = [],     // *extra* RPC-managed columns; stripped too, applied on download
     scopeColumn: String? = nil,            // partition column when RLS is broader than the partition
     conflictColumns: [String] = [],        // secondary-unique upsert target; LEAF tables only
     serverColumns: [String] = []           // optional allow-list to survive a dropped/renamed column
@@ -50,7 +51,8 @@ public init(
 | `scopeColumn` | Requires the engine `scope:` closure. While no partition value is available (cold launch, signed out), the table's pull is skipped and the stale-resync check stays armed — never wipes an un-pulled table. |
 | `conflictColumns` | Merges a fresh-pk insert onto an existing server row by a secondary `UNIQUE` (avoids a permanent 409). The merge **re-keys the server row to the client's pk** → **leaf tables only**, or you orphan children. |
 | `serverColumns` | Opt-in backstop; a stale list silently stops uploading a real column. Prefer the client-first removal rule. Downloads need no equivalent (they intersect against the local schema). |
-| `serverOwnedColumns` | Stripped from every upsert so a stale client value never clobbers the authoritative one; still arrive on download. |
+| `serverOwnedColumns` | Stripped from every upsert so a stale client value never clobbers the authoritative one; still arrive on download. Declare only the *extra* ones — the `cursorColumn` is always stripped. |
+| `cursorColumn` | Server-stamped by contract (§1/§4), so the engine **never uploads it** — nothing to declare, and no way to opt out. Defence in depth for the one server-side requirement the engine can't verify: on a table whose trigger is missing, a client-sent value would silently make that device's clock the LWW authority. `deletedAt` is *not* stripped — an upsert carrying `deletedAt = null` is how a re-created row un-tombstones. |
 
 ## SyncStatus
 

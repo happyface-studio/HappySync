@@ -92,7 +92,8 @@ rules so any single migration is safe for every client in the field:
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Writes never reach the server; `deadLetters` climbing | RLS rejects (`42501`) or a constraint violation | `deadLetters()` → read `lastError`; fix the policy/data, then `retryDeadLetters()`. |
-| A device never sees the server's version of its **own** write | Missing `updatedAt` trigger, or a client-sent `updatedAt` | Add the server trigger; never send `updatedAt` from the client. |
+| A device never sees the server's version of its **own** write | Missing `updatedAt` trigger (the engine already strips the client's `updatedAt` from every upload, so a stale client value can't be the cause) | Add the server trigger. |
+| Rows on an insert-only table never download to other devices | The table's `cursorColumn` has no server default — the engine never uploads it, so it lands null | `default now()` (or a trigger) on that column server-side. |
 | Whole public catalog downloads to every device | RLS broader than the partition, no `scopeColumn` | Declare `scopeColumn` + supply the engine `scope:` closure. |
 | A fresh-pk insert 409s forever | Row already exists under a secondary `UNIQUE` | Declare `conflictColumns` (leaf tables only). |
 | Every write on a table dead-letters after a server migration | Dropped/renamed server column (`PGRST204`) | Restore the column until clients stop sending it; or declare `serverColumns`. |

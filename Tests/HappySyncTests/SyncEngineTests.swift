@@ -60,6 +60,18 @@ private func makeEngine(tables: [SyncTable] = []) throws -> SyncEngine {
     #expect(SyncTable(name: "recipes").serverOwnedColumns.isEmpty)
 }
 
+@Test func uploadExclusionsAlwaysCoverTheCursorColumn() {
+    // The declared list stays "extra columns the server owns"; the cursor column joins it only at the
+    // payload boundary, so a consumer can't opt out of the §4 rule by passing a list (issue #47).
+    let interactions = SyncTable(name: "userRecipeInteractions", serverOwnedColumns: ["cookedCount"])
+    #expect(interactions.uploadExcludedColumns == Set(["cookedCount", "updatedAt"]))
+    #expect(SyncTable(name: "recipes").uploadExcludedColumns == Set(["updatedAt"]))
+    let translations = SyncTable(name: "recipe_translations", cursorColumn: "translatedAt")
+    #expect(translations.uploadExcludedColumns == Set(["translatedAt"]))
+    // deletedAt is never excluded — collapseOutbox uploads `deletedAt = null` to un-tombstone.
+    #expect(SyncTable(name: "recipes").uploadExcludedColumns.contains("deletedAt") == false)
+}
+
 @Test func pullNowWithNoTablesIsNoOp() async throws {
     let engine = try makeEngine()
     try await engine.pullNow() // no tables declared → nothing to pull, must not throw

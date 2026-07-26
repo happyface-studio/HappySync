@@ -16,7 +16,10 @@ Per synced table:
 
 - **`updatedAt timestamptz` + a `BEFORE INSERT/UPDATE` trigger stamping `now()`.**
   Non-negotiable: LWW compares `updatedAt`, and a *server* clock is what prevents two devices'
-  clock skew from silently losing writes. Never trust a client-sent `updatedAt`.
+  clock skew from silently losing writes. Never trust a client-sent `updatedAt` — and a conforming
+  client never sends one: the cursor column is stripped from every upload payload (§2/§4), so the
+  server has nothing to distrust. An insert-only table whose cursor column is stamped rather than
+  triggered (e.g. `translatedAt`) therefore needs a server `default now()` on that column.
 - **`deletedAt timestamptz` tombstone** (nullable). Deletes are soft — set `deletedAt` instead of
   removing the row — so deletions propagate on the next cursor pull. Deleting a parent must
   **tombstone its children too** (don't hard-`ON DELETE CASCADE`); a server trigger is the clean
@@ -89,7 +92,14 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
   self-referential table holding a data cycle terminates instead of recursing unbounded. The drain
   then tombstones the whole set children-before-parents via the FK ordering above, so no separate
   ordering is needed.
-- The upsert payload **excludes** `serverOwnedColumns` (§4) and re-encodes `jsonColumns` to JSON.
+- The upsert payload **excludes** the table's `cursorColumn` and its `serverOwnedColumns` (§4), and
+  re-encodes `jsonColumns` to JSON. The cursor column is excluded **unconditionally** — the engine
+  enforces it, the descriptor doesn't declare it, and a consumer can't opt out. With the §1 trigger
+  present a client-sent value is merely overwritten; on a table whose trigger was never added or was
+  dropped by a migration it would stick, and the client's clock would silently become the LWW
+  ordering authority (rows that won't converge, a device that never sees its own write, a skewed
+  device that always wins or always loses). `deletedAt` is deliberately **not** excluded: an upsert
+  carrying `deletedAt = null` is how a re-created row un-tombstones after a delete+recreate collapse.
 - **Schema-drift tolerance (APPS-504).** A column the server has dropped or renamed but a shipped
   client still sends makes PostgREST reject the whole upsert (`PGRST204`), which classifies permanent
   and dead-letters every write on the table. The primary defense is operational — the §8 client-first
@@ -126,7 +136,7 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
 | Bool | integer `0/1` locally ↔ `boolean` in Postgres. |
 | Enum | `rawValue` string. |
 | JSON columns | JSON **text** locally ↔ `json`/`jsonb` in Postgres; re-parsed to a JSON value on upload. Declared per table (`jsonColumns`). |
-| Server-owned columns | declared per table (`serverOwnedColumns`); excluded from upserts, applied only on download. |
+| Server-owned columns | the `cursorColumn` (always, enforced by the engine — nothing to declare) plus any *extra* columns declared per table (`serverOwnedColumns`); excluded from upserts, applied only on download. |
 
 ## 5. Table descriptor
 
@@ -135,9 +145,13 @@ declares the same shape):
 
 - `name` — identical local + remote table name
 - `primaryKey` — default `id`
+- `cursorColumn` — the server-stamped change time the download cursor orders/filters/advances by;
+  default `updatedAt`, overridden by an insert-only table (e.g. `translatedAt`). Server-owned by
+  §1/§4: the engine strips it from every upload payload, unconditionally
 - `dependsOn` — tables referenced by FK; drives sync ordering
 - `jsonColumns` — columns needing JSON encode/decode
-- `serverOwnedColumns` — RPC-managed columns stripped from upserts
+- `serverOwnedColumns` — *extra* RPC-managed columns stripped from upserts (the `cursorColumn` is
+  stripped whether or not it's listed)
 - `scopeColumn` — partition column (e.g. `userId`) when RLS is broader than the sync partition;
   the engine filters downloads + the doorbell to `scopeColumn = <partition value>` (§1). Omit when
   RLS already scopes the table to exactly the partition.

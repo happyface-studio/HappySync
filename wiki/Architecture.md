@@ -39,6 +39,10 @@ optimistically. A background drain processes entries in `seq` order:
 
 - **PostgREST upsert** with `Prefer: return=representation` for `.upsert`; soft-delete for
   `.delete`. Both are **idempotent by primary key**, so retries are safe.
+- **The cursor column never leaves the device.** It's server-stamped by contract, so the payload
+  drops it (along with any declared `serverOwnedColumns`) with nothing declared — a table whose
+  `updatedAt` trigger is missing can't quietly promote a device's clock to the LWW authority.
+  `deletedAt` still ships, as `null`, which is how a re-created row un-tombstones.
 - **The full server representation is written back locally** on success — column defaults,
   trigger-normalized fields, recomputed server-owned columns, and (for a `conflictColumns` upsert)
   the merged row re-keyed to the client's pk. Otherwise the writing device would be the one device

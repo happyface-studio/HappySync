@@ -9,7 +9,11 @@ Run the SQL below per synced table (swap `recipes` for your table).
 ## 1. `updatedAt` — server-stamped change time
 
 LWW compares `updatedAt`, and a *server* clock is what stops two devices' clock skew from silently
-losing writes. **Never trust a client-sent `updatedAt`.**
+losing writes. **Never trust a client-sent `updatedAt`.** The engine holds up its half unasked: a
+table's `cursorColumn` is stripped from every upload payload, so no HappySync client ever sends one
+— you don't declare anything for this. The trigger below is still required (it's what advances the
+column on update, and what the cursor pull depends on); the stripping just means a table that lost
+its trigger can't quietly promote a device's clock to the ordering authority.
 
 ```sql
 alter table public.recipes
@@ -29,7 +33,9 @@ create trigger stamp_updated_at
 ```
 
 > An **insert-only / immutable** table needs no update trigger. Give it a monotonic stamp column
-> (e.g. `translatedAt`) and set that table's `cursorColumn` in its `SyncTable` descriptor.
+> (e.g. `translatedAt`) and set that table's `cursorColumn` in its `SyncTable` descriptor. Because
+> the engine never uploads the cursor column, that column must be `default now()` server-side —
+> otherwise inserts land with a null stamp the cursor can't order.
 
 ## 2. `deletedAt` — soft-delete tombstones
 
@@ -113,11 +119,12 @@ applied directly. Sync converges without it; Realtime just makes it feel instant
 | Bool | integer `0/1` locally ↔ `boolean`. |
 | Enum | `rawValue` string. |
 | JSON columns | JSON **text** locally ↔ `json`/`jsonb`; declare in `jsonColumns`. |
-| Server-owned | RPC-managed columns; declare in `serverOwnedColumns`, never in an upsert. |
+| Server-owned | RPC-managed columns; declare in `serverOwnedColumns`, never in an upsert. The `cursorColumn` is server-owned too and the engine strips it with nothing declared. |
 
 ## Checklist
 
-- [ ] `updatedAt` + `BEFORE INSERT/UPDATE` trigger on every table.
+- [ ] `updatedAt` + `BEFORE INSERT/UPDATE` trigger on every table (`default now()` on an
+      insert-only table's stamp column — the client never sends it).
 - [ ] `deletedAt` on every table + a child-tombstone trigger on every parent.
 - [ ] Tombstone purge scheduled, retention **>** engine `maxOfflineGap`.
 - [ ] RLS enabled + `auth.uid()` policies on every table.

@@ -995,7 +995,7 @@ public actor SyncEngine {
             return RowCoding.payload(
                 from: row,
                 jsonColumns: Set(spec.jsonColumns),
-                excluding: Set(spec.serverOwnedColumns),
+                excluding: spec.uploadExcludedColumns,
                 restrictingTo: spec.serverColumns.isEmpty ? nil : Set(spec.serverColumns)
             )
         }

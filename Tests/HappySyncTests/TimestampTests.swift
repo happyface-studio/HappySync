@@ -17,20 +17,30 @@ import Supabase
 }
 
 @Test func codableDateRoundTripsAsISOStringThroughUpload() async throws {
-    struct NewRecipe: Encodable, Sendable { let id: String; let title: String; let updatedAt: Date }
-    let db = try recipesDB()
+    // Uses `createdAt`, not the cursor column: the cursor column is server-stamped and stripped from
+    // every payload (issue #47), so it can't witness the wire encoding.
+    struct NewRecipe: Encodable, Sendable { let id: String; let title: String; let createdAt: Date }
+    let db = try DatabaseQueue()
+    try await db.write { db in
+        try db.create(table: "recipes") { t in
+            t.column("id", .text).primaryKey()
+            t.column("title", .text)
+            t.column("createdAt", .text)
+            t.column("updatedAt", .text)
+        }
+    }
     let remote = FakeRemote()
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     let date = try #require(SyncTimestamp.date(from: "2026-07-02T10:00:00.123Z"))
 
-    try await engine.enqueue(.upsert, table: "recipes", row: NewRecipe(id: "r1", title: "Soup", updatedAt: date))
+    try await engine.enqueue(.upsert, table: "recipes", row: NewRecipe(id: "r1", title: "Soup", createdAt: date))
 
-    let stored = try await db.read { try String.fetchOne($0, sql: "SELECT updatedAt FROM recipes WHERE id='r1'") }
+    let stored = try await db.read { try String.fetchOne($0, sql: "SELECT createdAt FROM recipes WHERE id='r1'") }
     #expect(stored == "2026-07-02T10:00:00.123Z") // local column holds ISO text
 
     try await engine.drainOutbox()
     let payload = await remote.upsertCalls.first?.row
-    #expect(payload?["updatedAt"] == .string("2026-07-02T10:00:00.123Z")) // uploaded as ISO text
+    #expect(payload?["createdAt"] == .string("2026-07-02T10:00:00.123Z")) // uploaded as ISO text
 }
 
 // APPS-474: canonicalize the three timestamp shapes that coexist so the LWW lexicographic compare
