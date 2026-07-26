@@ -209,6 +209,13 @@ public actor SyncEngine {
         self.maxOfflineGap = maxOfflineGap
         self.statusBroadcaster = StatusBroadcaster(initial: SyncStatus())
 
+        // Deliberately the *synchronous* migrator (issue #46): a non-async actor init runs on the
+        // caller's thread, before any actor isolation exists, so there is no cooperative thread to
+        // hand back to — and the async writer isn't reachable from a synchronous init anyway. The
+        // cost is one bounded, one-time schema migration at construction; the alternative is an
+        // `async` initialiser, which would break every `try SyncEngine(…)` call site to save a
+        // blocking window the app already spends setting up its database. If the sync schema ever
+        // grows an expensive migration, construct the engine off the cooperative pool instead.
         try SyncSchema.migrator().migrate(db)
     }
 
@@ -573,8 +580,10 @@ public actor SyncEngine {
     /// Supported row value types: `String`, numbers, `Bool`, `Date` (encoded as canonical ISO-8601,
     /// APPS-475), `null`, and — for columns declared in `jsonColumns` — nested objects/arrays.
     /// `Data`/blob fields are **not** supported and throw `SyncError.encoding`.
-    public func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws {
-        guard let spec = tables.first(where: { $0.name == table }) else {
+    public func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) async throws {
+        // Bind the manifest up front so the write closure captures only value types, not the actor.
+        let manifest = tables
+        guard let spec = manifest.first(where: { $0.name == table }) else {
             throw SyncError.unknownTable(table)
         }
         let columns = try RowCoding.encode(row, jsonColumns: Set(spec.jsonColumns))
@@ -584,7 +593,11 @@ public actor SyncEngine {
         let pk = RowCoding.pkString(pkValue)
         let queuedAt = Date()
 
-        try db.write { db in
+        // `await` the writer rather than GRDB's synchronous `write`: the synchronous form parks a
+        // cooperative-pool thread (and the engine actor) for the whole transaction — including the
+        // recursive cascade walk on a `.delete` — which risks starving the pool on a write burst
+        // (issue #46). Callers already `try await` this actor-isolated method, so nothing changes for them.
+        try await db.write { db in
             switch op {
             case .upsert:
                 try RowCoding.upsertLocalRow(db, table: table, primaryKey: spec.primaryKey, columns: columns)
@@ -598,7 +611,7 @@ public actor SyncEngine {
                 // Seed the visited set with the parent's own key so a self-referential FK that points
                 // back at it can't re-enter and recurse forever (APPS-510 cycle guard).
                 var visited: Set<String> = ["\(table)\u{0}\(pk)"]
-                try Self.cascadeDeleteChildren(db, of: spec, parentKeys: [pkValue], tables: tables, queuedAt: queuedAt, visited: &visited)
+                try Self.cascadeDeleteChildren(db, of: spec, parentKeys: [pkValue], tables: manifest, queuedAt: queuedAt, visited: &visited)
                 try db.execute(
                     sql: "DELETE FROM \"\(table)\" WHERE \"\(spec.primaryKey)\" = ?",
                     arguments: [pkValue]

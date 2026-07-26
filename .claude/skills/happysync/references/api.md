@@ -32,7 +32,7 @@ SyncSchema.register(into: &migrator)   // adds happysync_v1..v3
 |---|---|
 | `func start()` | Begins background sync. Idempotent. Runs an immediate convergence sync, then drives from three triggers (Realtime doorbell, periodic poll, retry backoff) through one serialized runner. |
 | `func stop() async` | **Async** — awaits the in-flight pass, then quiesces (no more DB writes / network) and unsubscribes Realtime. `start()` re-subscribes cleanly. Call **before** wiping/replacing the DB. |
-| `func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws` | Writes the domain row + an outbox entry in one transaction and wakes the runner. `.delete` cascades to FK children. Throws `SyncError.unknownTable` / `.missingPrimaryKey` / `.encoding`. |
+| `func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) async throws` | Writes the domain row + an outbox entry in one transaction and wakes the runner. `.delete` cascades to FK children. Throws `SyncError.unknownTable` / `.missingPrimaryKey` / `.encoding`. |
 | `func syncNow()` | Fire-and-forget nudge (foreground return, pull-to-refresh). Not needed after `enqueue`. |
 | `@discardableResult func pullNow() async throws -> [String: Set<String>]` | Runs a cursor pull now; returns the server primary keys seen per table. |
 | `var status: AsyncStream<SyncStatus>` (`nonisolated`) | Live status for the sync-status UI. |

@@ -58,6 +58,31 @@ import Supabase
     #expect(outboxCount == 0)
 }
 
+@Test func concurrentEnqueuesEachCommitAcrossTheAsyncWriteSuspension() async throws {
+    // `enqueue` awaits GRDB's async writer rather than blocking a cooperative thread (issue #46), so
+    // the engine actor can now admit another enqueue while a transaction is in flight. Reentrancy may
+    // interleave the calls, but each write is still one transaction: every row lands with its outbox
+    // entry, none is lost and none is split.
+    let db = try recipesDB()
+    let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")])
+
+    try await withThrowingTaskGroup(of: Void.self) { group in
+        for i in 0..<32 {
+            group.addTask {
+                try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r\(i)", "title": "row \(i)"])
+            }
+        }
+        try await group.waitForAll()
+    }
+
+    let (rows, entries) = try await db.read { db -> (Int, Int) in
+        (try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM recipes") ?? 0,
+         try Int.fetchOne(db, sql: "SELECT COUNT(DISTINCT pk) FROM _sync_outbox") ?? 0)
+    }
+    #expect(rows == 32)
+    #expect(entries == 32)
+}
+
 @Test func enqueueUnknownTableThrows() async throws {
     let engine = try makeEngine(db: try recipesDB(), tables: [SyncTable(name: "recipes")])
     await #expect(throws: SyncError.self) {

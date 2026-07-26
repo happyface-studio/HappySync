@@ -20,7 +20,7 @@ public init(
 |---|---|
 | `func start()` | Begins background sync. Idempotent. Immediate convergence sync, then drives from the Realtime doorbell, a periodic poll, and retry backoff through one serialized runner. |
 | `func stop() async` | **Async.** Awaits the in-flight pass, quiesces (no more DB writes / network), unsubscribes Realtime. `start()` re-subscribes cleanly. Call **before** wiping/replacing the DB. |
-| `func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws` | Domain row + outbox entry in one transaction; wakes the runner. `.delete` cascades to FK children. Throws `SyncError`. |
+| `func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) async throws` | Domain row + outbox entry in one transaction; wakes the runner. `.delete` cascades to FK children. Throws `SyncError`. |
 | `func syncNow()` | Fire-and-forget nudge (foreground, pull-to-refresh). Not needed after `enqueue`. |
 | `@discardableResult func pullNow() async throws -> [String: Set<String>]` | Cursor pull now; returns server primary keys seen per table. |
 | `var status: AsyncStream<SyncStatus>` | `nonisolated`. Live status for the UI. |
