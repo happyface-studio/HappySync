@@ -16,19 +16,14 @@ import Supabase
     #expect(columns["createdAt"] == "2026-07-02T10:00:00.123Z".databaseValue) // ISO text, not a Double
 }
 
-@Test func codableDateRoundTripsAsISOStringThroughUpload() async throws {
-    struct NewRecipe: Encodable, Sendable { let id: String; let title: String; let updatedAt: Date }
+@Test func isoTimestampRoundTripsUnchangedThroughUpload() async throws {
     let db = try recipesDB()
     let remote = FakeRemote()
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    let date = try #require(SyncTimestamp.date(from: "2026-07-02T10:00:00.123Z"))
 
-    try await engine.enqueue(.upsert, table: "recipes", row: NewRecipe(id: "r1", title: "Soup", updatedAt: date))
-
-    let stored = try await db.read { try String.fetchOne($0, sql: "SELECT updatedAt FROM recipes WHERE id='r1'") }
-    #expect(stored == "2026-07-02T10:00:00.123Z") // local column holds ISO text
-
+    try await write(db, "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Soup', '2026-07-02T10:00:00.123Z')")
     try await engine.drainOutbox()
+
     let payload = await remote.upsertCalls.first?.row
     #expect(payload?["updatedAt"] == .string("2026-07-02T10:00:00.123Z")) // uploaded as ISO text
 }

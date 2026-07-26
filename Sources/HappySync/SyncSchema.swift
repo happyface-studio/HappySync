@@ -8,6 +8,10 @@ enum SyncSchema {
     static let stateTable = "_sync_state"
     /// Key/value engine metadata (e.g. `last_synced_at` for the stale-cursor resync, APPS-471).
     static let metaTable = "_sync_meta"
+    /// One row (`id = 1`) holding the `applying` re-entrancy flag the write-capture triggers read.
+    /// The engine raises it while it writes *downloaded* state into the store, so the pull's own
+    /// writes don't queue themselves straight back into the outbox (issue #48).
+    static let controlTable = "_sync_control"
 
     /// A standalone migrator for HappySync's internal tables. Used when the engine owns the DB.
     static func migrator() -> DatabaseMigrator {
@@ -19,6 +23,10 @@ enum SyncSchema {
     /// Registers HappySync's internal tables into an existing migrator. Prefer this when the app
     /// runs its own `DatabaseMigrator` on the same database — GRDB tracks every migration in one
     /// shared `grdb_migrations` table, so the app and HappySync must share one migrator.
+    ///
+    /// The per-table **write-capture triggers** (issue #48) are deliberately *not* here: they're
+    /// derived from the `SyncTable` manifest, which is source code and ships without a schema version
+    /// bump, so `SyncTriggers.install` (re)runs idempotently at every engine init instead.
     static func register(into migrator: inout DatabaseMigrator) {
         migrator.registerMigration("happysync_v1") { db in
             try db.create(table: outboxTable) { t in
@@ -56,6 +64,19 @@ enum SyncSchema {
                 t.column("key", .text).notNull().primaryKey()
                 t.column("value", .text).notNull()
             }
+        }
+
+        // Issue #48: the write-capture triggers' re-entrancy flag. Exactly one row, `id = 1`, so the
+        // triggers' `WHEN` clause is a single indexed lookup. `applying = 1` means "the engine is
+        // writing downloaded state" — every capture trigger is inert for the duration, so applying a
+        // pull doesn't re-enqueue the rows it just wrote. The flag is ordinary transactional state, so
+        // a crash mid-apply rolls it back to 0 along with the writes it was guarding.
+        migrator.registerMigration("happysync_v4_control") { db in
+            try db.create(table: controlTable) { t in
+                t.column("id", .integer).primaryKey().check(sql: "id = 1")
+                t.column("applying", .integer).notNull().defaults(to: 0)
+            }
+            try db.execute(sql: "INSERT INTO \(controlTable) (id, applying) VALUES (1, 0)")
         }
     }
 }

@@ -17,7 +17,9 @@ private func makeEngine(tables: [SyncTable] = []) throws -> SyncEngine {
 }
 
 @Test func emptyEngineMigratesAndStartsIdle() async throws {
-    let db = try DatabaseQueue()
+    // The manifest and the schema must agree — a declared table gets capture triggers at init, so it
+    // has to exist first (issue #48).
+    let db = try recipesDB()
     let engine = try SyncEngine(
         db: db,
         supabase: SupabaseClient(
@@ -29,12 +31,13 @@ private func makeEngine(tables: [SyncTable] = []) throws -> SyncEngine {
     )
 
     // Internal tables exist and the outbox is empty.
-    let (outboxCount, hasState) = try await db.read { db in
+    let (outboxCount, hasState, hasControl) = try await db.read { db in
         let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM _sync_outbox") ?? -1
-        return (count, try db.tableExists("_sync_state"))
+        return (count, try db.tableExists("_sync_state"), try db.tableExists("_sync_control"))
     }
     #expect(outboxCount == 0)
     #expect(hasState)
+    #expect(hasControl)
 
     // The status stream emits an initial idle status.
     var statuses = engine.status.makeAsyncIterator()

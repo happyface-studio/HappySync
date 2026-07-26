@@ -47,8 +47,27 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
 
 ## 2. Upload (outbox → server)
 
-- Writes append to a local **outbox** in the same transaction as the domain write, then return
-  optimistically. A background drain processes the outbox in `seq` order.
+- **Writes are captured by the database, not by a client API (#48).** Each synced table carries
+  `AFTER INSERT` / `AFTER UPDATE` / `AFTER DELETE` triggers that append to a local **outbox**, so a
+  write appends in the same transaction as the domain write itself and then returns optimistically —
+  from *any* source, including a partial update, an expression update, raw SQL, or a multi-table
+  transaction. The unit of atomicity is therefore the caller's transaction (a whole user intent),
+  not one row. A background drain processes the outbox in `seq` order.
+  - An `INSERT`/`UPDATE` queues an `upsert` for the row's post-write primary key; a `DELETE` queues a
+    `delete` for its pre-write key. An update that **changes** the primary key queues both: an upsert
+    of the new key and a tombstone for the old, which the server would otherwise keep forever.
+  - Triggers are derived from the table manifest (§5), which is client source code rather than a
+    numbered migration, so they are (re)installed **idempotently at engine init** and dropped for
+    tables no longer declared. A declared table that doesn't exist locally is a hard error at init,
+    not a table that silently syncs nothing.
+  - **Re-entrancy.** The engine raises a one-row `_sync_control.applying` flag, which every trigger's
+    `WHEN` clause reads, while it writes *server* state into the store — applying a pulled page or
+    tombstone, writing back an upload's representation, reconciling a full resync, discarding a dead
+    letter. Those writes are convergence on what the server already holds; queueing them would be a
+    loop that never settles.
+  - `PRAGMA recursive_triggers` must be **on** for the writer connection: without it a REPLACE that
+    displaces a row by a unique index deletes it locally with no tombstone queued, and older SQLite
+    also skips delete triggers for rows removed by an `ON DELETE CASCADE` action.
 - **PostgREST upsert** with `Prefer: return=representation` for `.upsert`; soft-delete for
   `.delete`. Both are **idempotent by primary key**, so retries are safe; back off exponentially
   **per entry** (`last_attempt_at` gates the window) and count `attempts`.
@@ -73,22 +92,16 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
   it never permanently blocks downloads for its key (§3 LWW). Health = `phase == .idle &&
   failedUploads == 0 && deadLetters == 0`.
 - **FK ordering:** upsert parents before children; tombstone children before parents.
-- **Local cascade on delete (APPS-510).** `enqueue(.delete)` on a parent whose children are enforced
-  by local foreign keys deletes those child rows too — deepest-first, in the **same transaction** —
-  and enqueues a tombstone for each, so the drain soft-deletes them server-side as well. This mirrors
-  the server's child-tombstone trigger (§1), keeping the local and server deleted sets symmetric with
-  **no orphan window** (the UI never shows children of an already-deleted parent) and no round-trip.
-  Without it a parent delete either throws a raw SQLite RESTRICT mid-flow (FKs on) or orphans children
-  until a later pull applies the server tombstone (FKs off). Child rows are found from the schema's
-  **declared foreign keys** (introspected via `PRAGMA foreign_key_list`), so only rows that actually
-  reference a deleted parent go; a table that only *logically* `dependsOn` a parent without a real FK
-  constraint is not cascaded locally — its orphans still reconcile on the next pull. The cascade
-  assumes FKs reference the parent's **single-column** primary key (the §4 convention): a *composite*
-  FK is out of contract and skipped (its orphans reconcile on the next pull) rather than expanded into
-  independent single-column matches. A visited-key guard makes each row delete at most once, so a
-  self-referential table holding a data cycle terminates instead of recursing unbounded. The drain
-  then tombstones the whole set children-before-parents via the FK ordering above, so no separate
-  ordering is needed.
+- **Cascade on delete (APPS-510, revised by #48).** A parent delete must remove its child rows *and*
+  tombstone them, in the **same transaction** — mirroring the server's child-tombstone trigger (§1),
+  so the local and server deleted sets stay symmetric with **no orphan window** (the UI never shows
+  children of an already-deleted parent) and no round-trip. This is now the database's job: the
+  schema declares `ON DELETE CASCADE` on the child foreign keys, SQLite walks the graph, and each
+  removed child's own delete trigger queues its tombstone. A table that only *logically* `dependsOn`
+  a parent, with no FK action declared, is not cascaded — its orphans reconcile on the next pull via
+  the server tombstone. The drain then tombstones the whole set children-before-parents via the FK
+  ordering above, so no separate ordering is needed. (The client-side FK walk this replaced needed a
+  composite-FK exclusion and a visited-key cycle guard; the database needs neither.)
 - The upsert payload **excludes** `serverOwnedColumns` (§4) and re-encodes `jsonColumns` to JSON.
 - **Schema-drift tolerance (APPS-504).** A column the server has dropped or renamed but a shipped
   client still sends makes PostgREST reject the whole upsert (`PGRST204`), which classifies permanent

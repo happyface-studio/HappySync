@@ -4,50 +4,12 @@ import GRDB
 import Supabase
 @testable import HappySync
 
-// FakeRemote and makeEngine live in TestSupport.swift.
+// recipeGraphDB / recipeGraphTables / write / queuedOps live in TestSupport.swift.
 //
-// Local cascade delete (APPS-510): deleting a parent row removes its children locally — deepest-first
-// so enforced FKs never RESTRICT — and queues a tombstone for each, mirroring the server trigger.
-
-// MARK: - Fixture
-
-/// CookThis's recipe graph with **real SQLite FK constraints** (GRDB enforces them by default), so a
-/// bare parent delete would RESTRICT without the engine's local cascade.
-private func recipeGraphDB() throws -> DatabaseQueue {
-    let db = try DatabaseQueue()
-    try db.write { db in
-        try db.create(table: "recipes") { t in
-            t.column("id", .text).primaryKey()
-            t.column("title", .text)
-            t.column("updatedAt", .text)
-        }
-        try db.create(table: "recipeIngredients") { t in
-            t.column("id", .text).primaryKey()
-            t.column("recipeId", .text).references("recipes")
-            t.column("updatedAt", .text)
-        }
-        try db.create(table: "recipeSteps") { t in
-            t.column("id", .text).primaryKey()
-            t.column("recipeId", .text).references("recipes")
-            t.column("updatedAt", .text)
-        }
-        try db.create(table: "recipeStepIngredients") { t in
-            t.column("id", .text).primaryKey()
-            t.column("stepId", .text).references("recipeSteps")
-            t.column("ingredientId", .text).references("recipeIngredients")
-            t.column("updatedAt", .text)
-        }
-    }
-    return db
-}
-
-/// Declared child-first to prove the cascade doesn't rely on input order.
-private let recipeGraphTables = [
-    SyncTable(name: "recipeStepIngredients", dependsOn: ["recipeSteps", "recipeIngredients"]),
-    SyncTable(name: "recipeIngredients", dependsOn: ["recipes"]),
-    SyncTable(name: "recipeSteps", dependsOn: ["recipes"]),
-    SyncTable(name: "recipes"),
-]
+// Issue #48 retired the engine's hand-rolled cascade (~60 lines of recursive FK walking, a composite-FK
+// exclusion, and a visited-set cycle guard). `ON DELETE CASCADE` in the app's schema now does the graph
+// walk the database was built for, and each child table's own delete trigger queues its tombstone — so
+// local and server still converge on the same deleted set, with no orphan window and no round-trip.
 
 private func queuedDeletes(_ db: any DatabaseReader) async throws -> [String] {
     try await db.read { db in
@@ -56,23 +18,29 @@ private func queuedDeletes(_ db: any DatabaseReader) async throws -> [String] {
     }
 }
 
+/// Seeds the graph and drains the inserts, so each test starts with an empty outbox.
+private func seedGraph(_ db: any DatabaseWriter, engine: SyncEngine, _ statements: [String]) async throws {
+    try await db.write { db in for sql in statements { try db.execute(sql: sql) } }
+    try await engine.drainOutbox()
+}
+
 // MARK: - Cascade
 
 @Test func deletingParentCascadesToChildrenAndQueuesTombstones() async throws {
     let db = try recipeGraphDB()
-    try await db.write { db in
-        try db.execute(sql: "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
-        try db.execute(sql: "INSERT INTO recipeIngredients (id, recipeId) VALUES ('i1', 'r1'), ('i2', 'r1')")
-        try db.execute(sql: "INSERT INTO recipeSteps (id, recipeId) VALUES ('s1', 'r1')")
-        try db.execute(sql: "INSERT INTO recipeStepIngredients (id, stepId, ingredientId) VALUES ('x1', 's1', 'i1')")
-        // A second recipe whose subtree must survive the delete of r1.
-        try db.execute(sql: "INSERT INTO recipes (id, title) VALUES ('r2', 'Salad')")
-        try db.execute(sql: "INSERT INTO recipeIngredients (id, recipeId) VALUES ('i9', 'r2')")
-    }
     let engine = try SyncEngine(db: db, remote: FakeRemote(), tables: recipeGraphTables)
+    try await seedGraph(db, engine: engine, [
+        "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')",
+        "INSERT INTO recipeIngredients (id, recipeId) VALUES ('i1', 'r1'), ('i2', 'r1')",
+        "INSERT INTO recipeSteps (id, recipeId) VALUES ('s1', 'r1')",
+        "INSERT INTO recipeStepIngredients (id, stepId, ingredientId) VALUES ('x1', 's1', 'i1')",
+        // A second recipe whose subtree must survive the delete of r1.
+        "INSERT INTO recipes (id, title) VALUES ('r2', 'Salad')",
+        "INSERT INTO recipeIngredients (id, recipeId) VALUES ('i9', 'r2')",
+    ])
 
-    // Under enforced FKs this bare DELETE would RESTRICT; the cascade removes the whole subtree.
-    try await engine.enqueue(.delete, table: "recipes", row: ["id": "r1"])
+    // A plain DELETE. SQLite walks the FK graph; each child's delete trigger queues its own tombstone.
+    try await write(db, "DELETE FROM recipes WHERE id = 'r1'")
 
     let counts = try await db.read { db in
         (
@@ -91,8 +59,8 @@ private func queuedDeletes(_ db: any DatabaseReader) async throws -> [String] {
     let survivor = try await db.read { try String.fetchOne($0, sql: "SELECT id FROM recipeIngredients") }
     #expect(survivor == "i9")
 
-    // A tombstone was queued for the parent and every removed child (no duplicate for x1, which is
-    // reachable via both recipeSteps and recipeIngredients).
+    // A tombstone was queued for the parent and every removed child — including x1, reached through
+    // both recipeSteps and recipeIngredients, which SQLite deletes (and so tombstones) exactly once.
     let queued = try await queuedDeletes(db)
     #expect(Set(queued) == [
         "recipes/r1", "recipeIngredients/i1", "recipeIngredients/i2",
@@ -103,16 +71,16 @@ private func queuedDeletes(_ db: any DatabaseReader) async throws -> [String] {
 
 @Test func cascadeDrainsTombstonesChildrenBeforeParent() async throws {
     let db = try recipeGraphDB()
-    try await db.write { db in
-        try db.execute(sql: "INSERT INTO recipes (id) VALUES ('r1')")
-        try db.execute(sql: "INSERT INTO recipeIngredients (id, recipeId) VALUES ('i1', 'r1')")
-        try db.execute(sql: "INSERT INTO recipeSteps (id, recipeId) VALUES ('s1', 'r1')")
-        try db.execute(sql: "INSERT INTO recipeStepIngredients (id, stepId, ingredientId) VALUES ('x1', 's1', 'i1')")
-    }
     let remote = FakeRemote()
     let engine = try SyncEngine(db: db, remote: remote, tables: recipeGraphTables)
+    try await seedGraph(db, engine: engine, [
+        "INSERT INTO recipes (id) VALUES ('r1')",
+        "INSERT INTO recipeIngredients (id, recipeId) VALUES ('i1', 'r1')",
+        "INSERT INTO recipeSteps (id, recipeId) VALUES ('s1', 'r1')",
+        "INSERT INTO recipeStepIngredients (id, stepId, ingredientId) VALUES ('x1', 's1', 'i1')",
+    ])
 
-    try await engine.enqueue(.delete, table: "recipes", row: ["id": "r1"])
+    try await write(db, "DELETE FROM recipes WHERE id = 'r1'")
     try await engine.drainOutbox()
 
     let order = await remote.deleteCalls.map(\.table)
@@ -130,13 +98,12 @@ private func queuedDeletes(_ db: any DatabaseReader) async throws -> [String] {
 
 @Test func deletingLeafParentQueuesOnlyItsOwnTombstone() async throws {
     let db = try recipeGraphDB()
-    try await db.write { db in try db.execute(sql: "INSERT INTO recipes (id) VALUES ('r1')") }
     let engine = try SyncEngine(db: db, remote: FakeRemote(), tables: recipeGraphTables)
+    try await seedGraph(db, engine: engine, ["INSERT INTO recipes (id) VALUES ('r1')"])
 
-    try await engine.enqueue(.delete, table: "recipes", row: ["id": "r1"])
+    try await write(db, "DELETE FROM recipes WHERE id = 'r1'")
 
-    // No children exist — the cascade is a no-op, exactly the pre-APPS-510 single-row behavior.
-    #expect(try await queuedDeletes(db) == ["recipes/r1"])
+    #expect(try await queuedDeletes(db) == ["recipes/r1"]) // no children — nothing to cascade
     let recipes = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM recipes")! }
     #expect(recipes == 0)
 }
@@ -145,15 +112,15 @@ private func queuedDeletes(_ db: any DatabaseReader) async throws -> [String] {
     // Deleting a recipeStep (a child that is itself a parent) removes its recipeStepIngredients but
     // leaves the recipe and its recipeIngredients intact.
     let db = try recipeGraphDB()
-    try await db.write { db in
-        try db.execute(sql: "INSERT INTO recipes (id) VALUES ('r1')")
-        try db.execute(sql: "INSERT INTO recipeIngredients (id, recipeId) VALUES ('i1', 'r1')")
-        try db.execute(sql: "INSERT INTO recipeSteps (id, recipeId) VALUES ('s1', 'r1'), ('s2', 'r1')")
-        try db.execute(sql: "INSERT INTO recipeStepIngredients (id, stepId, ingredientId) VALUES ('x1', 's1', 'i1'), ('x2', 's2', 'i1')")
-    }
     let engine = try SyncEngine(db: db, remote: FakeRemote(), tables: recipeGraphTables)
+    try await seedGraph(db, engine: engine, [
+        "INSERT INTO recipes (id) VALUES ('r1')",
+        "INSERT INTO recipeIngredients (id, recipeId) VALUES ('i1', 'r1')",
+        "INSERT INTO recipeSteps (id, recipeId) VALUES ('s1', 'r1'), ('s2', 'r1')",
+        "INSERT INTO recipeStepIngredients (id, stepId, ingredientId) VALUES ('x1', 's1', 'i1'), ('x2', 's2', 'i1')",
+    ])
 
-    try await engine.enqueue(.delete, table: "recipeSteps", row: ["id": "s1"])
+    try await write(db, "DELETE FROM recipeSteps WHERE id = 's1'")
 
     let (steps, stepIngredients, ingredients) = try await db.read { db in
         (
@@ -165,14 +132,14 @@ private func queuedDeletes(_ db: any DatabaseReader) async throws -> [String] {
     #expect(steps == ["s2"])            // only the deleted step is gone
     #expect(stepIngredients == ["x2"])  // only s1's step-ingredient cascaded away
     #expect(ingredients == 1)           // the shared recipeIngredient i1 is untouched
-    let queued = try await queuedDeletes(db)
-    #expect(Set(queued) == ["recipeSteps/s1", "recipeStepIngredients/x1"])
+    #expect(Set(try await queuedDeletes(db)) == ["recipeSteps/s1", "recipeStepIngredients/x1"])
 }
 
-@Test func cascadeSkipsLogicalDependencyWithoutFKConstraint() async throws {
-    // A child that `dependsOn` a parent but has NO real SQLite FK constraint is not cascaded here
-    // (there's no enforcement to violate, and no declared column to follow). Its rows survive locally
-    // and reconcile on the next pull via the server tombstone.
+@Test func aTableWithoutAnFKConstraintIsNotCascaded() async throws {
+    // A child that `dependsOn` a parent but declares no `ON DELETE CASCADE` isn't touched by the
+    // parent's delete — the database has nothing to walk. Its rows survive locally and reconcile on the
+    // next pull via the server's own child tombstone. Declare the FK action if you want the local
+    // cascade; `dependsOn` alone only orders uploads.
     let db = try DatabaseQueue()
     try await db.write { db in
         try db.create(table: "recipes") { t in
@@ -184,48 +151,77 @@ private func queuedDeletes(_ db: any DatabaseReader) async throws -> [String] {
             t.column("recipeId", .text) // logical reference only — no .references(...)
             t.column("updatedAt", .text)
         }
-        try db.execute(sql: "INSERT INTO recipes (id) VALUES ('r1')")
-        try db.execute(sql: "INSERT INTO mealPlans (id, recipeId) VALUES ('m1', 'r1')")
     }
     let engine = try SyncEngine(
         db: db,
         remote: FakeRemote(),
         tables: [SyncTable(name: "recipes"), SyncTable(name: "mealPlans", dependsOn: ["recipes"])]
     )
+    try await seedGraph(db, engine: engine, [
+        "INSERT INTO recipes (id) VALUES ('r1')",
+        "INSERT INTO mealPlans (id, recipeId) VALUES ('m1', 'r1')",
+    ])
 
-    try await engine.enqueue(.delete, table: "recipes", row: ["id": "r1"])
+    try await write(db, "DELETE FROM recipes WHERE id = 'r1'")
 
     let mealPlans = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM mealPlans")! }
-    #expect(mealPlans == 1) // not cascaded (no FK constraint to follow)
+    #expect(mealPlans == 1) // not cascaded — no FK action to follow
     #expect(try await queuedDeletes(db) == ["recipes/r1"])
 }
 
-@Test func cascadeTerminatesOnASelfReferentialDataCycle() async throws {
-    // A self-referential table holding a data cycle (n1 → n2 → n1) must not recurse unbounded into a
-    // stack overflow: the visited-key guard follows each row at most once (APPS-510). FK enforcement
-    // is disabled here so the cyclic data can exist and delete at all — SQLite forbids removing either
-    // row of a 2-cycle under enforced FKs — which isolates what the guard is for: terminating the
-    // recursion. Without the guard this test would spin forever rather than complete.
-    var config = Configuration()
-    config.foreignKeysEnabled = false
-    let db = try DatabaseQueue(configuration: config)
+@Test func selfReferentialCascadeTombstonesTheWholeChain() async throws {
+    // A self-referential table (a folder tree). Deleting the root cascades down every level and each
+    // removed row's own delete trigger queues its tombstone — no recursion guard needed on our side,
+    // because SQLite's cascade, not the engine, walks the graph.
+    let db = try DatabaseQueue()
     try await db.write { db in
         try db.create(table: "nodes") { t in
             t.column("id", .text).primaryKey()
-            t.column("parentId", .text).references("nodes") // declared so PRAGMA foreign_key_list finds it
+            t.column("parentId", .text).references("nodes", onDelete: .cascade)
             t.column("updatedAt", .text)
         }
-        try db.execute(sql: "INSERT INTO nodes (id, parentId) VALUES ('n1', 'n2'), ('n2', 'n1')") // n1 → n2 → n1
     }
-    let engine = try SyncEngine(
-        db: db, remote: FakeRemote(), tables: [SyncTable(name: "nodes", dependsOn: ["nodes"])]
-    )
+    let engine = try SyncEngine(db: db, remote: FakeRemote(), tables: [SyncTable(name: "nodes", dependsOn: ["nodes"])])
+    try await seedGraph(db, engine: engine, [
+        "INSERT INTO nodes (id, parentId) VALUES ('n1', NULL), ('n2', 'n1'), ('n3', 'n2')",
+    ])
 
-    try await engine.enqueue(.delete, table: "nodes", row: ["id": "n1"])
+    try await write(db, "DELETE FROM nodes WHERE id = 'n1'")
 
-    // Both rows are gone and each is tombstoned exactly once — the cycle terminated cleanly.
     let remaining = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM nodes")! }
     #expect(remaining == 0)
-    #expect(Set(try await queuedDeletes(db)) == ["nodes/n1", "nodes/n2"])
-    #expect(try await queuedDeletes(db).count == 2) // no duplicate tombstone from the cycle
+    #expect(Set(try await queuedDeletes(db)) == ["nodes/n1", "nodes/n2", "nodes/n3"])
+    #expect(try await queuedDeletes(db).count == 3) // one tombstone per row, no duplicates
+}
+
+// MARK: - Server tombstones don't bounce back
+
+@Test func aPulledParentTombstoneCascadesLocallyWithoutQueuingUploads() async throws {
+    // The server already tombstoned the children (its own trigger did, per contract §1/§2). Applying
+    // the parent's tombstone cascades locally, but none of it may be queued back for upload.
+    let db = try recipeGraphDB()
+    let remote = FakeRemote(dataset: [
+        "recipes": [[
+            "id": "r1", "title": "Soup",
+            // Strictly newer than the `serverUpdatedAt` the seeding drain stamped on the local row.
+            "updatedAt": "2026-07-01T00:00:00.000Z", "deletedAt": "2026-07-01T00:00:00.000Z",
+        ]],
+    ])
+    let engine = try SyncEngine(db: db, remote: remote, tables: recipeGraphTables)
+    try await seedGraph(db, engine: engine, [
+        "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Soup', '2026-01-01T00:00:00.000Z')",
+        "INSERT INTO recipeSteps (id, recipeId) VALUES ('s1', 'r1')",
+    ])
+
+    try await engine.pullNow()
+
+    let counts = try await db.read { db in
+        (
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM recipes")!,
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM recipeSteps")!
+        )
+    }
+    #expect(counts.0 == 0) // the tombstone applied…
+    #expect(counts.1 == 0) // …and cascaded to the child locally
+    #expect(try await queuedOps(db).isEmpty) // but nothing bounced back at the server
 }

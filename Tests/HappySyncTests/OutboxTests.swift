@@ -25,13 +25,13 @@ import Supabase
     #expect(rank("recipeIngredients") < rank("recipeStepIngredients"))
 }
 
-// MARK: - Transactional enqueue
+// MARK: - Transactional capture
 
-@Test func enqueueWritesDomainRowAndOutboxEntryAtomically() async throws {
+@Test func writeRecordsDomainRowAndOutboxEntryAtomically() async throws {
     let db = try recipesDB()
-    let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")])
+    _ = try makeEngine(db: db, tables: [SyncTable(name: "recipes")])
 
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     let (title, outbox) = try db.read { db -> (String?, Row?) in
         let title = try String.fetchOne(db, sql: "SELECT title FROM recipes WHERE id = 'r1'")
@@ -43,33 +43,6 @@ import Supabase
     #expect(outbox?["pk"] == "r1")
     #expect(outbox?["op"] == "upsert")
     #expect(outbox?["attempts"] == 0)
-}
-
-@Test func enqueueRollsBackOutboxWhenDomainWriteFails() async throws {
-    // "ghost" is declared as a synced table but has no local table → the domain write fails,
-    // so the outbox insert in the same transaction must roll back too.
-    let db = try recipesDB()
-    let engine = try makeEngine(db: db, tables: [SyncTable(name: "ghost")])
-
-    await #expect(throws: (any Error).self) {
-        try await engine.enqueue(.upsert, table: "ghost", row: ["id": "g1"])
-    }
-    let outboxCount = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM _sync_outbox") }
-    #expect(outboxCount == 0)
-}
-
-@Test func enqueueUnknownTableThrows() async throws {
-    let engine = try makeEngine(db: try recipesDB(), tables: [SyncTable(name: "recipes")])
-    await #expect(throws: SyncError.self) {
-        try await engine.enqueue(.upsert, table: "notdeclared", row: ["id": "x"])
-    }
-}
-
-@Test func enqueueMissingPrimaryKeyThrows() async throws {
-    let engine = try makeEngine(db: try recipesDB(), tables: [SyncTable(name: "recipes")])
-    await #expect(throws: SyncError.self) {
-        try await engine.enqueue(.upsert, table: "recipes", row: ["title": "no id here"])
-    }
 }
 
 @Test func encodesScalarsBoolsAndJSONColumns() throws {
@@ -100,7 +73,7 @@ import Supabase
     let db = try recipesDB()
     let remote = FakeRemote()
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox()
 
@@ -138,9 +111,9 @@ import Supabase
         remote: remote,
         tables: [SyncTable(name: "recipeIngredients", dependsOn: ["recipes"]), SyncTable(name: "recipes")]
     )
-    // Enqueue the CHILD first (lower seq); the drain must still upload the parent first.
-    try await engine.enqueue(.upsert, table: "recipeIngredients", row: ["id": "i1", "recipeId": "r1"])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1"])
+    // Write the CHILD first (lower seq); the drain must still upload the parent first.
+    try await write(db, "INSERT INTO recipeIngredients (id, recipeId) VALUES ('i1', 'r1')")
+    try await write(db, "INSERT INTO recipes (id) VALUES ('r1')")
 
     try await engine.drainOutbox()
 
@@ -152,8 +125,8 @@ import Supabase
     let db = try recipesDB()
     let remote = FakeRemote()
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "a", "title": "first"])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "b", "title": "second"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('a', 'first')")
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('b', 'second')")
 
     try await engine.drainOutbox()
 
@@ -174,7 +147,7 @@ import Supabase
         return server
     }
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox()
 
@@ -194,13 +167,13 @@ import Supabase
     let started = Signal(), gate = Signal()
     let remote = UpsertGatedRemote(started: started, gate: gate)
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     // Drive the drain concurrently; it uploads "Soup" then blocks in `upsert` awaiting the server.
     let drain = Task { try await engine.drainOutbox() }
     await started.wait()
     // The user edits the same row while that upload is in flight → a newer outbox entry for r1.
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "User edit"])
+    try await write(db, "UPDATE recipes SET title = 'User edit' WHERE id = 'r1'")
     await gate.fire() // let the in-flight upload complete and write back
     try await drain.value
 
@@ -238,10 +211,9 @@ import Supabase
         remote: remote,
         tables: [SyncTable(name: "userRecipeInteractions", conflictColumns: ["userId", "recipeId"])]
     )
-    try await engine.enqueue(
-        .upsert,
-        table: "userRecipeInteractions",
-        row: ["id": "x1", "userId": "u1", "recipeId": "r1", "cookedCount": 1] as [String: AnyJSON]
+    try await write(
+        db,
+        "INSERT INTO userRecipeInteractions (id, userId, recipeId, cookedCount) VALUES ('x1', 'u1', 'r1', 1)"
     )
 
     try await engine.drainOutbox()
@@ -276,11 +248,7 @@ import Supabase
         remote: remote,
         tables: [SyncTable(name: "userRecipeInteractions", conflictColumns: ["userId", "recipeId"])]
     )
-    try await engine.enqueue(
-        .upsert,
-        table: "userRecipeInteractions",
-        row: ["id": "x1", "userId": "u1", "recipeId": "r1"] as [String: AnyJSON]
-    )
+    try await write(db, "INSERT INTO userRecipeInteractions (id, userId, recipeId) VALUES ('x1', 'u1', 'r1')")
 
     try await engine.drainOutbox()
 
@@ -293,7 +261,7 @@ import Supabase
     let db = try recipesDB()
     let remote = FakeRemote()
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox()
 
@@ -306,7 +274,7 @@ import Supabase
     let db = try recipesDB()
     let remote = FakeRemote(failUpserts: 1) // first upsert throws, then succeeds
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     // First drain: upsert fails — entry stays, attempts bumped, row not yet marked clean.
     try await engine.drainOutbox()
@@ -361,11 +329,7 @@ import Supabase
         remote: remote,
         tables: [SyncTable(name: "userRecipeInteractions", serverOwnedColumns: ["cookedCount"])]
     )
-    try await engine.enqueue(
-        .upsert,
-        table: "userRecipeInteractions",
-        row: ["id": "u1", "cookedCount": 5] as [String: AnyJSON]
-    )
+    try await write(db, "INSERT INTO userRecipeInteractions (id, cookedCount) VALUES ('u1', 5)")
 
     try await engine.drainOutbox()
 
@@ -393,11 +357,7 @@ import Supabase
         remote: remote,
         tables: [SyncTable(name: "recipes", serverColumns: ["id", "title", "updatedAt"])]
     )
-    try await engine.enqueue(
-        .upsert,
-        table: "recipes",
-        row: ["id": "r1", "title": "Soup", "legacyNotes": "old"] as [String: AnyJSON]
-    )
+    try await write(db, "INSERT INTO recipes (id, title, legacyNotes) VALUES ('r1', 'Soup', 'old')")
 
     try await engine.drainOutbox()
 
@@ -415,9 +375,9 @@ import Supabase
     let remote = FakeRemote()
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
 
-    try await engine.enqueue(.delete, table: "recipes", row: ["id": "r1"])
+    try await write(db, "DELETE FROM recipes WHERE id = 'r1'")
 
-    // enqueue removes the local row immediately; the tombstone propagates on drain.
+    // The row is gone locally the moment the write commits; the tombstone propagates on drain.
     let localCount = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM recipes WHERE id = 'r1'") }
     #expect(localCount == 0)
 

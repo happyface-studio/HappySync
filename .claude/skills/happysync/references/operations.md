@@ -99,6 +99,8 @@ rules so any single migration is safe for every client in the field:
 | Whole public catalog downloads to every device | RLS broader than the partition, no `scopeColumn` | Declare `scopeColumn` + supply the engine `scope:` closure. |
 | A fresh-pk insert 409s forever | Row already exists under a secondary `UNIQUE` | Declare `conflictColumns` (leaf tables only). |
 | Every write on a table dead-letters after a server migration | Dropped/renamed server column (`PGRST204`) | Restore the column until clients stop sending it; or declare `serverColumns` as a backstop. |
-| Deleted parent leaves orphaned children in the UI | No local FK constraint, or server child-tombstone trigger missing | Add real FK constraints (local cascade) and the server child-tombstone trigger. |
+| Deleted parent leaves orphaned children in the UI | Child FK not declared `ON DELETE CASCADE` locally, or server child-tombstone trigger missing | Declare `ON DELETE CASCADE` on the child FKs (`dependsOn` alone deletes nothing) and add the server child-tombstone trigger. |
+| `SyncEngine.init` throws `missingLocalTable` / `missingPrimaryKeyColumn` | The `tables` manifest names a table (or key column) the local schema doesn't have | Run your app's migrations **before** constructing the engine; fix the manifest name. It throws rather than silently syncing nothing for that table. |
+| Some writes sync, one code path never does | A write that bypasses the declared tables — writing a table not in the manifest, or a `DatabasePool` reader-side hack | Add the table to the manifest. Writes to declared tables are captured by triggers, so there is no way to "forget" to enqueue one. |
 | Offline-long device resurrects deleted rows | `maxOfflineGap` > server tombstone retention | Set `maxOfflineGap` ≤ retention. |
 | Idle status shows healthy but changes aren't syncing | Reading `phase` only | Health must include `failedUploads == 0 && deadLetters == 0`. |

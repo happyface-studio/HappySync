@@ -48,9 +48,9 @@ private func tombstoneableRecipesDB() throws -> DatabaseQueue {
     let remote = FakeRemote()
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
 
-    // Offline: delete r1, then re-create it under the same pk.
-    try await engine.enqueue(.delete, table: "recipes", row: ["id": "r1"])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Recreated"])
+    // Offline: delete r1, then re-create it under the same pk — two plain writes, two captured ops.
+    try await write(db, "DELETE FROM recipes WHERE id = 'r1'")
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Recreated')")
 
     try await engine.drainOutbox()
 
@@ -74,8 +74,8 @@ private func tombstoneableRecipesDB() throws -> DatabaseQueue {
     try await db.write { try $0.execute(sql: "INSERT INTO recipes (id, title) VALUES ('r1', 'X')") }
     let remote = FakeRemote()
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Edited"])
-    try await engine.enqueue(.delete, table: "recipes", row: ["id": "r1"])
+    try await write(db, "UPDATE recipes SET title = 'Edited' WHERE id = 'r1'")
+    try await write(db, "DELETE FROM recipes WHERE id = 'r1'")
 
     try await engine.drainOutbox()
 
@@ -89,8 +89,8 @@ private func tombstoneableRecipesDB() throws -> DatabaseQueue {
     let db = try recipesDB()
     let remote = FakeRemote()
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "First"])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Second"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'First')")
+    try await write(db, "UPDATE recipes SET title = 'Second' WHERE id = 'r1'")
 
     try await engine.drainOutbox()
 

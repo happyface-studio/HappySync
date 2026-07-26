@@ -31,7 +31,7 @@ private func markLastSynced(_ db: any DatabaseWriter, _ date: Date) async throws
     ])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
     // r3 is a pending local-only create (dirty) — must NOT be reconciled away.
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r3", "title": "local only"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r3', 'local only')")
     // This device last synced 100 days ago — well past the default 30-day offline gap.
     try await markLastSynced(db, Date(timeIntervalSinceNow: -100 * 24 * 3600))
 

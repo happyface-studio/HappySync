@@ -16,15 +16,19 @@ public init(
 ) throws
 ```
 
-Migrations for the engine's internal tables (`_sync_outbox`, `_sync_state`, `_sync_meta`) run at
-init. If your app owns the GRDB migrator, register them into it instead so both share one
-`grdb_migrations` table:
+Migrations for the engine's internal tables (`_sync_outbox`, `_sync_state`, `_sync_meta`,
+`_sync_control`) run at init. If your app owns the GRDB migrator, register them into it instead so
+both share one `grdb_migrations` table:
 
 ```swift
 var migrator = DatabaseMigrator()
-SyncSchema.register(into: &migrator)   // adds happysync_v1..v3
+SyncSchema.register(into: &migrator)   // adds happysync_v1..v4
 // … your app migrations …
 ```
+
+The per-table **write-capture triggers** are not migrations — they're derived from the `tables`
+manifest, so the engine (re)installs them idempotently at every init and drops the ones for tables
+you've stopped syncing. Every declared table must exist by then.
 
 ### Methods
 
@@ -32,8 +36,8 @@ SyncSchema.register(into: &migrator)   // adds happysync_v1..v3
 |---|---|
 | `func start()` | Begins background sync. Idempotent. Runs an immediate convergence sync, then drives from three triggers (Realtime doorbell, periodic poll, retry backoff) through one serialized runner. |
 | `func stop() async` | **Async** — awaits the in-flight pass, then quiesces (no more DB writes / network) and unsubscribes Realtime. `start()` re-subscribes cleanly. Call **before** wiping/replacing the DB. |
-| `func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws` | Writes the domain row + an outbox entry in one transaction and wakes the runner. `.delete` cascades to FK children. Throws `SyncError.unknownTable` / `.missingPrimaryKey` / `.encoding`. |
-| `func syncNow()` | Fire-and-forget nudge (foreground return, pull-to-refresh). Not needed after `enqueue`. |
+| `func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws` | **Deprecated (issue #48).** Performs the write; the table's capture trigger records it. Write GRDB directly instead. Throws `SyncError.unknownTable` / `.missingPrimaryKey` / `.encoding`. |
+| `func syncNow()` | Fire-and-forget nudge (foreground return, pull-to-refresh). Not needed after a write — the engine wakes on queued writes itself. |
 | `@discardableResult func pullNow() async throws -> [String: Set<String>]` | Runs a cursor pull now; returns the server primary keys seen per table. |
 | `var status: AsyncStream<SyncStatus>` (`nonisolated`) | Live status for the sync-status UI. |
 | `func deadLetters() async throws -> [DeadLetter]` | Inspect parked entries. |
@@ -107,8 +111,29 @@ public enum SyncOp: String, Codable { case upsert; case delete }
 
 public enum SyncError: Error {
     case notImplemented(String)
-    case unknownTable(String)                    // enqueue on an undeclared table
+    case unknownTable(String)                    // deprecated enqueue on an undeclared table
     case missingPrimaryKey(table: String, column: String)
     case encoding(String)
+    // Thrown at init when the manifest and the local schema disagree (issue #48):
+    case missingLocalTable(String)               // declared SyncTable has no local table
+    case missingPrimaryKeyColumn(table: String, column: String)
+    case recursiveTriggersUnavailable            // PRAGMA recursive_triggers could not be enabled
 }
 ```
+
+## Writing (no API)
+
+There is no write method. Each declared table gets `AFTER INSERT` / `AFTER UPDATE` / `AFTER DELETE`
+triggers that append to `_sync_outbox` inside the caller's own transaction, so every GRDB write
+syncs — and a multi-row, multi-table transaction queues its uploads atomically with its rows.
+
+```swift
+try await db.write { try recipe.save($0) }                                   // upsert
+try await db.write { try $0.execute(sql: "UPDATE recipes SET title = ? WHERE id = ?", arguments: [t, id]) }
+try await db.write { try $0.execute(sql: "DELETE FROM recipes WHERE id = ?", arguments: [id]) }
+```
+
+An update that changes a row's primary key queues both an upsert of the new key and a tombstone for
+the old. Declare `ON DELETE CASCADE` on child foreign keys to have a parent delete tombstone its
+children. Internally, the engine suppresses the triggers (via a one-row `_sync_control.applying`
+flag) while it writes server state locally, so downloads never re-enqueue themselves.
