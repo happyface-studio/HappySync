@@ -124,6 +124,10 @@ await engine.stop()          // engine is quiesced here
 try await wipeLocalDatabase()
 ```
 
+Status subscriptions survive teardown: `stop()` broadcasts a settled `.idle` status but doesn't end
+the streams, so a `for await status in engine.status` loop keeps delivering after the next `start()`
+— no re-subscribing needed.
+
 ## Next
 
 - **[[Server Setup]]** — required before the first successful sync.

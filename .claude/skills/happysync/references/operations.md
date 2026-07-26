@@ -65,6 +65,10 @@ try await wipeLocalDatabase()
 // build a fresh engine for the new account, then start()
 ```
 
+`stop()` settles the status stream (`.idle`, keeping the outbox counts) but leaves subscriptions open,
+so a `for await status in engine.status` loop resumes delivering after the next `start()` — reusing
+the same engine across sign-out → sign-in needs no re-subscription.
+
 ## Stale-cursor full resync
 
 A device offline past `maxOfflineGap` (default 30 days) can't trust its cursors — a tombstone it

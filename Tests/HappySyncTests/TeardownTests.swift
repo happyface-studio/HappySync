@@ -85,3 +85,65 @@ import Supabase
     let resumed = try await db.read { try String.fetchAll($0, sql: "SELECT id FROM recipes ORDER BY id") }
     #expect(resumed == ["r0", "r1", "r2"]) // resumed cleanly from where teardown stopped
 }
+
+// MARK: - Status streams survive teardown (issue #45)
+
+// stop() used to finish() every status stream, so the typical long-lived consumer —
+// `.task { for await status in engine.status { … } }` — exited its loop for good. A later start()
+// then broadcast to zero subscribers and the sync-status UI stayed dead for the rest of the process,
+// on exactly the flow teardown exists for: sign-out → wipe → sign-in.
+
+@Test func statusStreamStillDeliversAfterStopThenStart() async throws {
+    let db = try recipesDB()
+    let remote = FakeRemote(dataset: ["recipes": [["id": "r1", "title": "Soup", "updatedAt": "2026-07-02T10:00:00.000Z"]]])
+    let engine = try SyncEngine(
+        db: db, remote: remote, tables: [SyncTable(name: "recipes")],
+        doorbell: SilentDoorbell(), pollInterval: 999
+    )
+
+    // One subscription, taken before the stop/start cycle and consumed the way a SwiftUI `.task`
+    // does — a `for await` loop that must outlive teardown.
+    let collected = StatusCollector()
+    let consumer = Task { for await status in engine.status { await collected.append(status) } }
+    #expect(await eventually { await collected.count >= 1 }) // initial idle replay landed
+
+    await engine.start()
+    #expect(await eventually { await remote.fetchCalls >= 1 }) // start()'s immediate pass ran
+    #expect(await eventually { await collected.syncingCount >= 1 })
+    await engine.stop()
+    let passesSeen = await collected.syncingCount
+
+    // The restarted engine's pass must reach that *original* subscriber. With the old finish()-on-stop
+    // behaviour the loop above has already exited, so no further status ever arrives. Counting
+    // `.syncing` statuses pins the assertion to a *new pass* — stop()'s settle only broadcasts `.idle`.
+    await engine.start()
+    #expect(await eventually { await remote.fetchCalls >= 2 })              // the post-restart pass ran…
+    #expect(await eventually { await collected.syncingCount > passesSeen }) // …and reached the subscriber
+
+    await engine.stop()
+    consumer.cancel()
+}
+
+@Test func stopSettlesStatusToIdleKeepingCounts() async throws {
+    let db = try recipesDB()
+    let remote = FakeRemote(failUpserts: 99, permanentUpserts: true) // parks the write on its first attempt
+    let engine = try SyncEngine(
+        db: db, remote: remote, tables: [SyncTable(name: "recipes")],
+        doorbell: SilentDoorbell(), pollInterval: 999
+    )
+    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await engine.runSyncOnce() // parks r1 → deadLetters == 1
+
+    var status = engine.status.makeAsyncIterator()
+    #expect(await status.next()?.deadLetters == 1) // replayed pre-stop snapshot
+
+    await engine.start()
+    await engine.stop()
+
+    // stop() leaves a settled, non-syncing status whose outbox counts still surface the parked write —
+    // teardown doesn't touch the outbox, so hiding them would read as healthy.
+    var afterStop = engine.status.makeAsyncIterator()
+    let settled = await afterStop.next()
+    #expect(settled?.phase == .idle)
+    #expect(settled?.deadLetters == 1)
+}
