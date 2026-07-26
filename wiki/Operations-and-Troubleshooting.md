@@ -63,6 +63,9 @@ await engine.stop()          // quiesced here
 try await wipeLocalDatabase()
 ```
 
+`stop()` settles the status stream (`.idle`, keeping the outbox counts) but leaves subscriptions
+open, so the sync-status UI resumes updating on the next `start()` without being re-subscribed.
+
 ## Stale-cursor full resync
 
 A device offline past `maxOfflineGap` (default 30 days) can't trust its cursors — a tombstone it

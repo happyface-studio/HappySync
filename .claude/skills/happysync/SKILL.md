@@ -101,6 +101,9 @@ await engine.stop()        // quiesced here: no more DB writes, no network calls
 try await wipeLocalDatabase()
 ```
 
+`stop()` settles `status` to `.idle` but does **not** end the streams — a `for await` loop taken
+before `stop()` keeps receiving updates after the next `start()`.
+
 ## Declaring tables
 
 `SyncTable` is the per-table descriptor. Only `name` is required; everything else is defaulted.

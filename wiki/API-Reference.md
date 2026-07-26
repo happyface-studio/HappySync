@@ -19,11 +19,11 @@ public init(
 | Method | Behavior |
 |---|---|
 | `func start()` | Begins background sync. Idempotent. Immediate convergence sync, then drives from the Realtime doorbell, a periodic poll, and retry backoff through one serialized runner. |
-| `func stop() async` | **Async.** Awaits the in-flight pass, quiesces (no more DB writes / network), unsubscribes Realtime. `start()` re-subscribes cleanly. Call **before** wiping/replacing the DB. |
+| `func stop() async` | **Async.** Awaits the in-flight pass, quiesces (no more DB writes / network), unsubscribes Realtime. Settles `status` to `.idle` but leaves subscriptions open. `start()` re-subscribes cleanly. Call **before** wiping/replacing the DB. |
 | `func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws` | Domain row + outbox entry in one transaction; wakes the runner. `.delete` cascades to FK children. Throws `SyncError`. |
 | `func syncNow()` | Fire-and-forget nudge (foreground, pull-to-refresh). Not needed after `enqueue`. |
 | `@discardableResult func pullNow() async throws -> [String: Set<String>]` | Cursor pull now; returns server primary keys seen per table. |
-| `var status: AsyncStream<SyncStatus>` | `nonisolated`. Live status for the UI. |
+| `var status: AsyncStream<SyncStatus>` | `nonisolated`. Live status for the UI. Each access is an independent stream replaying the latest snapshot; it survives `stop()`/`start()` and only ends when the engine is deallocated. |
 | `func deadLetters() async throws -> [DeadLetter]` | Inspect parked entries. |
 | `func retryDeadLetters(_ seqs: [Int64]? = nil) async throws` | Re-queue parked writes (specific `seq`s, or all). |
 | `func discardDeadLetters(_ seqs: [Int64]? = nil) async throws` | Drop parked writes and re-pull affected rows so local converges to the server. |
