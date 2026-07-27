@@ -12,7 +12,7 @@ import Supabase
 /// The kind answers *what to show the user*; it is deliberately **not** a retry signal. Whether a
 /// write is still being retried or has been parked is `SyncStatus.failedUploads` vs `deadLetters`,
 /// which the engine derives from its own permanence rules.
-public enum SyncFailure: Error, Sendable, Equatable {
+public enum SyncFailure: Error, Sendable, Equatable, CustomStringConvertible {
     /// The request never got an answer — offline, DNS, connection dropped (`URLError`). Recovers on
     /// its own; a UI generally shows nothing for this.
     case network
@@ -39,9 +39,16 @@ public enum SyncFailure: Error, Sendable, Equatable {
 }
 
 extension SyncFailure {
-    /// Classifies a transport error into its public kind. Mirrors the retry classification in
-    /// `remoteErrorIsPermanent` / `remoteErrorIsAuthTransient` — same inputs, same reasoning — so the
-    /// kind a consumer sees can't contradict how the engine treated the failure.
+    /// Classifies a transport error into its public kind, from the same inputs and by the same
+    /// reasoning as the retry classification in `remoteErrorIsPermanent` /
+    /// `remoteErrorIsAuthTransient`.
+    ///
+    /// **One deliberate divergence:** `PGRST204` classifies as `.schemaMismatch`, but
+    /// `postgrestCodeIsPermanent` leaves it transient, so the engine retries it to the
+    /// `deadLetterAfter` cap rather than parking at once. That's intended — PostgREST raises it from a
+    /// *stale schema cache* as well as from a genuinely absent column, and the stale case clears on
+    /// its own, so retrying first costs nothing and self-heals. The kind still tells the app what to
+    /// show if the write does eventually park.
     ///
     /// Unwraps the `RemoteFailure` envelope the production remote raises, so a classified error
     /// classifies identically whether it arrives wrapped or bare.
@@ -79,18 +86,34 @@ extension SyncFailure {
         }
     }
 
-    /// Pulls the first single- or double-quoted identifier out of a server message — Postgres says
+    /// Pulls the first quoted identifier out of a server message — Postgres says
     /// `column "nutrition" does not exist`, PostgREST says `Could not find the 'nutrition' column of
-    /// 'recipes' in the schema cache`. Best-effort: nil when the message names nothing, which the
-    /// `column:` payload is typed to allow.
+    /// 'recipes' in the schema cache`. Scans for whichever quote character appears **first**, so a
+    /// later double quote can't beat an earlier single-quoted identifier. Best-effort: nil when the
+    /// message names nothing, which the `column:` payload is typed to allow.
     private static func quotedIdentifier(in message: String) -> String? {
-        for quote in ["\"", "'"] as [Character] {
-            guard let open = message.firstIndex(of: quote) else { continue }
-            let rest = message.index(after: open)
-            guard let close = message[rest...].firstIndex(of: quote), close > rest else { continue }
-            return String(message[rest..<close])
+        guard let open = message.firstIndex(where: { $0 == "\"" || $0 == "'" }) else { return nil }
+        let quote = message[open]
+        let rest = message.index(after: open)
+        guard let close = message[rest...].firstIndex(of: quote), close > rest else { return nil }
+        return String(message[rest..<close])
+    }
+
+    /// A short, displayable rendering — so a consumer that had `case .failed(let reason):
+    /// showBanner(reason)` against the old `String` payload still has something to show. The classified
+    /// cases don't carry the server's prose (only `.other` does), and this is what stands in for it;
+    /// the full text is in the engine's log line, and on `DeadLetter.lastError` for a parked write.
+    public var description: String {
+        switch self {
+        case .network: return "Network unavailable"
+        case .authExpired: return "Session expired"
+        case .permissionDenied: return "Permission denied by the server"
+        case .constraintViolation(let code): return "Server rejected the row (constraint \(code))"
+        case .schemaMismatch(let column):
+            return column.map { "Server has no column '\($0)'" } ?? "Server schema mismatch"
+        case .server(let status): return "Server error (HTTP \(status))"
+        case .other(let message): return message
         }
-        return nil
     }
 }
 
@@ -98,8 +121,14 @@ extension SyncFailure {
 
 /// `DeadLetter` is reconstructed from `_sync_outbox` long after the live `Error` is gone, so the
 /// classification is stored alongside `last_error` in the `failure_kind` column (`happysync_v5`).
-/// The payload-carrying cases encode as `kind:payload`; `.other` stores only its kind and rehydrates
-/// its text from `last_error`, so the message isn't written to the row twice.
+/// The payload-carrying cases encode as `kind:payload` and round-trip exactly.
+///
+/// `.other` is the exception: it stores only its kind and rehydrates its text from `last_error`, so
+/// the message isn't written to the row twice — which means the decoded value carries whatever
+/// `recordFailure` stored (`"\(error)"`, the error's full description) rather than the narrower text
+/// `classify` happened to capture. For a `PostgrestError` that's the whole rendering, not just
+/// `.message`. Nothing is lost — the stored text is a superset — but `decode(wire:message:)` is not
+/// an equality-preserving inverse of `classify` for this case, only for the others.
 extension SyncFailure {
     var wireValue: String {
         switch self {

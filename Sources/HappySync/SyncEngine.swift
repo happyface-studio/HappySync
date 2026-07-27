@@ -318,8 +318,10 @@ public actor SyncEngine {
         // `failedUploads`/`deadLetters` stay visible across a stop, and settling *through* them lands on
         // `.degraded` rather than reporting a stopped engine with parked writes as `.idle` (issue #51).
         let carried = statusBroadcaster.latest
-        statusBroadcaster.send(transitionalStatus(
-            SyncStatus.settledPhase(failedUploads: carried.failedUploads, deadLetters: carried.deadLetters)
+        statusBroadcaster.send(SyncStatus(
+            phase: SyncStatus.settledPhase(failedUploads: carried.failedUploads, deadLetters: carried.deadLetters),
+            lastSyncedAt: lastSyncedAt,
+            failedUploads: carried.failedUploads, deadLetters: carried.deadLetters
         ))
     }
 
@@ -470,9 +472,12 @@ public actor SyncEngine {
             // stop() flipped `stopping` mid-pass; the pass unwound at a transaction boundary. Every
             // unit is transactional, so what already committed is consistent and the next start()
             // resumes from the advanced cursor. Leave the last settled status (don't flip to .failed)
-            // and don't advance the sync baseline — this pass didn't complete (APPS-513).
+            // and don't advance the sync baseline — this pass didn't complete (APPS-513). Return the
+            // last broadcast status rather than a fresh `.idle`: this value isn't broadcast, but a
+            // zero-count `.idle` would be a `SyncStatus` claiming health while the outbox may hold
+            // failing writes, contradicting what `.idle` now means (issue #51).
             log.info("sync pass aborted for teardown")
-            return SyncStatus(phase: .idle, lastSyncedAt: lastSyncedAt)
+            return statusBroadcaster.latest
         } catch {
             log.error("sync pass failed: \(String(describing: error), privacy: .public)")
             statusBroadcaster.send(transitionalStatus(.failed(SyncFailure.classify(error))))
@@ -490,12 +495,25 @@ public actor SyncEngine {
             try await writeLastSyncedAt(now)
             resyncBaseline = now
         }
-        // Settle both counts from the live outbox, not the drain pass just run. The drain skips
-        // entries still inside their per-entry backoff window without counting them, so `outcome.failed`
-        // alternates 1 → 0 across passes for a single persistently-failing entry — reading healthy
-        // while the write is still failing. An entry with `attempts > 0` that isn't dead-lettered is,
-        // by definition, still failing and retrying, whether or not this pass happened to re-attempt
-        // it (APPS-507).
+        let status = try await settledStatus()
+        log.info("sync pass settled: failedUploads=\(status.failedUploads, privacy: .public) deadLetters=\(status.deadLetters, privacy: .public)")
+        statusBroadcaster.send(status)
+        return status
+    }
+
+    /// A settled status read from the **live outbox** — the single way any settle path derives health.
+    ///
+    /// Both counts come from the DB, not from the drain pass just run: the drain skips entries still
+    /// inside their per-entry backoff window without counting them, so `outcome.failed` alternates
+    /// 1 → 0 across passes for a single persistently-failing entry, reading healthy while the write is
+    /// still failing. An entry with `attempts > 0` that isn't dead-lettered is, by definition, still
+    /// failing and retrying, whether or not this pass happened to re-attempt it (APPS-507).
+    ///
+    /// The phase follows from those counts, so `.idle` can only be broadcast when the outbox is
+    /// genuinely clean. Every caller goes through here for exactly that reason: the repair paths used
+    /// to assert `failedUploads: 0` rather than read it, which could settle `.idle` — now load-bearing
+    /// as "healthy" — while an unrelated entry was still failing (issue #51 review, finding 1).
+    private func settledStatus() async throws -> SyncStatus {
         let (failedUploads, deadLetters) = try await db.read { db -> (Int, Int) in
             let failing = try Int.fetchOne(
                 db, sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE attempts > 0 AND dead_lettered = 0"
@@ -505,23 +523,11 @@ public actor SyncEngine {
             ) ?? 0
             return (failing, dead)
         }
-        // `.idle` only when both counts are clean; otherwise the pass settled *degraded* — it completed,
-        // but writes are still outstanding. Deriving the phase here is what makes `.idle` mean healthy
-        // for a consumer switching on it (issue #51).
-        let status = SyncStatus(
+        return SyncStatus(
             phase: SyncStatus.settledPhase(failedUploads: failedUploads, deadLetters: deadLetters),
             lastSyncedAt: lastSyncedAt,
             failedUploads: failedUploads, deadLetters: deadLetters
         )
-        log.info("sync pass settled: failedUploads=\(failedUploads, privacy: .public) deadLetters=\(deadLetters, privacy: .public)")
-        statusBroadcaster.send(status)
-        return status
-    }
-
-    private func deadLetterCount() async throws -> Int {
-        try await db.read { db in
-            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 1") ?? 0
-        }
     }
 
     // MARK: - Dead-letter repair (APPS-508)
@@ -650,16 +656,13 @@ public actor SyncEngine {
         poke() // re-pull so the discarded rows converge to the server's version
     }
 
-    /// Re-broadcasts status after a repair mutation so `deadLetters` reflects the new count at once,
-    /// rather than waiting for the next sync pass. `failedUploads` resets to 0 here; the drain the
-    /// caller pokes re-derives it on its next pass.
+    /// Re-broadcasts status after a repair mutation so the counts reflect the new outbox at once,
+    /// rather than waiting for the next sync pass. **Both** counts are re-read, not just `deadLetters`:
+    /// repairing the last parked entry while an unrelated entry is still failing must settle
+    /// `.degraded`, not `.idle` — asserting `failedUploads: 0` here would render a green checkmark over
+    /// a failing write until the next drain corrected it (issue #51 review, finding 1).
     private func broadcastStatusRefresh() async throws {
-        let deadLetters = try await deadLetterCount()
-        statusBroadcaster.send(SyncStatus(
-            phase: SyncStatus.settledPhase(failedUploads: 0, deadLetters: deadLetters),
-            lastSyncedAt: lastSyncedAt,
-            failedUploads: 0, deadLetters: deadLetters
-        ))
+        statusBroadcaster.send(try await settledStatus())
     }
 
     /// Writes one row and lets the table's capture trigger queue the upload — a thin compatibility

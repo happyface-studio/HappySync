@@ -76,6 +76,38 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
     #expect(SyncFailure.classify(Weird()) == .other("something odd")) // never lose the breadcrumb
 }
 
+@Test func pgrst204IsRetriedEvenThoughItClassifiesAsSchemaMismatch() async throws {
+    let db = try recipesDB()
+    // A deliberate divergence between the kind and the retry decision: PostgREST raises PGRST204 from
+    // a *stale schema cache* as well as from a genuinely missing column, and the stale case clears on
+    // its own — so the engine retries rather than parking on the first attempt, while the kind still
+    // tells the app what to show if it does eventually park.
+    let error = pg("PGRST204", "Could not find the 'nutrition' column of 'recipes' in the schema cache")
+    #expect(SyncFailure.classify(error) == .schemaMismatch(column: "nutrition"))
+    #expect(remoteErrorIsPermanent(error) == false) // …but not permanent — retried, not parked
+
+    let remote = FakeRemote(failUpserts: 1, upsertError: error)
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 8)
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
+
+    try await engine.drainOutbox()
+
+    #expect(try await engine.deadLetters().isEmpty) // still retrying, not parked
+}
+
+@Test func everyKindHasADisplayableDescription() {
+    // A consumer that had `case .failed(let reason): showBanner(reason)` against the old String payload
+    // still has something to render — the classified cases carry no server prose of their own.
+    let rendered: [String] = [
+        SyncFailure.network, .authExpired, .permissionDenied,
+        .constraintViolation(code: "23505"), .schemaMismatch(column: "nutrition"),
+        .schemaMismatch(column: nil), .server(status: 500),
+    ].map(\.description)
+    #expect(rendered.allSatisfy { !$0.isEmpty })
+    #expect(Set(rendered).count == rendered.count)      // each kind reads distinctly
+    #expect(SyncFailure.other("raw text").description == "raw text") // `.other` shows the real thing
+}
+
 // MARK: - Persistence round-trip (pure)
 
 @Test func everyFailureKindRoundTripsThroughItsWireValue() {
@@ -161,6 +193,21 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
     #expect(letter.failure == .other("legacy failure"))
 }
 
+@Test func payloadKindsSurviveTheEngineRoundTripNotJustTheWireFormat() async throws {
+    let db = try recipesDB()
+    // `.server(status:)` end to end — classified from a live HTTPError, written to `failure_kind`,
+    // read back through `deadLetters()`. The pure wire test can't catch a break in that path.
+    let remote = FakeRemote(failUpserts: 1, upsertError: httpError(404))
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
+
+    try await engine.drainOutbox() // 404 is permanent → parks at once
+
+    #expect(try await engine.deadLetters().first?.failure == .server(status: 404))
+    let stored = try await db.read { try String.fetchOne($0, sql: "SELECT failure_kind FROM _sync_outbox WHERE pk='r1'") }
+    #expect(stored == "server:404")
+}
+
 @Test func retryClearsTheStoredFailureKind() async throws {
     let db = try recipesDB()
     let remote = FakeRemote(failUpserts: 1, upsertError: pg("42501", "rls"))
@@ -232,4 +279,28 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
     let settled = await repaired.next()
     #expect(settled?.phase == .idle)
     #expect(settled?.isHealthy == true)
+}
+
+@Test func repairingTheLastDeadLetterStaysDegradedWhileAnotherWriteIsFailing() async throws {
+    let db = try recipesDB()
+    // The repair broadcast used to assert `failedUploads: 0` instead of reading it, so clearing the
+    // last parked entry settled `.idle` — a green checkmark over a write that was still failing —
+    // until the next drain corrected it. That is precisely the misread this PR exists to remove.
+    let remote = FakeRemote(failUpserts: 99) // every upload fails transiently
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 8)
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r2', 'Stew')")
+
+    try await engine.drainOutbox() // both fail transiently: attempts > 0, neither parked
+    // Park only r1, leaving r2 failing-but-retrying — the two states the repair path has to tell apart.
+    try await write(db, "UPDATE _sync_outbox SET dead_lettered = 1 WHERE pk = 'r1'")
+
+    try await engine.discardDeadLetters() // clears the last dead letter; r2 is untouched
+
+    var iter = engine.status.makeAsyncIterator()
+    let settled = await iter.next()
+    #expect(settled?.deadLetters == 0)     // the repair landed…
+    #expect(settled?.failedUploads == 1)   // …but r2 is still failing, and must be re-read, not assumed
+    #expect(settled?.phase == .degraded)
+    #expect(settled?.isHealthy == false)
 }

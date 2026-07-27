@@ -52,6 +52,14 @@ It answers *what to show the user* — the retry decision is already made by the
 `.network` means the request got no answer at all; a server that answered with a 5xx is
 `.server(status:)`, so the status code isn't thrown away.
 
+The kind and the retry decision agree everywhere except `PGRST204`: it classifies as
+`.schemaMismatch` but is **retried** rather than parked immediately, because PostgREST also raises it
+from a stale schema cache, which clears on its own.
+
+Every case renders via `CustomStringConvertible`, so `"\(failure)"` is safe to put in a banner. The
+classified cases carry no server prose of their own — the full text lives in the engine's log, and on
+`DeadLetter.lastError` for a parked write.
+
 ## Repairing dead letters
 
 ```swift
