@@ -83,6 +83,32 @@ import Supabase
     #expect(entries == 32)
 }
 
+@Test func stopAwaitsEnqueueTransactionsStillInFlight() async throws {
+    // `stop()`'s contract is that no engine DB write lands after it returns, so a caller can wipe the
+    // store. `enqueue` now suspends inside `await db.write`, so `stop()` has to wait the in-flight
+    // transactions out rather than just the sync pass (issue #46). Racing a burst of enqueues against
+    // `stop()` exercises the waiter/resume path: if the continuation is never resumed, `stop()` never
+    // returns and this test hangs rather than quietly passing.
+    let db = try recipesDB()
+    let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")])
+
+    let writes = Task {
+        await withTaskGroup(of: Void.self) { group in
+            for i in 0..<16 {
+                group.addTask {
+                    try? await engine.enqueue(.upsert, table: "recipes", row: ["id": "r\(i)", "title": "row \(i)"])
+                }
+            }
+        }
+    }
+    await engine.stop()   // hangs here if a parked waiter is never resumed
+    await writes.value
+
+    // Teardown must not lose or corrupt a write that was already under way.
+    let entries = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM _sync_outbox") ?? 0 }
+    #expect(entries == 16)
+}
+
 @Test func enqueueUnknownTableThrows() async throws {
     let engine = try makeEngine(db: try recipesDB(), tables: [SyncTable(name: "recipes")])
     await #expect(throws: SyncError.self) {

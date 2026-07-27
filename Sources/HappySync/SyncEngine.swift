@@ -131,6 +131,15 @@ public actor SyncEngine {
     /// which must `await stop()` before wiping the DB (APPS-513). Cleared by `start()`.
     private var stopping = false
 
+    /// Enqueues whose transaction is in flight — i.e. suspended inside `await db.write`. `stop()`
+    /// waits for this to reach zero before returning, so its contract ("no further engine DB writes
+    /// after `await stop()`") still holds now that `enqueue` suspends mid-method (issue #46). Before
+    /// `enqueue` was async its body ran in one uninterrupted actor turn and so could never straddle
+    /// `stop()`; awaiting the count here restores exactly that invariant rather than narrowing it.
+    private var enqueuesInFlight = 0
+    /// Parked `stop()` callers, resumed when `enqueuesInFlight` falls to zero.
+    private var enqueueQuiescedWaiters: [CheckedContinuation<Void, Never>] = []
+
     /// Thrown at a cooperative checkpoint when `stop()` has begun teardown, so an in-flight pass
     /// unwinds at the next transaction boundary rather than completing. Caught in `runSyncOnce`, which
     /// settles without flipping to `.failed` — every unit already committed is consistent (APPS-513).
@@ -253,7 +262,9 @@ public actor SyncEngine {
     /// network calls — so a consumer can safely wipe or repurpose the database (e.g. on sign-out /
     /// account switch). Idempotent. See APPS-473 and the README teardown section.
     public func stop() async {
-        guard isRunning else { return }
+        // Ahead of the `isRunning` guard: an engine that was never started still owes the caller
+        // quiescence before they wipe the store, and `enqueue` works without `start()` (issue #46).
+        guard isRunning else { return await awaitEnqueueQuiescence() }
         isRunning = false
         stopping = true                       // let the in-flight pass bail at its next checkpoint (APPS-513)
         wake?.finish(); wake = nil            // no more passes enqueued; runner exits after the current one
@@ -264,8 +275,26 @@ public actor SyncEngine {
         await triggersTask?.value             // and the periodic loop to unwind
         await doorbellTask?.value             // and the doorbell consumer (channel teardown) to unwind
         runnerTask = nil; triggersTask = nil; doorbellTask = nil
+        await awaitEnqueueQuiescence()        // and any enqueue suspended inside its transaction (issue #46)
         doorbellState = .idle                 // a later start() re-subscribes from scratch
         statusBroadcaster.finish()
+    }
+
+    /// Suspends until no `enqueue` transaction is in flight. Keeps `stop()`'s "no further DB writes"
+    /// contract intact now that `enqueue` awaits its writer: without this, an enqueue that suspended
+    /// before `stop()` began could commit *after* `stop()` returned — into a store the caller is by
+    /// then entitled to wipe. Returns immediately in the common case (nothing in flight).
+    private func awaitEnqueueQuiescence() async {
+        guard enqueuesInFlight > 0 else { return }
+        await withCheckedContinuation { enqueueQuiescedWaiters.append($0) }
+    }
+
+    /// Marks an enqueue transaction finished, releasing `stop()` once the last one lands.
+    private func finishEnqueue() {
+        enqueuesInFlight -= 1
+        guard enqueuesInFlight == 0 else { return }
+        for waiter in enqueueQuiescedWaiters { waiter.resume() }
+        enqueueQuiescedWaiters.removeAll()
     }
 
     /// The single serialised runner: one sync at a time, so pushes and pulls never overlap. Pokes
@@ -597,6 +626,9 @@ public actor SyncEngine {
         // cooperative-pool thread (and the engine actor) for the whole transaction — including the
         // recursive cascade walk on a `.delete` — which risks starving the pool on a write burst
         // (issue #46). Callers already `try await` this actor-isolated method, so nothing changes for them.
+        // The in-flight count is what keeps `stop()`'s quiescence contract honest across the suspension.
+        enqueuesInFlight += 1
+        defer { finishEnqueue() }
         try await db.write { db in
             switch op {
             case .upsert:
