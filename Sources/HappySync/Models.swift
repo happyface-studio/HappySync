@@ -161,10 +161,22 @@ public struct DeadLetter: Sendable {
 public enum SyncError: Error, Sendable {
     /// Functionality scheduled for a later milestone is not wired up yet.
     case notImplemented(String)
-    /// `enqueue` was called for a table not declared in the engine's `tables`.
+    /// The deprecated `enqueue` shim was called for a table not declared in the engine's `tables`.
     case unknownTable(String)
     /// The encoded row had no value for the table's primary-key column.
     case missingPrimaryKey(table: String, column: String)
     /// The row could not be encoded to SQLite column values.
     case encoding(String)
+    /// A declared `SyncTable` has no table of that name in the local database, so its write-capture
+    /// triggers can't be installed. Create the table (run the app's migrations) before constructing
+    /// the engine — the manifest and the schema must agree, or the table would silently sync nothing
+    /// (issue #48).
+    case missingLocalTable(String)
+    /// A declared `SyncTable`'s `primaryKey` column doesn't exist on the local table — usually a typo
+    /// in the manifest, or a table whose key column isn't `id`.
+    case missingPrimaryKeyColumn(table: String, column: String)
+    /// `PRAGMA recursive_triggers` could not be enabled on the writer connection. Without it a
+    /// REPLACE-displaced row (and, on older SQLite, a `ON DELETE CASCADE` child) is deleted locally
+    /// without a tombstone ever reaching the server (issue #48).
+    case recursiveTriggersUnavailable
 }

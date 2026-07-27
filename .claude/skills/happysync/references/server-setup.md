@@ -69,9 +69,10 @@ create trigger tombstone_recipe_children
   for each row execute function public.tombstone_recipe_children();
 ```
 
-The engine **also** cascades child deletes locally (deepest-first, in one transaction) for children
-enforced by local foreign keys, so the local and server deleted sets stay symmetric with no orphan
-window and no round-trip. The server trigger is what makes *other* devices converge.
+Locally, declare the child foreign keys `ON DELETE CASCADE` in your **SQLite** schema: deleting a
+parent then removes its children in the same transaction and each child's capture trigger queues its
+tombstone, so the local and server deleted sets stay symmetric with no orphan window and no
+round-trip. The server trigger above is what makes *other* devices converge.
 
 ### Purge old tombstones — and the `maxOfflineGap` invariant
 

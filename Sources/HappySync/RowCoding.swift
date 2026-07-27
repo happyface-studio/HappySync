@@ -45,7 +45,7 @@ enum RowCoding {
         default:
             // Dates are already ISO-8601 strings by here (the encoder's date strategy, APPS-475);
             // UUID/enum arrive as String too. Anything else (e.g. a `Data`/blob field) is
-            // unsupported — see `enqueue`'s supported-types note.
+            // unsupported — see the `enqueue` shim's supported-types note.
             throw SyncError.encoding("unsupported value \(type(of: value))")
         }
     }
@@ -106,16 +106,6 @@ enum RowCoding {
                 return String(decoding: data, as: UTF8.self).databaseValue
             }
             return .null
-        }
-    }
-
-    /// Renders a primary-key `DatabaseValue` as the text stored in the outbox `pk` column.
-    static func pkString(_ value: DatabaseValue) -> String {
-        switch value.storage {
-        case .string(let s): return s
-        case .int64(let i): return String(i)
-        case .double(let d): return String(d)
-        case .blob, .null: return ""
         }
     }
 

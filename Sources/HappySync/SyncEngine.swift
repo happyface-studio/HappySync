@@ -73,7 +73,13 @@ private struct PendingDelete: Sendable {
 ///
 /// It does **not** own reads — the app keeps observing GRDB with `ValueObservation` — or schema.
 ///
-/// > Status: upload (`enqueue` + `drainOutbox`, APPS-413), download (`pullNow` — tuple cursor,
+/// **Writes need no engine call.** Every synced table carries SQLite triggers that record each
+/// insert/update/delete into the outbox, in the same transaction as the write itself, so
+/// `try await db.write { try recipe.save($0) }` uploads exactly like a call through the deprecated
+/// `enqueue` shim did — and so does a partial update, a `count = count + 1`, raw SQL, or a
+/// twelve-row multi-table transaction (issue #48).
+///
+/// > Status: upload (trigger capture + `drainOutbox`, APPS-413), download (`pullNow` — tuple cursor,
 /// > LWW, tombstones, pagination, APPS-414), and the scheduler that drives them (`start` — debounced
 /// > Realtime doorbell, periodic fallback, status, backoff, APPS-415) are all live. M1 is complete.
 public actor SyncEngine {
@@ -137,6 +143,11 @@ public actor SyncEngine {
     /// drain to completion on a slow network — bounding teardown latency for sign-out/account-switch,
     /// which must `await stop()` before wiping the DB (APPS-513). Cleared by `start()`.
     private var stopping = false
+    /// Watches `_sync_outbox` for trigger-queued writes so a plain GRDB write still wakes the runner
+    /// promptly, the way `enqueue`'s own poke used to (issue #48). Held strongly here and registered
+    /// with `.observerLifetime`, so it goes away with the engine rather than outliving it on the
+    /// database.
+    private nonisolated let outboxObserver: OutboxObserver
 
     /// Thrown at a cooperative checkpoint when `stop()` has begun teardown, so an in-flight pass
     /// unwinds at the next transaction boundary rather than completing. Caught in `runSyncOnce`, which
@@ -218,8 +229,33 @@ public actor SyncEngine {
         self.deadLetterAfter = deadLetterAfter
         self.maxOfflineGap = maxOfflineGap
         self.statusBroadcaster = StatusBroadcaster(initial: SyncStatus())
+        self.outboxObserver = OutboxObserver()
 
         try SyncSchema.migrator().migrate(db)
+
+        // Wake the runner when a trigger queues a write, so a direct GRDB write uploads as promptly as
+        // `enqueue`'s own poke used to (issue #48). `weak self`: GRDB holds the observer only as long
+        // as the engine does, and a poke into a deallocated engine has nothing left to sync.
+        outboxObserver.onNewEntries = { [weak self] in
+            Task { await self?.armDebouncedPoke() }
+        }
+
+        // `PRAGMA recursive_triggers` is connection state and the observer attaches to a connection,
+        // so both go on the writer — the only connection triggers ever fire on — outside a transaction.
+        try db.writeWithoutTransaction { [outboxObserver] db in
+            try SyncTriggers.enableRecursiveTriggers(db)
+            db.add(transactionObserver: outboxObserver, extent: .observerLifetime)
+        }
+
+        // Install the write-capture triggers for the declared manifest. This runs at every init rather
+        // than in a numbered migration: the manifest is source code, so adding or removing a
+        // `SyncTable` ships without a schema version bump. `install` is idempotent — a steady-state
+        // launch reads `sqlite_master` and issues no DDL.
+        try db.write { db in
+            // Insurance only: `applying` is transactional, so a crash mid-apply already rolled it back.
+            try SyncTriggers.setApplying(db, 0)
+            try SyncTriggers.install(db, tables: tables)
+        }
     }
 
     /// Begins background sync. Idempotent. Runs an immediate convergence sync, then keeps the local
@@ -355,9 +391,9 @@ public actor SyncEngine {
     }
 
     /// (Re)arms a single trailing debounce that pokes the runner after `debounceInterval`. Shared by
-    /// the doorbell (remote changes) and `enqueue` (local writes), so a burst from either source —
-    /// or a mix of both — coalesces into one drain pass instead of one per event. Cancelled on
-    /// `stop()`.
+    /// the doorbell (remote changes) and `outboxObserver` (local writes the capture triggers queued),
+    /// so a burst from either source — or a mix of both — coalesces into one drain pass instead of one
+    /// per event. Cancelled on `stop()`.
     private func armDebouncedPoke() {
         debounceTask?.cancel()
         debounceTask = Task { [debounceInterval, weak self] in
@@ -571,17 +607,21 @@ public actor SyncEngine {
             // *non-parked* sibling (`dead_lettered = 0`): a lingering parked sibling has stopped
             // retrying, so resetting its row to the server's version is the correct convergence, not
             // a clobbered pending write (APPS-508 follow-up).
-            for reset in rowResets {
-                try db.execute(
-                    sql: """
-                        DELETE FROM "\(reset.table)" WHERE "\(reset.primaryKey)" = ?
-                        AND NOT EXISTS (
-                            SELECT 1 FROM \(SyncSchema.outboxTable)
-                            WHERE table_name = ? AND pk = ? AND dead_lettered = 0
-                        )
-                        """,
-                    arguments: [reset.pk, reset.table, reset.pk]
-                )
+            // Suppressed: dropping the row is "accept the server's version", so it must not queue a
+            // delete that would propagate the abandoned write after all (issue #48).
+            try SyncTriggers.applyingRemoteState(db) {
+                for reset in rowResets {
+                    try db.execute(
+                        sql: """
+                            DELETE FROM "\(reset.table)" WHERE "\(reset.primaryKey)" = ?
+                            AND NOT EXISTS (
+                                SELECT 1 FROM \(SyncSchema.outboxTable)
+                                WHERE table_name = ? AND pk = ? AND dead_lettered = 0
+                            )
+                            """,
+                        arguments: [reset.pk, reset.table, reset.pk]
+                    )
+                }
             }
             // Clear the affected tables' cursors so the next pull re-fetches them from scratch,
             // reinstating server rows the advanced cursor would otherwise skip (APPS-505).
@@ -605,17 +645,30 @@ public actor SyncEngine {
         ))
     }
 
-    /// Records a write in the outbox in the same transaction as the domain write, so the local
-    /// store and the pending-upload queue can never disagree. An `.upsert` writes the row to its
-    /// table; a `.delete` removes it locally (the tombstone is propagated to the server on drain).
+    /// Writes one row and lets the table's capture trigger queue the upload — a thin compatibility
+    /// shim over what is now a plain database write (issue #48).
     ///
-    /// On success it wakes the runner through the shared debounce, so the write uploads promptly
-    /// rather than waiting for the next periodic poll (APPS-503). A burst of writes coalesces into
-    /// one drain pass, and the wake is a no-op before `start()` (the runner isn't listening yet).
+    /// Prefer writing GRDB directly; the triggers pick it up either way, and a direct write can do
+    /// what this signature can't — partial updates, `UPDATE … SET count = count + 1`, batch
+    /// statements, raw SQL, and (most usefully) several rows across several tables in **one**
+    /// transaction, so "create a recipe + 12 ingredients" is one atomic user intent rather than
+    /// thirteen separate transactions:
+    ///
+    /// ```swift
+    /// try await db.write { db in
+    ///     try recipe.save(db)
+    ///     for ingredient in ingredients { try ingredient.save(db) }
+    /// }
+    /// ```
     ///
     /// Supported row value types: `String`, numbers, `Bool`, `Date` (encoded as canonical ISO-8601,
     /// APPS-475), `null`, and — for columns declared in `jsonColumns` — nested objects/arrays.
     /// `Data`/blob fields are **not** supported and throw `SyncError.encoding`.
+    @available(*, deprecated, message: """
+        Write to the database directly — SQLite triggers now capture every write into the outbox. \
+        `enqueue(.upsert, table: t, row: r)` becomes `try await db.write { try r.save($0) }`; \
+        `enqueue(.delete, …)` becomes a plain DELETE (declare ON DELETE CASCADE for children).
+        """)
     public func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws {
         guard let spec = tables.first(where: { $0.name == table }) else {
             throw SyncError.unknownTable(table)
@@ -624,32 +677,19 @@ public actor SyncEngine {
         guard let pkValue = columns[spec.primaryKey], !pkValue.isNull else {
             throw SyncError.missingPrimaryKey(table: table, column: spec.primaryKey)
         }
-        let pk = RowCoding.pkString(pkValue)
-        let queuedAt = Date()
-
+        // No outbox insert and no poke here any more: the table's trigger records the op in this same
+        // transaction, and `outboxObserver` wakes the runner when it commits.
         try db.write { db in
             switch op {
             case .upsert:
                 try RowCoding.upsertLocalRow(db, table: table, primaryKey: spec.primaryKey, columns: columns)
             case .delete:
-                // Local cascade (APPS-510): before removing the parent row, delete its child rows —
-                // deepest-first so enforced FKs never RESTRICT the delete — and enqueue a tombstone for
-                // each, so the server soft-deletes them too. This mirrors the server's child-tombstone
-                // trigger (contract §1/§2): local and server converge on the same deleted set with no
-                // orphan window and no round-trip. Children are found from the schema's declared FKs, so
-                // only rows that actually reference a deleted parent are touched.
-                // Seed the visited set with the parent's own key so a self-referential FK that points
-                // back at it can't re-enter and recurse forever (APPS-510 cycle guard).
-                var visited: Set<String> = ["\(table)\u{0}\(pk)"]
-                try Self.cascadeDeleteChildren(db, of: spec, parentKeys: [pkValue], tables: tables, queuedAt: queuedAt, visited: &visited)
                 try db.execute(
                     sql: "DELETE FROM \"\(table)\" WHERE \"\(spec.primaryKey)\" = ?",
                     arguments: [pkValue]
                 )
             }
-            try Self.insertOutboxEntry(db, table: table, pk: pk, op: op, queuedAt: queuedAt)
         }
-        armDebouncedPoke() // wake the runner so the write uploads promptly (APPS-503)
     }
 
     /// Pulls rows changed since each table's `(updated_at, id)` cursor and applies them
@@ -708,33 +748,37 @@ public actor SyncEngine {
 
                 let pageCursor = cursor // immutable copy for the Sendable write closure
                 let (advanced, deletes) = try await db.write { db -> (SyncCursor?, [PendingDelete]) in
-                    var advanced = pageCursor
-                    var deferred: [PendingDelete] = []
-                    for row in page {
-                        let pk = row[spec.primaryKey]?.stringValue ?? ""
-                        let updatedAt = row[spec.cursorColumn]?.stringValue ?? ""
-                        let tombstoned = !(row["deletedAt"]?.isNil ?? true)
-                        if try Self.lwwAllows(
-                            db, table: spec.name, cursorColumn: spec.cursorColumn,
-                            primaryKey: spec.primaryKey, pk: pk, remoteUpdatedAt: updatedAt
-                        ) {
-                            if tombstoned {
-                                deferred.append(PendingDelete(
-                                    table: spec.name, primaryKey: spec.primaryKey,
-                                    cursorColumn: spec.cursorColumn, pk: pk, updatedAt: updatedAt
-                                ))
-                            } else {
-                                try RowCoding.upsertLocalRow(
-                                    db, table: spec.name, primaryKey: spec.primaryKey,
-                                    columns: RowCoding.localColumns(from: row),
-                                    restrictingTo: knownColumns
-                                )
+                    // Downloaded rows must not re-enqueue themselves: the capture triggers stay inert
+                    // for the whole page apply (issue #48).
+                    try SyncTriggers.applyingRemoteState(db) { () throws -> (SyncCursor?, [PendingDelete]) in
+                        var advanced = pageCursor
+                        var deferred: [PendingDelete] = []
+                        for row in page {
+                            let pk = row[spec.primaryKey]?.stringValue ?? ""
+                            let updatedAt = row[spec.cursorColumn]?.stringValue ?? ""
+                            let tombstoned = !(row["deletedAt"]?.isNil ?? true)
+                            if try Self.lwwAllows(
+                                db, table: spec.name, cursorColumn: spec.cursorColumn,
+                                primaryKey: spec.primaryKey, pk: pk, remoteUpdatedAt: updatedAt
+                            ) {
+                                if tombstoned {
+                                    deferred.append(PendingDelete(
+                                        table: spec.name, primaryKey: spec.primaryKey,
+                                        cursorColumn: spec.cursorColumn, pk: pk, updatedAt: updatedAt
+                                    ))
+                                } else {
+                                    try RowCoding.upsertLocalRow(
+                                        db, table: spec.name, primaryKey: spec.primaryKey,
+                                        columns: RowCoding.localColumns(from: row),
+                                        restrictingTo: knownColumns
+                                    )
+                                }
                             }
+                            advanced = SyncCursor(updatedAt: updatedAt, id: pk) // cursor advances whether or not we applied
                         }
-                        advanced = SyncCursor(updatedAt: updatedAt, id: pk) // cursor advances whether or not we applied
+                        if let advanced { try Self.writeCursor(db, table: spec.name, cursor: advanced) }
+                        return (advanced, deferred)
                     }
-                    if let advanced { try Self.writeCursor(db, table: spec.name, cursor: advanced) }
-                    return (advanced, deferred)
                 }
                 if let advanced { cursor = advanced }
                 pendingDeletes.append(contentsOf: deletes)
@@ -757,15 +801,20 @@ public actor SyncEngine {
         let rank = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
         for del in pendingDeletes.sorted(by: { (rank[$0.table] ?? 0) > (rank[$1.table] ?? 0) }) {
             try await db.write { db in
-                // Re-check the gate: a local edit may have arrived between phases.
-                guard try Self.lwwAllows(
-                    db, table: del.table, cursorColumn: del.cursorColumn,
-                    primaryKey: del.primaryKey, pk: del.pk, remoteUpdatedAt: del.updatedAt
-                ) else { return }
-                try db.execute(
-                    sql: "DELETE FROM \"\(del.table)\" WHERE \"\(del.primaryKey)\" = ?",
-                    arguments: [del.pk]
-                )
+                // A tombstone the server already holds — applying it must not queue a delete straight
+                // back at the server (issue #48). Any local `ON DELETE CASCADE` children it removes are
+                // suppressed with it, and the server's own child tombstones arrive on their own tables.
+                try SyncTriggers.applyingRemoteState(db) {
+                    // Re-check the gate: a local edit may have arrived between phases.
+                    guard try Self.lwwAllows(
+                        db, table: del.table, cursorColumn: del.cursorColumn,
+                        primaryKey: del.primaryKey, pk: del.pk, remoteUpdatedAt: del.updatedAt
+                    ) else { return }
+                    try db.execute(
+                        sql: "DELETE FROM \"\(del.table)\" WHERE \"\(del.primaryKey)\" = ?",
+                        arguments: [del.pk]
+                    )
+                }
             }
         }
     }
@@ -824,13 +873,17 @@ public actor SyncEngine {
             let toDelete = localPks.subtracting(seenPks).subtracting(dirtyPks)
             guard !toDelete.isEmpty else { continue }
             try await db.write { db in
-                // ponytail: single IN-list. Personal-scale divergence is small; chunk only if a table
-                // ever diverges by more than SQLite's ~32k variable limit.
-                let placeholders = toDelete.map { _ in "?" }.joined(separator: ", ")
-                try db.execute(
-                    sql: "DELETE FROM \"\(spec.name)\" WHERE \"\(spec.primaryKey)\" IN (\(placeholders))",
-                    arguments: StatementArguments(Array(toDelete))
-                )
+                // These rows are already gone server-side (purged tombstones) — dropping them locally
+                // is convergence, not a user delete, so the capture triggers stay inert (issue #48).
+                try SyncTriggers.applyingRemoteState(db) {
+                    // ponytail: single IN-list. Personal-scale divergence is small; chunk only if a table
+                    // ever diverges by more than SQLite's ~32k variable limit.
+                    let placeholders = toDelete.map { _ in "?" }.joined(separator: ", ")
+                    try db.execute(
+                        sql: "DELETE FROM \"\(spec.name)\" WHERE \"\(spec.primaryKey)\" IN (\(placeholders))",
+                        arguments: StatementArguments(Array(toDelete))
+                    )
+                }
             }
         }
     }
@@ -1064,12 +1117,16 @@ public actor SyncEngine {
     /// either way.
     private func stampAndClear(_ entry: OutboxEntry, spec: SyncTable, server: [String: AnyJSON], seqs: [Int64]) async throws {
         try await db.write { db in
-            if try Self.writeBackAllowed(db, table: spec.name, pk: entry.pk, excluding: seqs) {
-                try RowCoding.upsertLocalRow(
-                    db, table: spec.name, primaryKey: spec.primaryKey,
-                    columns: RowCoding.localColumns(from: server),
-                    restrictingTo: try RowCoding.tableColumns(db, table: spec.name)
-                )
+            // The server's own representation of the row we just uploaded — suppressed, or writing it
+            // back would queue the very upload it confirms and the drain would never settle (issue #48).
+            try SyncTriggers.applyingRemoteState(db) {
+                if try Self.writeBackAllowed(db, table: spec.name, pk: entry.pk, excluding: seqs) {
+                    try RowCoding.upsertLocalRow(
+                        db, table: spec.name, primaryKey: spec.primaryKey,
+                        columns: RowCoding.localColumns(from: server),
+                        restrictingTo: try RowCoding.tableColumns(db, table: spec.name)
+                    )
+                }
             }
             try Self.deleteEntries(db, seqs: seqs)
         }
@@ -1103,89 +1160,4 @@ public actor SyncEngine {
         )
     }
 
-    /// Appends one pending op to the outbox. Shared by `enqueue` (the caller's op) and the local
-    /// cascade (child tombstones), so every queued upload records identically (APPS-510).
-    private static func insertOutboxEntry(_ db: Database, table: String, pk: String, op: SyncOp, queuedAt: Date) throws {
-        try db.execute(
-            sql: """
-                INSERT INTO \(SyncSchema.outboxTable) (table_name, pk, op, queued_at, attempts)
-                VALUES (?, ?, ?, ?, 0)
-                """,
-            arguments: [table, pk, op.rawValue, queuedAt]
-        )
-    }
-
-    /// Local cascade delete (APPS-510). Deletes every synced child row that foreign-keys onto one of
-    /// `parentKeys` in `parent`, recursing grandchildren-first so enforced FK constraints never
-    /// RESTRICT the delete, and enqueues a `.delete` tombstone for each removed child so the drain
-    /// soft-deletes it server-side too. Mirrors the server child-tombstone trigger (contract §1/§2):
-    /// local and server converge on the same deleted set with no orphan window and no round-trip.
-    ///
-    /// Child FK columns are read from the schema's declared foreign keys (`PRAGMA foreign_key_list`),
-    /// so no extra descriptor is needed and only rows that actually reference a deleted parent go — a
-    /// table that only *logically* `dependsOn` a parent (no SQLite FK constraint) is left alone here;
-    /// its orphans still reconcile on the next pull via the server tombstone. A child reachable by two
-    /// paths (e.g. `recipeStepIngredients` under both `recipeSteps` and `recipeIngredients`) is deleted
-    /// by whichever path reaches it first — the other path's `SELECT` no longer finds the removed row,
-    /// so no duplicate tombstone is queued. FKs are assumed to reference the parent's primary key (the
-    /// §4 convention), which is what `parentKeys` carries.
-    ///
-    /// `visited` carries every `(table, pk)` already scheduled for deletion this cascade, keyed as
-    /// `"table\0pk"`. A row is followed at most once, so a self-referential table holding a data cycle
-    /// (r1 → r2 → r1) terminates instead of recursing until the stack overflows.
-    private static func cascadeDeleteChildren(
-        _ db: Database, of parent: SyncTable, parentKeys: [DatabaseValue], tables: [SyncTable],
-        queuedAt: Date, visited: inout Set<String>
-    ) throws {
-        guard !parentKeys.isEmpty else { return }
-        let parentPlaceholders = parentKeys.map { _ in "?" }.joined(separator: ", ")
-        for child in tables where child.dependsOn.contains(parent.name) {
-            for fkColumn in try foreignKeyColumns(db, of: child.name, referencing: parent.name) {
-                let found = try DatabaseValue.fetchAll(
-                    db,
-                    sql: "SELECT \"\(child.primaryKey)\" FROM \"\(child.name)\" WHERE \"\(fkColumn)\" IN (\(parentPlaceholders))",
-                    arguments: StatementArguments(parentKeys)
-                )
-                // Drop any row already scheduled this cascade (reached via another path or a data
-                // cycle): `insert(_:).inserted` marks it visited and keeps only the first sighting,
-                // so a cyclic FK graph can't recurse unbounded and a second path queues no duplicate.
-                let childKeys = found.filter { visited.insert("\(child.name)\u{0}\(RowCoding.pkString($0))").inserted }
-                guard !childKeys.isEmpty else { continue }
-                // Grandchildren first: recurse before removing this level, so the deepest rows go
-                // before the rows they reference.
-                try cascadeDeleteChildren(db, of: child, parentKeys: childKeys, tables: tables, queuedAt: queuedAt, visited: &visited)
-                let childPlaceholders = childKeys.map { _ in "?" }.joined(separator: ", ")
-                try db.execute(
-                    sql: "DELETE FROM \"\(child.name)\" WHERE \"\(child.primaryKey)\" IN (\(childPlaceholders))",
-                    arguments: StatementArguments(childKeys)
-                )
-                for key in childKeys {
-                    try insertOutboxEntry(db, table: child.name, pk: RowCoding.pkString(key), op: .delete, queuedAt: queuedAt)
-                }
-            }
-        }
-    }
-
-    /// The single-column foreign keys of `child` that reference `parent`, read from the live schema
-    /// via `PRAGMA foreign_key_list` and grouped by FK id. Empty when no such constraint exists (FKs
-    /// off, or a logical-only dependency) — the cascade then skips that child (APPS-510).
-    ///
-    /// A *composite* FK — several columns sharing one FK id — is deliberately excluded, not expanded:
-    /// the §4 contract keys parents by a single primary key, so a well-formed child FK onto a synced
-    /// parent is single-column. Treating a composite FK as independent single-column FKs would match
-    /// (and delete) any row where *any one* column matched a parent key — an over-broad cascade. Until
-    /// composite PKs are in contract, such an FK is skipped here; its orphans still reconcile on the
-    /// next pull via the server tombstone.
-    private static func foreignKeyColumns(_ db: Database, of child: String, referencing parent: String) throws -> [String] {
-        var columnsByFK: [Int: [String]] = [:]
-        var order: [Int] = []
-        for row in try Row.fetchAll(db, sql: "PRAGMA foreign_key_list(\"\(child)\")")
-        where (row["table"] as String?) == parent {
-            guard let id = row["id"] as Int?, let from = row["from"] as String? else { continue }
-            if columnsByFK[id] == nil { order.append(id) }
-            columnsByFK[id, default: []].append(from)
-        }
-        // Keep only single-column FKs (the in-contract shape); a composite FK id is dropped.
-        return order.compactMap { columnsByFK[$0]!.count == 1 ? columnsByFK[$0]![0] : nil }
-    }
 }

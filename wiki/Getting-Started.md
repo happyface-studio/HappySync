@@ -22,7 +22,12 @@ Or in Xcode: **File → Add Package Dependencies →** `https://github.com/happy
 ## 2. Declare your tables
 
 Each synced table is a `SyncTable`, declared once, in FK-dependency order (parents before children).
-Only `name` is required.
+Only `name` is required. Every declared table must **already exist** in your local schema when the
+engine is constructed — it installs write-capture triggers on each one, and throws
+`SyncError.missingLocalTable` if the manifest and the schema disagree. Run your migrations first.
+
+Declare `ON DELETE CASCADE` on child foreign keys if you want a parent delete to remove (and
+tombstone) its children — see [Delete](#delete-with-cascade) below.
 
 ```swift
 import HappySync
@@ -56,37 +61,70 @@ and retry backoff — all funnelled through one serialized runner.
 
 ### Sharing a migrator
 
-The engine's internal tables (`_sync_outbox`, `_sync_state`, `_sync_meta`) migrate at init. If your
-app owns the GRDB `DatabaseMigrator`, register HappySync's migrations into it so both share one
-`grdb_migrations` table:
+The engine's internal tables (`_sync_outbox`, `_sync_state`, `_sync_meta`, `_sync_control`) migrate
+at init. If your app owns the GRDB `DatabaseMigrator`, register HappySync's migrations into it so
+both share one `grdb_migrations` table:
 
 ```swift
 var migrator = DatabaseMigrator()
-SyncSchema.register(into: &migrator)   // happysync_v1..v3
+SyncSchema.register(into: &migrator)   // happysync_v1..v4
 // … your app migrations …
 try migrator.migrate(databaseQueue)
 ```
 
+The **write-capture triggers** are not part of that migrator. They're derived from your `tables`
+manifest — source code, which ships without a schema version bump — so the engine (re)installs them
+idempotently at every init and drops the ones for tables you've stopped syncing.
+
 ## 4. Write
 
-A write goes to GRDB **and** the outbox in one transaction, then returns optimistically. `enqueue`
-wakes the uploader itself, so there's **no `syncNow()` needed after a write** — a burst debounces
-into one drain pass.
+Write GRDB **normally**. Each declared table carries `AFTER INSERT` / `UPDATE` / `DELETE` triggers
+that append to the outbox in your transaction, so there is no second API to call and nothing to
+forget. The engine notices the queued write and uploads promptly, so there's **no `syncNow()` needed
+after a write** — a burst debounces into one drain pass.
 
 ```swift
-try await engine.enqueue(.upsert, table: "recipes", row: recipe)   // recipe: some Encodable & Sendable
+try await db.write { try recipe.save($0) }                       // PersistableRecord
+
+try await db.write { db in                                        // partial / expression updates
+    try db.execute(sql: "UPDATE recipes SET title = ? WHERE id = ?", arguments: [title, id])
+    try db.execute(sql: "UPDATE recipes SET cookCount = cookCount + 1 WHERE id = ?", arguments: [id])
+}
+
+try await db.write { db in                                        // one transaction = one user intent
+    try recipe.save(db)
+    for ingredient in ingredients { try ingredient.save(db) }
+}
 ```
 
-### Delete (with automatic cascade)
+That last one matters: the rows and their queued uploads commit together, or neither does. A crash
+part-way through leaves no half-recipe *and* no half-batch in the outbox.
 
-`enqueue(.delete, …)` removes the row locally and queues a tombstone. When the row is a **parent**
-with children enforced by local foreign keys, the engine **cascades** — deletes the child rows too,
-deepest-first, in the same transaction, and queues a tombstone for each. You don't enqueue child
-deletes yourself, and the UI never shows orphaned children.
+> `engine.enqueue(op:table:row:)` still works but is **deprecated**. It now just performs the write
+> and lets the trigger queue it. Replace `enqueue(.upsert, table: t, row: r)` with
+> `try await db.write { try r.save($0) }`, and `enqueue(.delete, …)` with a plain `DELETE`.
+
+### Delete (with cascade)
+
+A plain `DELETE` removes the row locally and queues a tombstone. For a **parent** row, declare
+`ON DELETE CASCADE` on the child foreign keys — SQLite then walks the graph and each removed child's
+own trigger queues its tombstone, so you never delete children by hand and the UI never shows
+orphans.
 
 ```swift
-try await engine.enqueue(.delete, table: "recipes", row: ["id": recipeID])
+// In your migration:
+try db.create(table: "recipeIngredients") { t in
+    t.column("id", .text).primaryKey()
+    t.column("recipeId", .text).references("recipes", onDelete: .cascade)
+    // …
+}
+
+// Then:
+try await db.write { try $0.execute(sql: "DELETE FROM recipes WHERE id = ?", arguments: [recipeID]) }
 ```
+
+A table that only `dependsOn` a parent without an FK action is **not** cascaded — `dependsOn` orders
+uploads, it doesn't delete rows. Its orphans reconcile on the next pull via the server tombstone.
 
 ## 5. Pull
 

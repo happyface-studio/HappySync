@@ -73,18 +73,40 @@ A Realtime change event triggers a **debounced `pullNow()`** — it never applie
 All correctness lives in the idempotent cursor pull, so sync converges even if Realtime drops; the
 doorbell just makes it feel instant. Foreground and periodic pulls converge on their own.
 
+### Writes and capture
+
+There is no write API to remember. Each declared table carries `AFTER INSERT` / `AFTER UPDATE` /
+`AFTER DELETE` triggers that append to `_sync_outbox`, so any GRDB write — `save`, a partial update,
+raw SQL, a whole multi-table transaction — is queued **in the caller's transaction**. The unit of
+atomicity is the user's intent, not one row: "create a recipe + 12 ingredients" commits the rows and
+their queued uploads together or not at all.
+
+Each trigger's `WHEN` clause reads a one-row `_sync_control.applying` flag that the engine raises
+while it writes *server* state locally (a pulled page, a tombstone, an upload's write-back, a resync
+reconcile, a discarded dead letter). Without it every downloaded row would queue itself straight back
+for upload and the sync would never settle.
+
+The triggers come from the `tables` manifest, which is source code rather than a numbered migration,
+so the engine (re)installs them idempotently at init and drops the ones for tables you've stopped
+syncing. A declared table that doesn't exist locally throws at init — the manifest and the schema are
+not allowed to drift silently.
+
+A GRDB `TransactionObserver` watches for **inserts into the outbox** and wakes the runner, so a plain
+write uploads as promptly as an explicit call used to. Drain bookkeeping (updates and deletes on the
+outbox) is deliberately not observed, so a drain can't feed itself another pass.
+
 ### Deletes and cascades
 
-`enqueue(.delete)` soft-deletes locally and queues a tombstone. For a parent whose children are
-enforced by **local foreign keys**, the engine cascades — deletes the children deepest-first in the
-same transaction and queues a tombstone for each — mirroring the server's child-tombstone trigger.
-Result: the local and server deleted sets stay symmetric, with no orphan window and no round-trip. A
-visited-key guard makes each row delete at most once, so a self-referential cycle terminates.
+A plain `DELETE` removes the row locally and queues a tombstone. For a parent, the schema's
+`ON DELETE CASCADE` does the graph walk and each removed child's own delete trigger queues its
+tombstone — mirroring the server's child-tombstone trigger. Result: the local and server deleted sets
+stay symmetric, with no orphan window and no round-trip. A table that only `dependsOn` a parent
+without an FK action is not cascaded; `dependsOn` orders uploads, it doesn't delete rows.
 
 ## What HappySync owns (and doesn't)
 
-**Owns:** the outbox drain, cursor pull, tombstones, FK ordering, the Realtime doorbell, status, and
-retry/backoff.
+**Owns:** the write-capture triggers on your declared tables, the outbox drain, cursor pull,
+tombstones, FK ordering, the Realtime doorbell, status, and retry/backoff.
 
 **Does not own:** your reads (observe GRDB directly) or your schema (you declare tables; the server
 holds the authoritative schema).

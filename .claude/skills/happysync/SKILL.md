@@ -23,17 +23,20 @@ CRDTs and no conflict-resolution RPC.
 ## Mental model (read before wiring anything)
 
 - **Local GRDB is the source of truth for reads.** Observe it with `ValueObservation`.
-- **Writes go to GRDB *and* an outbox in the same transaction**, then return optimistically.
-  A background drain uploads the outbox via PostgREST upsert (idempotent by primary key,
-  retried with per-entry backoff, FK-ordered).
+- **You write GRDB normally; SQLite triggers capture it.** Each declared table carries
+  `AFTER INSERT`/`UPDATE`/`DELETE` triggers that append to an outbox **in your own transaction**,
+  so `save`, a partial `UPDATE`, `SET n = n + 1`, raw SQL and whole multi-table transactions all
+  sync — there is no write API to call and nothing to forget. A background drain uploads the outbox
+  via PostgREST upsert (idempotent by primary key, retried with per-entry backoff, FK-ordered).
 - **Downloads are a cursor pull:** `SELECT … WHERE updatedAt > :cursor ORDER BY (updatedAt, id)`,
   RLS-scoped, applied last-write-wins with a dirty-row guard (a pending local edit is never
   clobbered).
 - **Supabase Realtime is a *doorbell only*.** A change event triggers a debounced `pullNow()`;
   payloads are **never** applied directly. All correctness lives in the idempotent cursor pull,
   so sync converges even if Realtime drops.
-- **HappySync owns** the outbox drain, cursor pull, tombstones, FK ordering, the Realtime
-  doorbell, status, and retry/backoff. It does **not** own reads or your schema.
+- **HappySync owns** its capture triggers on your declared tables, the outbox drain, cursor pull,
+  tombstones, FK ordering, the Realtime doorbell, status, and retry/backoff. It does **not** own
+  reads or the rest of your schema.
 
 ## The four things you must get right
 
@@ -41,7 +44,10 @@ CRDTs and no conflict-resolution RPC.
    `deletedAt` tombstone column, RLS scoped to `auth.uid()`, and Realtime publication. This is
    non-negotiable: LWW compares a *server* clock. See `references/server-setup.md`.
 2. **The table manifest** — declare every synced table as a `SyncTable`, in FK dependency order.
-   See "Declaring tables" below and `references/api.md`.
+   Each must already exist locally when you construct the engine (run your migrations first): it
+   installs capture triggers on them and throws `SyncError.missingLocalTable` otherwise. Declare
+   `ON DELETE CASCADE` on child FKs so a parent delete tombstones its children. See "Declaring
+   tables" below and `references/api.md`.
 3. **Lifecycle** — `await engine.start()` after sign-in; **`await engine.stop()` before wiping
    or replacing the database** on sign-out / account switch. `stop()` is async and awaits the
    in-flight pass.
@@ -74,12 +80,18 @@ let engine = try SyncEngine(
 
 await engine.start()
 
-// Write: goes to GRDB + outbox in one txn, uploads promptly (no syncNow() needed —
-// enqueue wakes the runner; a burst debounces into one drain pass).
-try await engine.enqueue(.upsert, table: "recipes", row: recipe)
+// Write: just use GRDB. The capture trigger queues the upload in the same txn, and the engine
+// uploads promptly (no syncNow() needed — a burst debounces into one drain pass).
+try await databaseQueue.write { db in
+    try recipe.save(db)
+    for ingredient in ingredients { try ingredient.save(db) }   // one txn = one atomic user intent
+}
 
-// Delete: removes locally + queues a tombstone; cascades to FK children automatically.
-try await engine.enqueue(.delete, table: "recipes", row: ["id": recipeID])
+// Delete: a plain DELETE queues a tombstone. With ON DELETE CASCADE on the child FKs, SQLite
+// removes the children too and each child's own trigger queues its tombstone.
+try await databaseQueue.write { try $0.execute(sql: "DELETE FROM recipes WHERE id = ?", arguments: [recipeID]) }
+
+// `engine.enqueue(...)` still exists but is DEPRECATED — it just performs the write now.
 
 // App-driven nudge (foreground, pull-to-refresh):
 try await engine.pullNow()
@@ -139,6 +151,9 @@ contract: the repo's `docs/SYNC-CONTRACT.md`.
 - **Never trust a client `updatedAt`.** The server trigger stamps it; LWW depends on it. The engine
   already strips the cursor column from every upload, so the only half left to get right is the
   trigger.
+- **Don't call `enqueue`** in new code — write GRDB directly and let the capture triggers queue it.
+- **Declare synced tables' child FKs `ON DELETE CASCADE`**, or a parent delete either RESTRICTs or
+  leaves orphans until the server tombstone arrives. `dependsOn` orders uploads; it deletes nothing.
 - **Don't apply Realtime payloads.** The doorbell only triggers a pull.
 - **`await stop()` before touching the DB file** on sign-out/account switch, or an in-flight pass
   writes to the store you're deleting (or uploads the old user's rows with the new user's token).

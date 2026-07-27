@@ -103,7 +103,7 @@ private func seedRecipe(_ db: DatabaseQueue, id: String, title: String, updatedA
     ])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
     // A pending local edit makes the row dirty; its queued upload must win.
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "My Local Edit"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'My Local Edit')")
 
     try await engine.pullNow()
 

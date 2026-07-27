@@ -131,7 +131,7 @@ import Supabase
         db: db, remote: remote, tables: [SyncTable(name: "recipes")],
         doorbell: SilentDoorbell(), pollInterval: 999
     )
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')") // trigger-captured
     try await engine.runSyncOnce() // parks r1 → deadLetters == 1
 
     var status = engine.status.makeAsyncIterator()

@@ -309,6 +309,20 @@ func agePastBackoff(_ db: any DatabaseWriter) async throws {
     }
 }
 
+/// A plain GRDB write — **no engine call**. Since issue #48 the table's capture trigger records the
+/// op in this same transaction, so this is how an app writes and how these tests drive the outbox.
+func write(_ db: any DatabaseWriter, _ sql: String, _ arguments: StatementArguments = StatementArguments()) async throws {
+    try await db.write { try $0.execute(sql: sql, arguments: arguments) }
+}
+
+/// Every pending outbox entry as `"table/pk:op"`, in `seq` order — the queue the capture triggers built.
+func queuedOps(_ db: any DatabaseReader) async throws -> [String] {
+    try await db.read { db in
+        try Row.fetchAll(db, sql: "SELECT table_name, pk, op FROM \(SyncSchema.outboxTable) ORDER BY seq")
+            .map { "\($0["table_name"] as String)/\($0["pk"] as String):\($0["op"] as String)" }
+    }
+}
+
 /// A DB with one `recipes` domain table (id, title, updated_at) plus HappySync's internal tables.
 func recipesDB() throws -> DatabaseQueue {
     let db = try DatabaseQueue()
@@ -321,3 +335,42 @@ func recipesDB() throws -> DatabaseQueue {
     }
     return db
 }
+
+/// CookThis's recipe graph with real SQLite FK constraints — `ON DELETE CASCADE` throughout, which is
+/// what makes a parent delete reach the child tables' own capture triggers (issue #48). GRDB enforces
+/// foreign keys by default, so this is the shape an app declares to get cascading tombstones.
+func recipeGraphDB() throws -> DatabaseQueue {
+    let db = try DatabaseQueue()
+    try db.write { db in
+        try db.create(table: "recipes") { t in
+            t.column("id", .text).primaryKey()
+            t.column("title", .text)
+            t.column("updatedAt", .text)
+        }
+        try db.create(table: "recipeIngredients") { t in
+            t.column("id", .text).primaryKey()
+            t.column("recipeId", .text).references("recipes", onDelete: .cascade)
+            t.column("updatedAt", .text)
+        }
+        try db.create(table: "recipeSteps") { t in
+            t.column("id", .text).primaryKey()
+            t.column("recipeId", .text).references("recipes", onDelete: .cascade)
+            t.column("updatedAt", .text)
+        }
+        try db.create(table: "recipeStepIngredients") { t in
+            t.column("id", .text).primaryKey()
+            t.column("stepId", .text).references("recipeSteps", onDelete: .cascade)
+            t.column("ingredientId", .text).references("recipeIngredients", onDelete: .cascade)
+            t.column("updatedAt", .text)
+        }
+    }
+    return db
+}
+
+/// The graph's manifest, declared child-first to prove ordering doesn't rely on input order.
+let recipeGraphTables = [
+    SyncTable(name: "recipeStepIngredients", dependsOn: ["recipeSteps", "recipeIngredients"]),
+    SyncTable(name: "recipeIngredients", dependsOn: ["recipes"]),
+    SyncTable(name: "recipeSteps", dependsOn: ["recipes"]),
+    SyncTable(name: "recipes"),
+]

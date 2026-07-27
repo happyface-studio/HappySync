@@ -14,7 +14,7 @@ import Supabase
     let db = try recipesDB()
     let remote = FakeRemote(failUpserts: 1, permanentUpserts: true) // parks on the first attempt
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox() // r1 parks permanently
 
@@ -32,7 +32,7 @@ import Supabase
     let db = try recipesDB()
     let remote = FakeRemote(failUpserts: 1) // transient — retried, not parked
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 8)
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox() // fails transiently, stays pending (not parked)
 
@@ -46,7 +46,7 @@ import Supabase
     // Parks on the first attempt (permanent), then the remote accepts writes — the cause is "fixed".
     let remote = FakeRemote(failUpserts: 1, permanentUpserts: true)
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox() // parks r1
     #expect(try await engine.deadLetters().count == 1)
@@ -72,8 +72,8 @@ import Supabase
     let db = try recipesDB()
     let remote = FakeRemote(failUpserts: 99, permanentUpserts: true) // every write parks
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "A"])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r2", "title": "B"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'A')")
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r2', 'B')")
     try await engine.drainOutbox() // both park
 
     let r1 = try #require(try await engine.deadLetters().first { $0.pk == "r1" })
@@ -88,7 +88,7 @@ import Supabase
     let db = try recipesDB()
     let remote = FakeRemote(failUpserts: 1, permanentUpserts: true)
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
     try await engine.runSyncOnce() // parks r1; status shows one dead letter
 
     var beforeStatus = engine.status.makeAsyncIterator()
@@ -111,7 +111,7 @@ import Supabase
         dataset: ["recipes": [["id": "r1", "title": "Server Wins", "updatedAt": "2026-06-30T12:00:00.000Z"]]]
     )
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Poison", "updatedAt": "2026-07-01T09:00:00.000Z"])
+    try await write(db, "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Poison', '2026-07-01T09:00:00.000Z')")
 
     try await engine.drainOutbox() // parks the poison entry
     try await engine.pullNow()     // advances the cursor past the server row, but LWW keeps "Poison"
@@ -136,9 +136,10 @@ import Supabase
         failUpserts: 0,
         dataset: ["recipes": [["id": "r1", "title": "Still Here", "updatedAt": "2026-06-30T12:00:00.000Z"]]]
     )
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    // Seeded before the engine exists, so only the delete below is captured.
     try await db.write { try $0.execute(sql: "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Local', '2026-06-01T00:00:00.000Z')") }
-    try await engine.enqueue(.delete, table: "recipes", row: ["id": "r1"]) // removes the local row + queues a delete
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    try await write(db, "DELETE FROM recipes WHERE id = 'r1'") // removes the local row + queues a delete
     // Park the queued delete by hand — the delete path can't be failed via FakeRemote, but the repair
     // API operates purely on `_sync_outbox` state regardless of *why* an entry parked.
     try await db.write { try $0.execute(sql: "UPDATE _sync_outbox SET dead_lettered = 1 WHERE pk='r1'") }
@@ -158,11 +159,11 @@ import Supabase
     let db = try recipesDB()
     let remote = FakeRemote(failUpserts: 1, permanentUpserts: true)
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Parked"])
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Parked')")
     try await engine.drainOutbox() // parks the first write
 
     // The user edits the same row again after it parked → a fresh, live (non-parked) outbox entry.
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Fresh Edit"])
+    try await write(db, "UPDATE recipes SET title = 'Fresh Edit' WHERE id = 'r1'")
 
     try await engine.discardDeadLetters() // discards only the parked entry
 
@@ -182,8 +183,8 @@ import Supabase
         dataset: ["recipes": [["id": "r1", "title": "Server", "updatedAt": "2026-06-30T12:00:00.000Z"]]]
     )
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "First", "updatedAt": "2026-07-01T09:00:00.000Z"])
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Second", "updatedAt": "2026-07-01T10:00:00.000Z"])
+    try await write(db, "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'First', '2026-07-01T09:00:00.000Z')")
+    try await write(db, "UPDATE recipes SET title = 'Second', updatedAt = '2026-07-01T10:00:00.000Z' WHERE id = 'r1'")
     // Park both by hand — two dead-lettered siblings on one (table, pk).
     try await db.write { try $0.execute(sql: "UPDATE _sync_outbox SET dead_lettered = 1 WHERE pk='r1'") }
 

@@ -20,8 +20,8 @@ public init(
 |---|---|
 | `func start()` | Begins background sync. Idempotent. Immediate convergence sync, then drives from the Realtime doorbell, a periodic poll, and retry backoff through one serialized runner. |
 | `func stop() async` | **Async.** Awaits the in-flight pass, quiesces (no more DB writes / network), unsubscribes Realtime. Settles `status` to `.idle` but leaves subscriptions open. `start()` re-subscribes cleanly. Call **before** wiping/replacing the DB. |
-| `func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws` | Domain row + outbox entry in one transaction; wakes the runner. `.delete` cascades to FK children. Throws `SyncError`. |
-| `func syncNow()` | Fire-and-forget nudge (foreground, pull-to-refresh). Not needed after `enqueue`. |
+| `func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws` | **Deprecated.** Performs the write; the table's capture trigger queues it. Write GRDB directly instead. Throws `SyncError`. |
+| `func syncNow()` | Fire-and-forget nudge (foreground, pull-to-refresh). Not needed after a write — the engine wakes on queued writes itself. |
 | `@discardableResult func pullNow() async throws -> [String: Set<String>]` | Cursor pull now; returns server primary keys seen per table. |
 | `var status: AsyncStream<SyncStatus>` | `nonisolated`. Live status for the UI. Each access is an independent stream replaying the latest snapshot; it survives `stop()`/`start()` and only ends when the engine is deallocated. |
 | `func deadLetters() async throws -> [DeadLetter]` | Inspect parked entries. |
@@ -90,17 +90,35 @@ public enum SyncOp: String, Codable { case upsert; case delete }
 
 public enum SyncError: Error {
     case notImplemented(String)
-    case unknownTable(String)                      // enqueue on an undeclared table
+    case unknownTable(String)                      // deprecated enqueue on an undeclared table
     case missingPrimaryKey(table: String, column: String)
     case encoding(String)
+    case missingLocalTable(String)                 // declared SyncTable has no local table (init)
+    case missingPrimaryKeyColumn(table: String, column: String)
+    case recursiveTriggersUnavailable              // PRAGMA recursive_triggers could not be enabled
 }
 ```
+
+## Writing
+
+There is no write API. Each declared table gets `AFTER INSERT` / `AFTER UPDATE` / `AFTER DELETE`
+triggers that append to `_sync_outbox` inside your own transaction, so any GRDB write syncs:
+
+```swift
+try await db.write { try recipe.save($0) }
+try await db.write { try $0.execute(sql: "UPDATE recipes SET title = ? WHERE id = ?", arguments: [t, id]) }
+try await db.write { try $0.execute(sql: "DELETE FROM recipes WHERE id = ?", arguments: [id]) }
+```
+
+Declare `ON DELETE CASCADE` on child foreign keys to have a parent delete tombstone its children.
+The engine enables `PRAGMA recursive_triggers` on the writer connection at init.
 
 ## SyncSchema (migrator sharing)
 
 ```swift
 static func migrator() -> DatabaseMigrator                 // standalone; used when the engine owns the DB
 static func register(into migrator: inout DatabaseMigrator) // prefer this when the app owns the migrator
+// The capture triggers are NOT migrations — the engine installs them idempotently at init.
 ```
 
 Registers `happysync_v1..v3` — the `_sync_outbox`, `_sync_state`, and `_sync_meta` internal tables.

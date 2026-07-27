@@ -126,12 +126,12 @@ private struct SeededGenerator: RandomNumberGenerator {
     #expect(converged) // initial sync + repeated periodic polls, with no doorbell at all
 }
 
-// MARK: - Local writes wake the runner (APPS-503)
+// MARK: - Local writes wake the runner (APPS-503, issue #48)
 
-@Test func enqueueTriggersDrainWithoutSyncNow() async throws {
+@Test func localWriteTriggersDrainWithoutSyncNow() async throws {
     let db = try recipesDB()
     let remote = FakeRemote()
-    // Long poll, silent doorbell → the only thing that can drive an upload is the enqueue itself.
+    // Long poll, silent doorbell → the only thing that can drive an upload is the local write itself.
     let engine = try SyncEngine(
         db: db, remote: remote, tables: [SyncTable(name: "recipes")],
         doorbell: SilentDoorbell(), pollInterval: 999, debounceInterval: 0.02
@@ -140,16 +140,17 @@ private struct SeededGenerator: RandomNumberGenerator {
     #expect(await eventually { await remote.fetchCalls >= 1 }) // initial start-sync settled
     let baseline = await remote.upsertCalls.count
 
-    // A local write with no syncNow() follow-up must still upload promptly.
-    try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
-    #expect(await eventually { await remote.upsertCalls.count == baseline + 1 }) // the enqueue alone drove a drain
+    // A plain GRDB write with no syncNow() follow-up must still upload promptly: the capture trigger
+    // queues it and the engine's outbox observer wakes the runner (issue #48).
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
+    #expect(await eventually { await remote.upsertCalls.count == baseline + 1 }) // the write alone drove a drain
     await engine.stop()
 }
 
-@Test func burstOfEnqueuesCoalescesIntoOneDrainPass() async throws {
+@Test func burstOfWritesCoalescesIntoOneDrainPass() async throws {
     let db = try recipesDB()
     let remote = FakeRemote()
-    // A large debounce so the 20 sequential enqueues finish before it fires — the burst then coalesces
+    // A large debounce so the 20 sequential writes finish before it fires — the burst then coalesces
     // into one drain instead of splitting across windows under load (issue #19).
     let engine = try SyncEngine(
         db: db, remote: remote, tables: [SyncTable(name: "recipes")],
@@ -161,7 +162,7 @@ private struct SeededGenerator: RandomNumberGenerator {
 
     // e.g. importing a recipe with many ingredients: a burst of writes inside one debounce window.
     for i in 0..<20 {
-        try await engine.enqueue(.upsert, table: "recipes", row: ["id": "r\(i)", "title": "row \(i)"])
+        try await write(db, "INSERT INTO recipes (id, title) VALUES (?, ?)", ["r\(i)", "row \(i)"])
     }
     // Wait until every queued write has uploaded, then count how many sync passes it took.
     #expect(await eventually { await remote.upsertCalls.count == 20 })

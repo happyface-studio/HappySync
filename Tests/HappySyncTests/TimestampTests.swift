@@ -16,10 +16,11 @@ import Supabase
     #expect(columns["createdAt"] == "2026-07-02T10:00:00.123Z".databaseValue) // ISO text, not a Double
 }
 
-@Test func codableDateRoundTripsAsISOStringThroughUpload() async throws {
-    // Uses `createdAt`, not the cursor column: the cursor column is server-stamped and stripped from
-    // every payload (issue #47), so it can't witness the wire encoding.
-    struct NewRecipe: Encodable, Sendable { let id: String; let title: String; let createdAt: Date }
+@Test func isoTimestampRoundTripsUnchangedThroughUpload() async throws {
+    // Observes `createdAt`, not the cursor column: `updatedAt` is server-stamped and stripped from
+    // every payload (issue #47), so it can't witness the wire encoding. The write is a plain SQL
+    // INSERT — the table's capture trigger queues it (issue #48) — so this covers the whole path from
+    // local ISO text to the wire without going through the deprecated `enqueue` shim.
     let db = try DatabaseQueue()
     try await db.write { db in
         try db.create(table: "recipes") { t in
@@ -31,16 +32,17 @@ import Supabase
     }
     let remote = FakeRemote()
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
-    let date = try #require(SyncTimestamp.date(from: "2026-07-02T10:00:00.123Z"))
 
-    try await engine.enqueue(.upsert, table: "recipes", row: NewRecipe(id: "r1", title: "Soup", createdAt: date))
+    try await write(db, "INSERT INTO recipes (id, title, createdAt) VALUES ('r1', 'Soup', '2026-07-02T10:00:00.123Z')")
 
     let stored = try await db.read { try String.fetchOne($0, sql: "SELECT createdAt FROM recipes WHERE id='r1'") }
     #expect(stored == "2026-07-02T10:00:00.123Z") // local column holds ISO text
 
     try await engine.drainOutbox()
+
     let payload = await remote.upsertCalls.first?.row
     #expect(payload?["createdAt"] == .string("2026-07-02T10:00:00.123Z")) // uploaded as ISO text
+    #expect(payload?.keys.contains("updatedAt") == false)                 // cursor column never ships
 }
 
 // APPS-474: canonicalize the three timestamp shapes that coexist so the LWW lexicographic compare
