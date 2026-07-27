@@ -242,6 +242,19 @@ final class FakeDoorbell: SyncDoorbell, @unchecked Sendable {
     }
 }
 
+/// Accumulates every `SyncStatus` a subscriber receives, so a test can drive a `for await` loop the
+/// way a SwiftUI `.task` does and then assert on what arrived — including *after* a stop/start cycle,
+/// which a finished stream would never deliver (issue #45).
+actor StatusCollector {
+    private(set) var statuses: [SyncStatus] = []
+    var count: Int { statuses.count }
+    /// How many `.syncing` statuses arrived. One per sync pass, and `stop()` never broadcasts one — so
+    /// a test can prove a *new* pass reached this subscriber rather than re-counting teardown's settle.
+    var syncingCount: Int { statuses.filter { $0.phase == .syncing }.count }
+
+    func append(_ status: SyncStatus) { statuses.append(status) }
+}
+
 /// Engine over a caller-supplied DB (and, by default, a no-op `FakeRemote`) so tests can
 /// pre-create domain tables and only wire a dataset/failure remote when they exercise sync.
 func makeEngine(

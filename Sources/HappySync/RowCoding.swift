@@ -50,11 +50,12 @@ enum RowCoding {
         }
     }
 
-    /// Builds the PostgREST wire payload from a local row: `serverOwnedColumns` are dropped (the
-    /// server owns them) and `jsonColumns` are parsed from text back into JSON values. When
-    /// `serverColumns` is non-nil, local columns the server's schema doesn't have are dropped too, so
-    /// a column the server has since removed or renamed can't reject the whole upsert (`PGRST204`) and
-    /// dead-letter every write on the table (APPS-504).
+    /// Builds the PostgREST wire payload from a local row: the `serverOwned` columns are dropped (the
+    /// table's `serverOwnedColumns` *and* its `cursorColumn` — see `SyncTable.uploadExcludedColumns`)
+    /// and `jsonColumns` are parsed from text back into JSON values. When `serverColumns` is non-nil,
+    /// local columns the server's schema doesn't have are dropped too, so a column the server has
+    /// since removed or renamed can't reject the whole upsert (`PGRST204`) and dead-letter every write
+    /// on the table (APPS-504).
     static func payload(
         from row: Row, jsonColumns: Set<String>, excluding serverOwned: Set<String>,
         restrictingTo serverColumns: Set<String>? = nil

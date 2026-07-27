@@ -10,7 +10,9 @@ below — implemented inline so you don't need an extension.
 ## 1. `updatedAt` — server-stamped change time
 
 LWW compares `updatedAt`, and a *server* clock is what stops two devices' clock skew from silently
-losing writes. **Never trust a client-sent `updatedAt`.**
+losing writes. **Never trust a client-sent `updatedAt`.** The engine never sends one: a table's
+`cursorColumn` is stripped from every upload payload, with nothing declared. The trigger is still
+required — it's what advances the column on update, which the cursor pull depends on.
 
 ```sql
 alter table public.recipes
@@ -31,7 +33,9 @@ create trigger stamp_updated_at
 
 > An **insert-only / immutable** table (rows never change after write) needs no update trigger.
 > Give it its own monotonic stamp column (e.g. `translatedAt`) and set the table's
-> `cursorColumn` to it in the `SyncTable` descriptor.
+> `cursorColumn` to it in the `SyncTable` descriptor. That column needs `default now()`
+> server-side: the engine never uploads a cursor column, so an insert with no default lands a null
+> stamp the cursor can't order.
 
 ## 2. `deletedAt` — soft-delete tombstones
 
@@ -123,7 +127,7 @@ alter publication supabase_realtime add table public.recipes;
 | Bool | integer `0/1` locally ↔ `boolean` in Postgres. |
 | Enum | `rawValue` string. |
 | JSON columns | JSON **text** locally ↔ `json`/`jsonb`; declare in `SyncTable.jsonColumns`. |
-| Server-owned | RPC-managed columns; declare in `serverOwnedColumns`, never in an upsert payload. |
+| Server-owned | RPC-managed columns; declare in `serverOwnedColumns`, never in an upsert payload. The `cursorColumn` is server-owned too — the engine strips it with nothing declared. |
 
 ## Server-side checklist
 

@@ -168,6 +168,15 @@ await engine.stop()   // engine is quiesced here
 try await wipeLocalDatabase()
 ```
 
+**Status streams survive a stop/start cycle.** `stop()` broadcasts a settled `.idle` status (keeping
+`failedUploads`/`deadLetters`, which live in the outbox) but does **not** end the streams — so the
+usual long-lived consumer keeps working across sign-out → wipe → sign-in, and doesn't need to be
+re-subscribed after `start()`:
+
+```swift
+.task { for await status in engine.status { self.status = status } }  // survives stop() → start()
+```
+
 ## Repairing dead letters
 
 A write that fails permanently (an RLS reject, a constraint violation) — or exhausts its retries —

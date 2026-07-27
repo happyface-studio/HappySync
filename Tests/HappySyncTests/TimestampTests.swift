@@ -17,15 +17,32 @@ import Supabase
 }
 
 @Test func isoTimestampRoundTripsUnchangedThroughUpload() async throws {
-    let db = try recipesDB()
+    // Observes `createdAt`, not the cursor column: `updatedAt` is server-stamped and stripped from
+    // every payload (issue #47), so it can't witness the wire encoding. The write is a plain SQL
+    // INSERT — the table's capture trigger queues it (issue #48) — so this covers the whole path from
+    // local ISO text to the wire without going through the deprecated `enqueue` shim.
+    let db = try DatabaseQueue()
+    try await db.write { db in
+        try db.create(table: "recipes") { t in
+            t.column("id", .text).primaryKey()
+            t.column("title", .text)
+            t.column("createdAt", .text)
+            t.column("updatedAt", .text)
+        }
+    }
     let remote = FakeRemote()
     let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
 
-    try await write(db, "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Soup', '2026-07-02T10:00:00.123Z')")
+    try await write(db, "INSERT INTO recipes (id, title, createdAt) VALUES ('r1', 'Soup', '2026-07-02T10:00:00.123Z')")
+
+    let stored = try await db.read { try String.fetchOne($0, sql: "SELECT createdAt FROM recipes WHERE id='r1'") }
+    #expect(stored == "2026-07-02T10:00:00.123Z") // local column holds ISO text
+
     try await engine.drainOutbox()
 
     let payload = await remote.upsertCalls.first?.row
-    #expect(payload?["updatedAt"] == .string("2026-07-02T10:00:00.123Z")) // uploaded as ISO text
+    #expect(payload?["createdAt"] == .string("2026-07-02T10:00:00.123Z")) // uploaded as ISO text
+    #expect(payload?.keys.contains("updatedAt") == false)                 // cursor column never ships
 }
 
 // APPS-474: canonicalize the three timestamp shapes that coexist so the LWW lexicographic compare

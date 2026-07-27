@@ -60,11 +60,15 @@ private func shimEnqueue(
 
     try await shimEnqueue(engine, .upsert, table: "recipes", row: NewRecipe(id: "r1", title: "Soup", updatedAt: date))
 
+    // The local column is what witnesses the encoding: `updatedAt` is the cursor column, and issue #47
+    // strips that from every payload — including one the shim queued — so the wire can't show it.
     let stored = try await db.read { try String.fetchOne($0, sql: "SELECT updatedAt FROM recipes WHERE id='r1'") }
     #expect(stored == "2026-07-02T10:00:00.123Z")
 
     try await engine.drainOutbox()
-    #expect(await remote.upsertCalls.first?.row["updatedAt"] == .string("2026-07-02T10:00:00.123Z"))
+    let payload = try #require(await remote.upsertCalls.first?.row)
+    #expect(payload["title"] == .string("Soup"))
+    #expect(payload.keys.contains("updatedAt") == false) // server-stamped; never uploaded (issue #47)
 }
 
 @available(*, deprecated)

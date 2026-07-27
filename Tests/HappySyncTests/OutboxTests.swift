@@ -338,6 +338,62 @@ import Supabase
     #expect(payload.keys.contains("cookedCount") == false) // server owns it — never uploaded
 }
 
+// issue #47: the cursor column is server-stamped by contract §1/§4, so the engine strips it from
+// every upload with nothing declared. Without this a table missing its `updatedAt` trigger silently
+// promotes the client's clock to the LWW ordering authority.
+
+@Test func drainNeverUploadsTheCursorColumn() async throws {
+    let db = try recipesDB()
+    let remote = FakeRemote()
+    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+
+    // A row carrying an explicit client `updatedAt` — the shape the download path leaves behind too.
+    try await write(db, "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Soup', '2020-01-01T00:00:00.000Z')")
+
+    try await engine.drainOutbox()
+
+    let payload = try #require(await remote.upsertCalls.first?.row)
+    #expect(payload["title"] == .string("Soup"))
+    #expect(payload.keys.contains("updatedAt") == false) // the server stamps it — never uploaded
+    // The local column keeps its value (it's the LWW/cursor comparand); only the wire drops it.
+    let stored = try await db.read { try String.fetchOne($0, sql: "SELECT updatedAt FROM recipes WHERE id='r1'") }
+    #expect(stored == remote.serverUpdatedAt) // and the write-back stamped the server's value over it
+}
+
+@Test func drainStripsACustomCursorColumn() async throws {
+    // `recipe_translations` cursors on `translatedAt` (it has no `updatedAt`) — the stripping follows
+    // the declared cursor column, not the name `updatedAt`.
+    let db = try DatabaseQueue()
+    try await db.write { db in
+        try db.create(table: "recipe_translations") { t in
+            t.column("id", .text).primaryKey()
+            t.column("locale", .text)
+            t.column("translatedAt", .text)
+        }
+    }
+    let remote = FakeRemote()
+    let engine = try SyncEngine(
+        db: db,
+        remote: remote,
+        // serverColumns names it explicitly: even an allow-listed cursor column stays off the wire.
+        tables: [SyncTable(
+            name: "recipe_translations",
+            cursorColumn: "translatedAt",
+            serverColumns: ["id", "locale", "translatedAt"]
+        )]
+    )
+    try await write(
+        db,
+        "INSERT INTO recipe_translations (id, locale, translatedAt) VALUES ('t1', 'de', '2020-01-01T00:00:00.000Z')"
+    )
+
+    try await engine.drainOutbox()
+
+    let payload = try #require(await remote.upsertCalls.first?.row)
+    #expect(payload["locale"] == .string("de"))
+    #expect(payload.keys.contains("translatedAt") == false)
+}
+
 @Test func drainExcludesColumnsTheServerDoesNotKnow() async throws {
     // The server has since dropped `legacyNotes`; a shipped client still has it locally. Declaring
     // `serverColumns` intersects the payload so the upsert doesn't PGRST204 and dead-letter every
