@@ -31,11 +31,11 @@ SyncSchema.register(into: &migrator)   // adds happysync_v1..v3
 | Method | Notes |
 |---|---|
 | `func start()` | Begins background sync. Idempotent. Runs an immediate convergence sync, then drives from three triggers (Realtime doorbell, periodic poll, retry backoff) through one serialized runner. |
-| `func stop() async` | **Async** — awaits the in-flight pass, then quiesces (no more DB writes / network) and unsubscribes Realtime. `start()` re-subscribes cleanly. Call **before** wiping/replacing the DB. |
+| `func stop() async` | **Async** — awaits the in-flight pass *and any in-flight `enqueue` transaction*, then quiesces (no more DB writes / network) and unsubscribes Realtime. Settles `status` to `.idle` but leaves subscriptions open. `start()` re-subscribes cleanly. Call **before** wiping/replacing the DB. |
 | `func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) async throws` | Writes the domain row + an outbox entry in one transaction and wakes the runner. `.delete` cascades to FK children. Throws `SyncError.unknownTable` / `.missingPrimaryKey` / `.encoding`. |
 | `func syncNow()` | Fire-and-forget nudge (foreground return, pull-to-refresh). Not needed after `enqueue`. |
 | `@discardableResult func pullNow() async throws -> [String: Set<String>]` | Runs a cursor pull now; returns the server primary keys seen per table. |
-| `var status: AsyncStream<SyncStatus>` (`nonisolated`) | Live status for the sync-status UI. |
+| `var status: AsyncStream<SyncStatus>` (`nonisolated`) | Live status for the sync-status UI. Independent stream per access, replays the latest snapshot, survives `stop()`/`start()` — it only ends when the engine is deallocated. |
 | `func deadLetters() async throws -> [DeadLetter]` | Inspect parked entries. |
 | `func retryDeadLetters(_ seqs: [Int64]? = nil) async throws` | Re-queue parked writes (specific `seq`s, or all). Refreshes status immediately. |
 | `func discardDeadLetters(_ seqs: [Int64]? = nil) async throws` | Drop parked writes and re-pull the affected rows so local converges to the server. |
@@ -47,9 +47,10 @@ public init(
     name: String,                          // identical local + remote table name
     primaryKey: String = "id",
     cursorColumn: String = "updatedAt",    // change-time column the cursor orders/filters/advances by
+                                           // — server-stamped: never included in an upload payload
     dependsOn: [String] = [],              // FK parents; drives sync + delete ordering
     jsonColumns: [String] = [],            // JSON text locally ↔ json/jsonb remote
-    serverOwnedColumns: [String] = [],     // RPC-managed; stripped from every upsert, applied on download
+    serverOwnedColumns: [String] = [],     // *extra* RPC-managed columns; stripped too, applied on download
     scopeColumn: String? = nil,            // partition column when RLS is broader than the partition
     conflictColumns: [String] = [],        // secondary-unique upsert target; LEAF tables only
     serverColumns: [String] = []           // optional allow-list to survive a dropped/renamed column
@@ -67,6 +68,15 @@ Field gotchas:
 - **`conflictColumns`** merges a fresh-pk insert onto an existing server row by a secondary
   `UNIQUE` constraint (avoids a permanent 409). The merge **re-keys the server row to the client's
   pk**, so declaring it on a non-leaf table orphans children — **leaf tables only**.
+- **`cursorColumn`** is server-stamped by contract, so the engine strips it from **every** upload
+  payload — you declare nothing, and there's no way to opt out. It's defence in depth for the one
+  server-side requirement the engine can't verify: on a table whose `updatedAt` trigger is missing,
+  an uploaded client value would stick and that device's clock would silently become the LWW
+  ordering authority. Consequence: an insert-only table's stamp column needs a server
+  `default now()`, since the client never supplies it. `deletedAt` is *not* stripped — an upsert
+  carrying `deletedAt = null` is how a re-created row un-tombstones.
+- **`serverOwnedColumns`** lists only the *extra* server-owned columns (RPC-managed counters and the
+  like); the cursor column is already covered.
 - **`serverColumns`** is an opt-in client-side backstop; a stale list silently stops uploading a
   real column. Prefer the operational client-first removal rule; use this only when you accept the
   maintenance cost. Downloads need no equivalent — they intersect against the local schema.

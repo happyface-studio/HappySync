@@ -33,6 +33,9 @@ final class StatusBroadcaster: Sendable {
         }
     }
 
+    /// The most recent snapshot — what a new subscriber would replay.
+    var latest: SyncStatus { state.withLock { $0.latest } }
+
     /// Records the new status and fans it out. Yields outside the lock to avoid reentrancy.
     func send(_ status: SyncStatus) {
         let continuations = state.withLock { s -> [AsyncStream<SyncStatus>.Continuation] in
@@ -42,6 +45,10 @@ final class StatusBroadcaster: Sendable {
         for continuation in continuations { continuation.yield(status) }
     }
 
+    /// Terminates every subscriber's stream and drops them. **Disposal only** — reserved for the
+    /// engine's `deinit`. `stop()` must not call this: a subscriber loop (`for await status in
+    /// engine.status` inside a SwiftUI `.task`) would exit for good, so a later `start()` would
+    /// broadcast to nobody and the status UI would stay dead for the rest of the process (issue #45).
     func finish() {
         let continuations = state.withLock { s -> [AsyncStream<SyncStatus>.Continuation] in
             let all = Array(s.subscribers.values)
@@ -153,6 +160,9 @@ public actor SyncEngine {
 
     /// Live engine status. Each access returns an independent stream that replays the latest
     /// snapshot, so multiple consumers (status UI, refresh loop) can observe concurrently.
+    ///
+    /// A stream stays alive for as long as the engine does — `stop()` settles it but doesn't end it —
+    /// so a view can subscribe once and keep receiving updates across a stop/start cycle (issue #45).
     public nonisolated var status: AsyncStream<SyncStatus> {
         statusBroadcaster.subscribe()
     }
@@ -257,10 +267,17 @@ public actor SyncEngine {
         poke() // converge immediately on start (the first pass also subscribes the doorbell)
     }
 
-    /// Stops background sync and finishes all status streams. **Awaits the in-flight sync pass**
-    /// before returning: after `await stop()` the engine has quiesced — no further DB writes and no
-    /// network calls — so a consumer can safely wipe or repurpose the database (e.g. on sign-out /
-    /// account switch). Idempotent. See APPS-473 and the README teardown section.
+    /// Stops background sync. **Awaits the in-flight sync pass** before returning: after
+    /// `await stop()` the engine has quiesced — no further DB writes and no network calls — so a
+    /// consumer can safely wipe or repurpose the database (e.g. on sign-out / account switch).
+    /// Idempotent. See APPS-473 and the README teardown section.
+    ///
+    /// Status streams **stay open** across teardown: `stop()` broadcasts a settled status and leaves
+    /// every subscriber registered, so the usual long-lived consumer (`for await status in
+    /// engine.status` inside a SwiftUI `.task`) keeps receiving updates after a later `start()`.
+    /// Terminating the streams here would silently kill the status UI for the rest of the process on
+    /// the very flow this API exists to serve — sign-out → wipe → sign-in (issue #45). Only `deinit`
+    /// finishes them.
     public func stop() async {
         // Ahead of the `isRunning` guard: an engine that was never started still owes the caller
         // quiescence before they wipe the store, and `enqueue` works without `start()` (issue #46).
@@ -277,6 +294,32 @@ public actor SyncEngine {
         runnerTask = nil; triggersTask = nil; doorbellTask = nil
         await awaitEnqueueQuiescence()        // and any enqueue suspended inside its transaction (issue #46)
         doorbellState = .idle                 // a later start() re-subscribes from scratch
+        // Settle the status rather than finishing the streams (issue #45). A pass that was mid-flight
+        // left `.syncing` broadcast, and nothing is syncing any more — so land on `.idle`, and drop a
+        // `.failed` reason from the last pass too: with the engine stopped nothing is retrying it, so
+        // it's no longer live state. The outbox counts carry over — teardown doesn't touch the outbox,
+        // so `failedUploads`/`deadLetters` stay visible across a stop.
+        statusBroadcaster.send(transitionalStatus(.idle))
+    }
+
+    /// A status for a phase change that doesn't itself re-derive the outbox counts — `.syncing` at the
+    /// head of a pass, `.failed` when one throws, and the settled `.idle` `stop()` broadcasts — carrying
+    /// `failedUploads`/`deadLetters` over from the last broadcast. Those counts describe the outbox, not
+    /// the pass: zeroing them would blink a degraded-sync indicator off for the length of every pass,
+    /// and since `stop()` settles from the last broadcast it would also hide a parked write across
+    /// teardown (issue #45). The settled `.idle` at the end of a pass re-reads both from the DB.
+    private func transitionalStatus(_ phase: SyncStatus.Phase) -> SyncStatus {
+        let previous = statusBroadcaster.latest
+        return SyncStatus(
+            phase: phase, lastSyncedAt: lastSyncedAt,
+            failedUploads: previous.failedUploads, deadLetters: previous.deadLetters
+        )
+    }
+
+    /// The one genuine disposal path: the engine is going away, so no `start()` can follow and the
+    /// status streams should terminate instead of hanging their consumers forever. `stop()` deliberately
+    /// does *not* do this — see its documentation and issue #45.
+    deinit {
         statusBroadcaster.finish()
     }
 
@@ -398,7 +441,7 @@ public actor SyncEngine {
         // right partition here — before the pull — without a stop/start (APPS-509).
         updateDoorbellScope(await scope())
         log.debug("sync pass starting")
-        statusBroadcaster.send(SyncStatus(phase: .syncing, lastSyncedAt: lastSyncedAt))
+        statusBroadcaster.send(transitionalStatus(.syncing))
         var resyncDeferred = false
         do {
             // Stale-cursor guard (APPS-471): if this device is past the offline horizon, full-resync
@@ -427,7 +470,7 @@ public actor SyncEngine {
             return SyncStatus(phase: .idle, lastSyncedAt: lastSyncedAt)
         } catch {
             log.error("sync pass failed: \(String(describing: error), privacy: .public)")
-            statusBroadcaster.send(SyncStatus(phase: .failed("\(error)"), lastSyncedAt: lastSyncedAt))
+            statusBroadcaster.send(transitionalStatus(.failed("\(error)")))
             throw error
         }
         lastSyncedAt = now
@@ -1040,7 +1083,7 @@ public actor SyncEngine {
             return RowCoding.payload(
                 from: row,
                 jsonColumns: Set(spec.jsonColumns),
-                excluding: Set(spec.serverOwnedColumns),
+                excluding: spec.uploadExcludedColumns,
                 restrictingTo: spec.serverColumns.isEmpty ? nil : Set(spec.serverColumns)
             )
         }
