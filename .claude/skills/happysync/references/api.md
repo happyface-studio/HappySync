@@ -163,8 +163,8 @@ public enum SyncError: Error, CustomStringConvertible {
 
 public enum ManifestProblem: Equatable, CustomStringConvertible {
     case duplicateDeclaration                            // the same table declared twice
-    case noSuchTable                                     // no local table of that name
-    case noSuchColumn(field: String, column: String)     // a field names a column the table lacks
+    case noSuchTable(didYouMean: String?)                // no local table of that name
+    case noSuchColumn(field: String, column: String, didYouMean: String?)
     case unknownDependency(String)                       // dependsOn names an undeclared SyncTable
     case conflictColumnsOnParentTable(referencedBy: String)
     case serverColumnsOmitPrimaryKey(String)
@@ -177,8 +177,10 @@ public enum ManifestProblem: Equatable, CustomStringConvertible {
 trigger, and the error names the table, the field and the value. What's checked:
 
 - `name` is a local table; `primaryKey`, `cursorColumn`, `scopeColumn`, `jsonColumns`,
-  `conflictColumns` and `serverOwnedColumns` each name a column on it (case-insensitively, as SQLite
-  matches identifiers).
+  `conflictColumns` and `serverOwnedColumns` each name a column on it, **spelled exactly**. Case
+  counts even though SQLite would resolve either spelling — these names reach PostgREST verbatim and
+  Postgres matches quoted (camelCase) identifiers case-sensitively, so `scopeColumn: "userID"` on a
+  `userId` column works locally and fails on the wire. Case-only mismatches get a "did you mean".
 - `serverColumns` is **not** checked against the local schema — it describes the server's schema,
   which is allowed to differ — but it may not omit the primary key.
 - `conflictColumns` is rejected on a table anything else foreign-keys (the leaf-only rule, now

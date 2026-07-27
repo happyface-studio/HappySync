@@ -65,58 +65,69 @@ private func manifestDB() throws -> DatabaseQueue {
 // MARK: - Every field that names a column is checked
 
 @Test func initRejectsAScopeColumnTheTableDoesNotHave() throws {
-    // `userID` vs `userId`. Unchecked, the filter matches nothing (every pull comes back empty) or
-    // PostgREST 400s — and on a table whose RLS is deliberately broader than the partition, an
-    // unfiltered pull downloads the whole public catalog to every device.
-    let fault = try #require(try problem(manifestDB(), [SyncTable(name: "recipes", scopeColumn: "userID")]))
+    // Unchecked, the filter matches nothing (every pull comes back empty) or PostgREST 400s — and on
+    // a table whose RLS is deliberately broader than the partition, an unfiltered pull downloads the
+    // whole public catalog to every device.
+    let fault = try #require(try problem(manifestDB(), [SyncTable(name: "recipes", scopeColumn: "ownerId")]))
     #expect(fault.table == "recipes")
-    #expect(fault.reason == .noSuchColumn(field: "scopeColumn", column: "userID"))
+    #expect(fault.reason == .noSuchColumn(field: "scopeColumn", column: "ownerId", didYouMean: nil))
 }
 
 @Test func initRejectsAJSONColumnTheTableDoesNotHave() throws {
     // The quietest of them all: the real column stores escaped JSON *text* instead of a JSON value,
     // and corrupts in both directions with nothing to report it.
     let fault = try #require(try problem(manifestDB(), [SyncTable(name: "recipes", jsonColumns: ["nutritian"])]))
-    #expect(fault.reason == .noSuchColumn(field: "jsonColumns", column: "nutritian"))
+    #expect(fault.reason == .noSuchColumn(field: "jsonColumns", column: "nutritian", didYouMean: nil))
 }
 
 @Test func initRejectsACursorColumnTheTableDoesNotHave() throws {
     // Every pull orders by a column that isn't there — a hard failure, or a cursor that never advances.
     let fault = try #require(try problem(manifestDB(), [SyncTable(name: "recipes", cursorColumn: "modifiedAt")]))
-    #expect(fault.reason == .noSuchColumn(field: "cursorColumn", column: "modifiedAt"))
+    #expect(fault.reason == .noSuchColumn(field: "cursorColumn", column: "modifiedAt", didYouMean: nil))
 }
 
 @Test func initRejectsAPrimaryKeyColumnTheTableDoesNotHave() throws {
     let fault = try #require(try problem(manifestDB(), [SyncTable(name: "recipes", primaryKey: "uuid")]))
-    #expect(fault.reason == .noSuchColumn(field: "primaryKey", column: "uuid"))
+    #expect(fault.reason == .noSuchColumn(field: "primaryKey", column: "uuid", didYouMean: nil))
 }
 
 @Test func initRejectsAConflictColumnTheTableDoesNotHave() throws {
     let fault = try #require(
         try problem(manifestDB(), [SyncTable(name: "recipeIngredients", conflictColumns: ["recipe_id"])])
     )
-    #expect(fault.reason == .noSuchColumn(field: "conflictColumns", column: "recipe_id"))
+    #expect(fault.reason == .noSuchColumn(field: "conflictColumns", column: "recipe_id", didYouMean: nil))
 }
 
 @Test func initRejectsAServerOwnedColumnTheTableDoesNotHave() throws {
     // Not data loss, but dead configuration: the column it was meant to protect is uploaded on every
     // write, clobbering the server's authoritative value.
     let fault = try #require(try problem(manifestDB(), [SyncTable(name: "recipes", serverOwnedColumns: ["cookedCount"])]))
-    #expect(fault.reason == .noSuchColumn(field: "serverOwnedColumns", column: "cookedCount"))
+    #expect(fault.reason == .noSuchColumn(field: "serverOwnedColumns", column: "cookedCount", didYouMean: nil))
 }
 
 @Test func initRejectsATableTheDatabaseDoesNotHave() throws {
     // `recipe` (singular) simply never synced — no error, no log, no status change.
     let fault = try #require(try problem(manifestDB(), [SyncTable(name: "recipe")]))
     #expect(fault.table == "recipe")
-    #expect(fault.reason == .noSuchTable)
+    #expect(fault.reason == .noSuchTable(didYouMean: nil))
 }
 
-@Test func columnChecksAreCaseInsensitiveLikeSQLite() throws {
-    // SQLite resolves identifiers case-insensitively, so `UserId` really is the partition column and
-    // faulting it would be a false alarm on a working manifest.
-    let fault = try problem(manifestDB(), [SyncTable(name: "recipes", scopeColumn: "UserId")])
-    #expect(fault == nil)
+@Test func initRejectsAColumnThatDiffersFromTheSchemaOnlyInCase() throws {
+    // `userID` vs `userId` — the likeliest typo of the whole set, and the one that reads as a false
+    // alarm. SQLite *would* resolve either spelling, which is exactly why this is a trap: the local
+    // half works. But `scopeColumn` goes to PostgREST verbatim (`.eq(column, value:)`), and a
+    // camelCase Postgres column is a quoted identifier the server matches case-sensitively — so the
+    // pull 400s or silently filters on nothing. Same for `cursorColumn`, `primaryKey` and
+    // `conflictColumns` on the wire, and for `jsonColumns` / `serverOwnedColumns`, which
+    // `RowCoding.payload` matches by exact string equality against the local row's column names.
+    let fault = try #require(try problem(manifestDB(), [SyncTable(name: "recipes", scopeColumn: "userID")]))
+    #expect(fault.reason == .noSuchColumn(field: "scopeColumn", column: "userID", didYouMean: "userId"))
+}
+
+@Test func initRejectsATableThatDiffersFromTheSchemaOnlyInCase() throws {
+    // Same reasoning one level up: the table name is `client.from(table)`, sent verbatim.
+    let fault = try #require(try problem(manifestDB(), [SyncTable(name: "Recipes")]))
+    #expect(fault.reason == .noSuchTable(didYouMean: "recipes"))
 }
 
 @Test func serverColumnsAreNotCheckedAgainstTheLocalSchema() throws {
@@ -300,7 +311,7 @@ private func manifestDB() throws -> DatabaseQueue {
     // its own — a bare `invalidManifest(table:reason:)` in a stack trace is not actionable.
     let message = String(
         describing: SyncError.invalidManifest(
-            table: "recipes", reason: .noSuchColumn(field: "scopeColumn", column: "userID")
+            table: "recipes", reason: .noSuchColumn(field: "scopeColumn", column: "userID", didYouMean: "userId")
         )
     )
     #expect(message.contains("recipes"))

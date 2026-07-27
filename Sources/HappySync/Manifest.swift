@@ -13,10 +13,13 @@ public enum ManifestProblem: Sendable, Equatable, CustomStringConvertible {
     /// Two `SyncTable`s name the same table. The second would install identical triggers and drain
     /// the same rows twice under whichever spec `drainOutbox` happened to look up.
     case duplicateDeclaration
-    /// No local table of that name — the manifest and the schema disagree.
-    case noSuchTable
-    /// A field naming a column names one the local table doesn't have.
-    case noSuchColumn(field: String, column: String)
+    /// No local table of that name — the manifest and the schema disagree. `didYouMean` carries a
+    /// table that differs only in case, which SQLite would resolve but PostgREST would not.
+    case noSuchTable(didYouMean: String?)
+    /// A field naming a column names one the local table doesn't have. `didYouMean` carries a column
+    /// that differs only in case — the likeliest form of this mistake, and the one that reads as a
+    /// false alarm until you know these names are sent to Postgres verbatim.
+    case noSuchColumn(field: String, column: String, didYouMean: String?)
     /// `dependsOn` names a table that isn't itself declared, so the ordering it asks for can't be
     /// applied — the entry is dead configuration.
     case unknownDependency(String)
@@ -31,10 +34,18 @@ public enum ManifestProblem: Sendable, Equatable, CustomStringConvertible {
         switch self {
         case .duplicateDeclaration:
             "declared more than once in `tables`"
-        case .noSuchTable:
+        case .noSuchTable(nil):
             "there is no local table of that name — run the app's migrations before constructing the engine"
-        case .noSuchColumn(let field, let column):
+        case .noSuchTable(.some(let actual)):
+            """
+            there is no local table spelled that way — did you mean \"\(actual)\"? \(Self.verbatimNote)
+            """
+        case .noSuchColumn(let field, let column, nil):
             "`\(field)` names \"\(column)\", which is not a column on this table"
+        case .noSuchColumn(let field, let column, .some(let actual)):
+            """
+            `\(field)` names \"\(column)\", but the column is spelled \"\(actual)\". \(Self.verbatimNote)
+            """
         case .unknownDependency(let name):
             "`dependsOn` names \"\(name)\", which is not a declared SyncTable"
         case .conflictColumnsOnParentTable(let child):
@@ -46,6 +57,13 @@ public enum ManifestProblem: Sendable, Equatable, CustomStringConvertible {
             "`serverColumns` is non-empty but omits the primary key \"\(primaryKey)\", so every upload would be keyless"
         }
     }
+
+    /// Why a case-only difference is still an error, which is the least obvious of these and the one
+    /// most likely to be read as a false alarm.
+    private static let verbatimNote = """
+        SQLite would resolve either spelling, but these names are sent to PostgREST verbatim — and a \
+        camelCase Postgres identifier is quoted, so the server matches it case-sensitively.
+        """
 }
 
 /// Checks the declared manifest against the local schema and fills in what the schema already knows
@@ -76,32 +94,45 @@ enum SyncManifest {
             }
         }
 
-        let graph = try ForeignKeyGraph(db)
+        let schema = try LocalSchema(db)
 
         return try tables.map { spec in
-            guard try db.tableExists(spec.name) else {
-                throw SyncError.invalidManifest(table: spec.name, reason: .noSuchTable)
+            guard schema.tables.contains(spec.name) else {
+                throw SyncError.invalidManifest(
+                    table: spec.name,
+                    reason: .noSuchTable(didYouMean: nearMiss(spec.name, among: schema.tables))
+                )
             }
             try checkColumns(db, spec)
-            try checkLeafRule(spec, graph: graph)
-            return spec.dependingOn(try resolveDependencies(spec, declared: declared, graph: graph))
+            try checkLeafRule(spec, schema: schema)
+            return spec.dependingOn(try resolveDependencies(spec, declared: declared, schema: schema))
         }
     }
 
-    /// Every field that names a column must name one the table has. `serverColumns` is deliberately
-    /// exempt: it describes the *server's* schema, which is allowed to differ from the local one —
-    /// that's the whole reason it exists (APPS-504). The one thing about it that is checkable locally
-    /// is that it can't omit the primary key, since the payload is intersected against it.
+    /// Every field that names a column must name one the table has, **spelled identically**.
+    ///
+    /// Exact, not case-insensitive, even though SQLite resolves identifiers case-insensitively — and
+    /// that's the whole point. `primaryKey`, `cursorColumn`, `scopeColumn` and `conflictColumns` are
+    /// handed to PostgREST verbatim (`.eq`, `.order`, `on_conflict=`), where a camelCase Postgres
+    /// column is a quoted identifier and matches case-sensitively; `jsonColumns` and
+    /// `serverOwnedColumns` are matched by exact string equality against the local row's column names
+    /// in `RowCoding.payload`. So `scopeColumn: "userID"` against a `userId` column is a real defect —
+    /// the local half works and the wire half doesn't — and a check that accepted it would wave
+    /// through the likeliest typo of the set.
+    ///
+    /// `serverColumns` is deliberately exempt from the existence check: it describes the *server's*
+    /// schema, which is allowed to differ from the local one — that's the whole reason it exists
+    /// (APPS-504). The one thing about it that is checkable locally is that it can't omit the primary
+    /// key, since the payload is intersected against it.
     private static func checkColumns(_ db: Database, _ spec: SyncTable) throws {
-        let columns = try RowCoding.tableColumns(db, table: spec.name)
-        let known = Set(columns.map { $0.lowercased() })
+        let known = try RowCoding.tableColumns(db, table: spec.name)
 
         func require(_ column: String, _ field: String) throws {
-            guard known.contains(column.lowercased()) else {
-                throw SyncError.invalidManifest(
-                    table: spec.name, reason: .noSuchColumn(field: field, column: column)
-                )
-            }
+            if known.contains(column) { return }
+            throw SyncError.invalidManifest(
+                table: spec.name,
+                reason: .noSuchColumn(field: field, column: column, didYouMean: nearMiss(column, among: known))
+            )
         }
 
         try require(spec.primaryKey, "primaryKey")
@@ -111,12 +142,17 @@ enum SyncManifest {
         for column in spec.conflictColumns { try require(column, "conflictColumns") }
         for column in spec.serverOwnedColumns { try require(column, "serverOwnedColumns") }
 
-        if !spec.serverColumns.isEmpty,
-           !spec.serverColumns.contains(where: { $0.lowercased() == spec.primaryKey.lowercased() }) {
+        if !spec.serverColumns.isEmpty, !spec.serverColumns.contains(spec.primaryKey) {
             throw SyncError.invalidManifest(
                 table: spec.name, reason: .serverColumnsOmitPrimaryKey(spec.primaryKey)
             )
         }
+    }
+
+    /// The one name in `candidates` that differs from `name` only in case, if there is one — the
+    /// "did you mean" on a `noSuchTable` / `noSuchColumn` fault.
+    private static func nearMiss(_ name: String, among candidates: Set<String>) -> String? {
+        candidates.first { $0.lowercased() == name.lowercased() }
     }
 
     /// `conflictColumns` documents itself as "only safe on a leaf table … or you orphan its
@@ -125,9 +161,9 @@ enum SyncManifest {
     ///
     /// The scan covers *every* local table, not just the synced ones — an unsynced child is orphaned
     /// by the re-key just the same.
-    private static func checkLeafRule(_ spec: SyncTable, graph: ForeignKeyGraph) throws {
+    private static func checkLeafRule(_ spec: SyncTable, schema: LocalSchema) throws {
         guard !spec.conflictColumns.isEmpty else { return }
-        if let child = graph.firstChild(of: spec.name, referencing: spec.primaryKey) {
+        if let child = schema.firstChild(of: spec.name, referencing: spec.primaryKey) {
             throw SyncError.invalidManifest(
                 table: spec.name, reason: .conflictColumnsOnParentTable(referencedBy: child)
             )
@@ -153,10 +189,10 @@ enum SyncManifest {
     /// real schema shape, and `topologicalOrder` already emits such a pair in declared order rather
     /// than hanging. Derivation only makes it reachable; it isn't new.
     private static func resolveDependencies(
-        _ spec: SyncTable, declared: [String: String], graph: ForeignKeyGraph
+        _ spec: SyncTable, declared: [String: String], schema: LocalSchema
     ) throws -> [String] {
         guard let names = spec.dependsOn else {
-            return graph.parents(of: spec.name)
+            return schema.parents(of: spec.name)
                 .compactMap { declared[$0.lowercased()] }
                 .filter { $0.lowercased() != spec.name.lowercased() }
         }
@@ -171,12 +207,16 @@ enum SyncManifest {
     }
 }
 
-/// The local database's foreign-key graph, read once per engine init.
+/// What the local schema says, read once per engine init: the app's table names as SQLite spells
+/// them, plus the foreign-key graph in both directions.
 ///
-/// Both directions are needed and both come from the same `PRAGMA foreign_key_list` pass: parents to
-/// derive `dependsOn`, children to enforce the `conflictColumns` leaf rule. Every user table is
-/// scanned, not just the synced ones — an unsynced child still makes a synced table a non-leaf.
-private struct ForeignKeyGraph {
+/// Both FK directions come from the same `PRAGMA foreign_key_list` pass: parents to derive
+/// `dependsOn`, children to enforce the `conflictColumns` leaf rule. Every user table is scanned, not
+/// just the synced ones — an unsynced child still makes a synced table a non-leaf.
+private struct LocalSchema {
+    /// Every app table, spelled as `CREATE TABLE` spelled it. The manifest must match exactly: the
+    /// name goes to PostgREST verbatim, where it is case-sensitive.
+    private(set) var tables: Set<String> = []
     /// child table → the tables it references, in `foreign_key_list` order, de-duplicated.
     private var parentsByChild: [String: [String]] = [:]
     /// parent table → (child table, referenced column) for every FK pointing at it. The column is nil
@@ -186,11 +226,12 @@ private struct ForeignKeyGraph {
     init(_ db: Database) throws {
         // Filtered in Swift rather than with `NOT LIKE`, where `_` is itself a single-character
         // wildcard and `'_sync_%'` would quietly match more than the engine's own tables.
-        let tables = try String
+        let names = try String
             .fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'table'")
             .filter { !$0.hasPrefix("sqlite_") && !$0.hasPrefix(SyncSchema.tablePrefix) }
+        tables = Set(names)
 
-        for child in tables {
+        for child in names {
             var parents: [String] = []
             for row in try Row.fetchAll(db, sql: "PRAGMA foreign_key_list(\(Self.quoted(child)))") {
                 let parent: String = row["table"]

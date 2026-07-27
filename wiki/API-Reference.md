@@ -126,8 +126,8 @@ public enum SyncError: Error, CustomStringConvertible {
 
 public enum ManifestProblem: Equatable, CustomStringConvertible {
     case duplicateDeclaration                             // the same table declared twice
-    case noSuchTable                                      // no local table of that name
-    case noSuchColumn(field: String, column: String)      // a field names a column the table lacks
+    case noSuchTable(didYouMean: String?)                 // no local table of that name
+    case noSuchColumn(field: String, column: String, didYouMean: String?)
     case unknownDependency(String)                        // dependsOn names an undeclared SyncTable
     case conflictColumnsOnParentTable(referencedBy: String)
     case serverColumnsOmitPrimaryKey(String)
@@ -142,8 +142,11 @@ Each of these used to fail silently and late — the wrong partition downloads, 
 both directions, an FK-order violation surfaces days later as a dead letter on another device.
 
 - `name` must be a local table; `primaryKey`, `cursorColumn`, `scopeColumn`, `jsonColumns`,
-  `conflictColumns` and `serverOwnedColumns` must each name a column on it (matched
-  case-insensitively, as SQLite does).
+  `conflictColumns` and `serverOwnedColumns` must each name a column on it, **spelled exactly** as
+  the schema spells it. Case counts even though SQLite would resolve either spelling: these names go
+  to PostgREST verbatim, and a camelCase Postgres identifier is quoted and matched
+  case-sensitively — so `scopeColumn: "userID"` against a `userId` column works locally and 400s (or
+  silently filters on nothing) on the wire. A case-only mismatch is reported with a "did you mean".
 - `serverColumns` is **not** checked against the local schema — it describes the *server's* schema,
   which is allowed to differ. It may not omit the primary key, since the payload is intersected
   against it.
