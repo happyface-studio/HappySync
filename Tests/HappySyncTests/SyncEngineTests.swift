@@ -79,3 +79,12 @@ private func makeEngine(tables: [SyncTable] = []) throws -> SyncEngine {
     let engine = try makeEngine()
     try await engine.pullNow() // no tables declared → nothing to pull, must not throw
 }
+
+@Test func pullNowReturnsNothing() async throws {
+    // Issue #55: the pull's `[String: Set<String>]` is `fullResync`'s input, and its subtlest property
+    // — a skipped scoped table has no entry, which is not the same as an empty set — is an invariant
+    // of that reconcile. Nothing outside the engine can act on it correctly, so the public entry point
+    // hands back Void. This annotation is the assertion: it stops compiling if the value comes back.
+    let engine = try makeEngine()
+    let _: Void = try await engine.pullNow()
+}

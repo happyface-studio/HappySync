@@ -22,7 +22,7 @@ public init(
 | `func stop() async` | **Async.** Awaits the in-flight pass, quiesces (no more DB writes / network), unsubscribes Realtime. Settles `status` to `.idle` but leaves subscriptions open. `start()` re-subscribes cleanly. Call **before** wiping/replacing the DB. |
 | `func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws` | **Deprecated.** Performs the write; the table's capture trigger queues it. Write GRDB directly instead. Throws `SyncError`. |
 | `func syncNow()` | Fire-and-forget nudge (foreground, pull-to-refresh). Not needed after a write — the engine wakes on queued writes itself. |
-| `@discardableResult func pullNow() async throws -> [String: Set<String>]` | Cursor pull now; returns server primary keys seen per table. |
+| `func pullNow() async throws` | Cursor pull now — the app-driven nudge (foreground return, pull-to-refresh). Returns nothing. |
 | `var status: AsyncStream<SyncStatus>` | `nonisolated`. Live status for the UI. Each access is an independent stream replaying the latest snapshot; it survives `stop()`/`start()` and only ends when the engine is deallocated. |
 | `func deadLetters() async throws -> [DeadLetter]` | Inspect parked entries. |
 | `func retryDeadLetters(_ seqs: [Int64]? = nil) async throws` | Re-queue parked writes (specific `seq`s, or all). |
@@ -117,7 +117,6 @@ public struct DeadLetter {
 public enum SyncOp: String, Codable { case upsert; case delete }
 
 public enum SyncError: Error, CustomStringConvertible {
-    case notImplemented(String)
     case unknownTable(String)                      // deprecated enqueue on an undeclared table
     case missingPrimaryKey(table: String, column: String)
     case encoding(String)

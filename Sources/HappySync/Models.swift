@@ -226,8 +226,6 @@ public struct DeadLetter: Sendable {
 
 /// Errors thrown by the engine's public API.
 public enum SyncError: Error, Sendable, CustomStringConvertible {
-    /// Functionality scheduled for a later milestone is not wired up yet.
-    case notImplemented(String)
     /// The deprecated `enqueue` shim was called for a table not declared in the engine's `tables`.
     case unknownTable(String)
     /// The encoded row had no value for the table's primary-key column.
@@ -251,8 +249,6 @@ public enum SyncError: Error, Sendable, CustomStringConvertible {
     /// most of these are configuration errors surfaced at app launch.
     public var description: String {
         switch self {
-        case .notImplemented(let what):
-            "HappySync: \(what) is not implemented yet"
         case .unknownTable(let table):
             "HappySync: enqueue(table: \"\(table)\") — no SyncTable of that name is declared"
         case .missingPrimaryKey(let table, let column):
