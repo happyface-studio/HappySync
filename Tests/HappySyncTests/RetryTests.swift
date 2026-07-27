@@ -246,9 +246,10 @@ private func httpError(_ code: Int) -> HTTPError {
     try await engine.runSyncOnce() // attempt 1 fails; pull succeeds
     var firstStatus = engine.status.makeAsyncIterator()
     let afterFail = await firstStatus.next() // replayed latest snapshot
-    #expect(afterFail?.phase == .idle)     // pull succeeded, so not .failed…
-    #expect(afterFail?.failedUploads == 1) // …but the failing upload is surfaced, not hidden as healthy
+    #expect(afterFail?.phase == .degraded) // the pass completed, so not .failed — but not .idle either…
+    #expect(afterFail?.failedUploads == 1) // …because the failing upload is surfaced, not hidden as healthy
     #expect(afterFail?.deadLetters == 0)
+    #expect(afterFail?.isHealthy == false)
 
     try await agePastBackoff(db)
     try await engine.runSyncOnce() // attempt 2 hits the cap → parked
@@ -256,6 +257,8 @@ private func httpError(_ code: Int) -> HTTPError {
     let afterPark = await secondStatus.next()
     #expect(afterPark?.failedUploads == 0) // no longer actively retrying…
     #expect(afterPark?.deadLetters == 1)   // …now surfaced as a dead-letter for the consumer to repair
+    #expect(afterPark?.phase == .degraded) // a parked write is still degraded — nothing reached the server
+    #expect(afterPark?.isHealthy == false)
 }
 
 @Test func statusStaysFailingWhenDrainSkipsEntryInBackoffWindow() async throws {
@@ -272,8 +275,8 @@ private func httpError(_ code: Int) -> HTTPError {
 
     var iter = engine.status.makeAsyncIterator()
     let settled = await iter.next()
-    #expect(settled?.phase == .idle)         // pull succeeded, so not .failed…
-    #expect(settled?.failedUploads == 1)     // …and the skipped-but-failing upload is still surfaced
+    #expect(settled?.phase == .degraded)     // pull succeeded, so not .failed — and not healthy either…
+    #expect(settled?.failedUploads == 1)     // …because the skipped-but-failing upload is still surfaced
     #expect(settled?.deadLetters == 0)
     // The drain genuinely skipped the second attempt (proves the pass count would have been 0).
     #expect(await remote.upsertCalls.count == 1)

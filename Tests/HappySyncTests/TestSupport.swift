@@ -19,6 +19,7 @@ actor FakeRemote: SyncRemote {
     private var remainingFetchFailures: Int
     private let permanentUpsertFailures: Bool
     private let upsertError: Error?
+    private let fetchError: Error?
     private let dataset: [String: [[String: AnyJSON]]]
 
     /// - failUpserts: number of upserts that throw before succeeding.
@@ -28,17 +29,21 @@ actor FakeRemote: SyncRemote {
     ///   or a `PostgrestError`). It's wrapped in `RemoteFailure` with the production classification,
     ///   exactly as `SupabaseRemote` does — so the drain sees a faithfully-classified failure. Takes
     ///   precedence over `permanentUpserts`.
+    /// - fetchError: the same, for each failed fetch — so a test can drive a whole sync *pass* to a
+    ///   chosen failure and assert the `SyncFailure` the status carries (issue #52).
     init(
         failUpserts: Int = 0,
         failFetches: Int = 0,
         permanentUpserts: Bool = false,
         upsertError: Error? = nil,
+        fetchError: Error? = nil,
         dataset: [String: [[String: AnyJSON]]] = [:]
     ) {
         remainingFailures = failUpserts
         remainingFetchFailures = failFetches
         permanentUpsertFailures = permanentUpserts
         self.upsertError = upsertError
+        self.fetchError = fetchError
         self.dataset = dataset
     }
 
@@ -69,7 +74,14 @@ actor FakeRemote: SyncRemote {
     func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]] {
         fetchCalls += 1
         lastScope = scope
-        if remainingFetchFailures > 0 { remainingFetchFailures -= 1; throw Failure.simulated }
+        if remainingFetchFailures > 0 {
+            remainingFetchFailures -= 1
+            if let fetchError {
+                // Mirror SupabaseRemote.classify, as the upsert path does.
+                throw RemoteFailure(isPermanent: remoteErrorIsPermanent(fetchError), underlying: fetchError)
+            }
+            throw Failure.simulated
+        }
         let scoped = (dataset[table] ?? []).filter { row in
             guard let scope else { return true }
             return row[scope.column]?.stringValue == scope.value

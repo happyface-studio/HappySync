@@ -78,5 +78,15 @@ enum SyncSchema {
             }
             try db.execute(sql: "INSERT INTO \(controlTable) (id, applying) VALUES (1, 0)")
         }
+
+        // Issue #52: the classified cause of an entry's last failure, alongside the `last_error` text.
+        // `DeadLetter` is rebuilt from this table long after the live `Error` is gone, so the
+        // classification has to be persisted rather than re-derived from prose. Nullable: entries that
+        // parked before this migration keep a NULL here and decode to `SyncFailure.other`.
+        migrator.registerMigration("happysync_v5_failure_kind") { db in
+            try db.alter(table: outboxTable) { t in
+                t.add(column: "failure_kind", .text)
+            }
+        }
     }
 }
