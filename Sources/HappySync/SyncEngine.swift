@@ -172,7 +172,11 @@ public actor SyncEngine {
     /// - Parameters:
     ///   - db: GRDB writer (`DatabaseQueue` or `DatabasePool`) — the local source of truth.
     ///   - supabase: Supabase client for PostgREST upsert/pull and the Realtime doorbell.
-    ///   - tables: Synced tables in any order; the engine sorts them by `dependsOn`.
+    ///   - tables: Synced tables **in any order** — the engine sorts them by `dependsOn`, which it
+    ///     derives from the schema's own foreign keys unless a spec declares one (issue #49). Each is
+    ///     validated against the local schema here, so a field naming a column the table doesn't have
+    ///     throws `SyncError.invalidManifest` rather than syncing wrong: run the app's migrations
+    ///     before constructing the engine.
     ///   - auth: Returns a fresh Supabase access token, called before each authenticated batch.
     ///   - scope: Resolves the current user's download-partition value (auth uid) for tables that
     ///     declare a `scopeColumn`. Defaults to `nil` (no partition beyond RLS). Called per pull, so
@@ -217,21 +221,26 @@ public actor SyncEngine {
         deadLetterAfter: Int = 8,
         maxOfflineGap: TimeInterval = 30 * 24 * 3600
     ) throws {
+        // The manifest is checked against the schema — and its `dependsOn` filled in from the schema's
+        // foreign keys — before anything else reads it, so `self.tables` only ever holds specs the
+        // database has agreed with (issue #49). Migrating first is what makes that check meaningful:
+        // the app's own tables have to exist before the manifest can be validated against them.
+        try SyncSchema.migrator().migrate(db)
+        let resolved = try db.write { try SyncManifest.resolve($0, tables: tables) }
+
         self.db = db
         self.remote = remote
-        self.tables = tables
+        self.tables = resolved
         self.pageSize = pageSize
         self.doorbell = doorbell
         self.pollInterval = pollInterval
         self.debounceInterval = debounceInterval
         self.scope = scope
-        self.hasScopedTables = tables.contains { $0.scopeColumn != nil }
+        self.hasScopedTables = resolved.contains { $0.scopeColumn != nil }
         self.deadLetterAfter = deadLetterAfter
         self.maxOfflineGap = maxOfflineGap
         self.statusBroadcaster = StatusBroadcaster(initial: SyncStatus())
         self.outboxObserver = OutboxObserver()
-
-        try SyncSchema.migrator().migrate(db)
 
         // Wake the runner when a trigger queues a write, so a direct GRDB write uploads as promptly as
         // `enqueue`'s own poke used to (issue #48). `weak self`: GRDB holds the observer only as long
@@ -254,7 +263,7 @@ public actor SyncEngine {
         try db.write { db in
             // Insurance only: `applying` is transactional, so a crash mid-apply already rolled it back.
             try SyncTriggers.setApplying(db, 0)
-            try SyncTriggers.install(db, tables: tables)
+            try SyncTriggers.install(db, tables: resolved)
         }
     }
 

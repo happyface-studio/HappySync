@@ -163,7 +163,8 @@ declares the same shape):
 - `cursorColumn` — the server-stamped change time the download cursor orders/filters/advances by;
   default `updatedAt`, overridden by an insert-only table (e.g. `translatedAt`). Server-owned by
   §1/§4: the engine strips it from every upload payload, unconditionally
-- `dependsOn` — tables referenced by FK; drives sync ordering
+- `dependsOn` — tables referenced by FK; drives sync ordering. Derived from the schema when the
+  client leaves it unset
 - `jsonColumns` — columns needing JSON encode/decode
 - `serverOwnedColumns` — *extra* RPC-managed columns stripped from upserts (the `cursorColumn` is
   stripped whether or not it's listed)

@@ -32,16 +32,12 @@ enum SyncTriggers {
     /// and only issues DDL when they differ, so the steady-state launch does one `sqlite_master` read
     /// and no schema churn.
     ///
-    /// Throws if a declared table (or its `primaryKey` column) doesn't exist locally. That's the loud
-    /// failure the old `enqueue`-only design lacked: a manifest that doesn't match the schema now
-    /// stops the engine at init instead of silently syncing nothing for that table.
+    /// Expects a manifest `SyncManifest.resolve` has already checked against the schema — a declared
+    /// table missing locally, or a `primaryKey` naming no column on it, is faulted there (issue #49)
+    /// so every manifest problem reports through one error with one shape.
     static func install(_ db: Database, tables: [SyncTable]) throws {
         var wanted: [String: String] = [:] // trigger name → the exact CREATE statement
         for spec in tables {
-            guard try db.tableExists(spec.name) else { throw SyncError.missingLocalTable(spec.name) }
-            guard try RowCoding.tableColumns(db, table: spec.name).contains(spec.primaryKey) else {
-                throw SyncError.missingPrimaryKeyColumn(table: spec.name, column: spec.primaryKey)
-            }
             for (name, sql) in statements(for: spec) { wanted[name] = sql }
         }
 

@@ -44,7 +44,7 @@ let engine = try SyncEngine(
     db: databaseQueue,
     supabase: client,
     tables: [
-        SyncTable(name: "recipes", primaryKey: "id", dependsOn: [], jsonColumns: ["nutrition"]),
+        SyncTable(name: "recipes", primaryKey: "id", jsonColumns: ["nutrition"]),
     ],
     auth: { await session.accessToken }
 )
