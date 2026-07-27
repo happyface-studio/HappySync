@@ -92,8 +92,10 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
   `PGRST301`/`PGRST302`) are transient *and* exempt from the retry budget — a stale token recovers
   out-of-band, so an expired-token stretch must not dead-letter the whole outbox. A dead-lettered
   entry stops retrying **and** stops counting as a dirty row, so
-  it never permanently blocks downloads for its key (§3 LWW). Health = `phase == .idle &&
-  failedUploads == 0 && deadLetters == 0`.
+  it never permanently blocks downloads for its key (§3 LWW). Health is `status.isHealthy`; a settled
+  pass with writes still failing or parked broadcasts `.degraded`, never `.idle`. The same
+  classification is surfaced publicly as `SyncFailure` on `Phase.failed` and `DeadLetter.failure`,
+  and persisted per outbox entry so a parked write's cause survives the process that classified it.
 - **FK ordering:** upsert parents before children; tombstone children before parents.
 - **Cascade on delete (APPS-510, revised by #48).** A parent delete must remove its child rows *and*
   tombstone them, in the **same transaction** — mirroring the server's child-tombstone trigger (§1),

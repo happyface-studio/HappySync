@@ -312,11 +312,15 @@ public actor SyncEngine {
         runnerTask = nil; triggersTask = nil; doorbellTask = nil
         doorbellState = .idle                 // a later start() re-subscribes from scratch
         // Settle the status rather than finishing the streams (issue #45). A pass that was mid-flight
-        // left `.syncing` broadcast, and nothing is syncing any more — so land on `.idle`, and drop a
-        // `.failed` reason from the last pass too: with the engine stopped nothing is retrying it, so
-        // it's no longer live state. The outbox counts carry over — teardown doesn't touch the outbox,
-        // so `failedUploads`/`deadLetters` stay visible across a stop.
-        statusBroadcaster.send(transitionalStatus(.idle))
+        // left `.syncing` broadcast, and nothing is syncing any more — so settle, and drop a `.failed`
+        // reason from the last pass too: with the engine stopped nothing is retrying it, so it's no
+        // longer live state. The outbox counts carry over — teardown doesn't touch the outbox, so
+        // `failedUploads`/`deadLetters` stay visible across a stop, and settling *through* them lands on
+        // `.degraded` rather than reporting a stopped engine with parked writes as `.idle` (issue #51).
+        let carried = statusBroadcaster.latest
+        statusBroadcaster.send(transitionalStatus(
+            SyncStatus.settledPhase(failedUploads: carried.failedUploads, deadLetters: carried.deadLetters)
+        ))
     }
 
     /// A status for a phase change that doesn't itself re-derive the outbox counts — `.syncing` at the
@@ -426,14 +430,15 @@ public actor SyncEngine {
     }
 
     /// One full sync pass: push local changes then pull remote ones, driving `status` across the
-    /// run (`.syncing` → `.idle` on success with `lastSyncedAt` stamped, or `.failed` then rethrow).
+    /// run (`.syncing` → `.idle`/`.degraded` on success with `lastSyncedAt` stamped, or `.failed` then
+    /// rethrow).
     /// The scheduler serialises these, so a push and pull never overlap.
     ///
-    /// The settled `.idle` status still carries `failedUploads`/`deadLetters`: a drain can complete
-    /// (so the *pass* is idle) while individual entries are still failing or parked. Both counts are
-    /// read from the DB — not the drain pass — so an entry skipped inside its per-entry backoff
-    /// window still surfaces as failing rather than flapping to healthy (APPS-507). Health is
-    /// `phase == .idle && failedUploads == 0 && deadLetters == 0`, not the phase alone (APPS-470).
+    /// The settled status still carries `failedUploads`/`deadLetters`: a drain can complete (so the
+    /// *pass* is over) while individual entries are still failing or parked — which settles as
+    /// `.degraded`, not `.idle` (issue #51). Both counts are read from the DB — not the drain pass — so
+    /// an entry skipped inside its per-entry backoff window still surfaces as failing rather than
+    /// flapping to healthy (APPS-507). Ask `status.isHealthy`, never the phase alone (APPS-470).
     @discardableResult
     func runSyncOnce(now: Date = Date()) async throws -> SyncStatus {
         // Keep the Realtime doorbell filtered on the current signed-in user: scope() is resolved
@@ -470,7 +475,7 @@ public actor SyncEngine {
             return SyncStatus(phase: .idle, lastSyncedAt: lastSyncedAt)
         } catch {
             log.error("sync pass failed: \(String(describing: error), privacy: .public)")
-            statusBroadcaster.send(transitionalStatus(.failed("\(error)")))
+            statusBroadcaster.send(transitionalStatus(.failed(SyncFailure.classify(error))))
             throw error
         }
         lastSyncedAt = now
@@ -500,11 +505,15 @@ public actor SyncEngine {
             ) ?? 0
             return (failing, dead)
         }
+        // `.idle` only when both counts are clean; otherwise the pass settled *degraded* — it completed,
+        // but writes are still outstanding. Deriving the phase here is what makes `.idle` mean healthy
+        // for a consumer switching on it (issue #51).
         let status = SyncStatus(
-            phase: .idle, lastSyncedAt: lastSyncedAt,
+            phase: SyncStatus.settledPhase(failedUploads: failedUploads, deadLetters: deadLetters),
+            lastSyncedAt: lastSyncedAt,
             failedUploads: failedUploads, deadLetters: deadLetters
         )
-        log.info("sync pass idle: failedUploads=\(failedUploads, privacy: .public) deadLetters=\(deadLetters, privacy: .public)")
+        log.info("sync pass settled: failedUploads=\(failedUploads, privacy: .public) deadLetters=\(deadLetters, privacy: .public)")
         statusBroadcaster.send(status)
         return status
     }
@@ -526,7 +535,7 @@ public actor SyncEngine {
             try Row.fetchAll(
                 db,
                 sql: """
-                    SELECT seq, table_name, pk, op, attempts, last_error, queued_at
+                    SELECT seq, table_name, pk, op, attempts, failure_kind, last_error, queued_at
                     FROM \(SyncSchema.outboxTable) WHERE dead_lettered = 1 ORDER BY seq
                     """
             ).map { row in
@@ -536,6 +545,9 @@ public actor SyncEngine {
                     pk: row["pk"],
                     op: SyncOp(rawValue: row["op"]) ?? .upsert,
                     attempts: row["attempts"],
+                    // Rebuilt from the stored kind, not re-derived from the message — the live Error is
+                    // long gone by the time a consumer asks (issue #52).
+                    failure: SyncFailure.decode(wire: row["failure_kind"], message: row["last_error"]),
                     lastError: row["last_error"],
                     queuedAt: row["queued_at"]
                 )
@@ -545,14 +557,17 @@ public actor SyncEngine {
 
     /// Un-parks dead-lettered entries so the drain re-uploads them — for after the cause is fixed
     /// (an RLS/policy change, a schema migration, an app update). Clears `dead_lettered` and resets
-    /// the retry bookkeeping (`attempts`, `last_attempt_at`, `last_error`) so the next drain attempts
-    /// immediately rather than inside a stale backoff window. Pass specific `seqs`, or nil for all.
+    /// the retry bookkeeping (`attempts`, `last_attempt_at`, `last_error`, `failure_kind`) so the next
+    /// drain attempts immediately rather than inside a stale backoff window, and so a later failure
+    /// can't be read through the stale classification of the one just repaired. Pass specific `seqs`,
+    /// or nil for all.
     /// Refreshes the broadcast status (so `deadLetters` drops at once) and pokes a drain.
     public func retryDeadLetters(_ seqs: [Int64]? = nil) async throws {
         try await db.write { db in
             var sql = """
                 UPDATE \(SyncSchema.outboxTable)
-                SET dead_lettered = 0, attempts = 0, last_attempt_at = NULL, last_error = NULL
+                SET dead_lettered = 0, attempts = 0, last_attempt_at = NULL,
+                    last_error = NULL, failure_kind = NULL
                 WHERE dead_lettered = 1
                 """
             var arguments = StatementArguments()
@@ -639,9 +654,11 @@ public actor SyncEngine {
     /// rather than waiting for the next sync pass. `failedUploads` resets to 0 here; the drain the
     /// caller pokes re-derives it on its next pass.
     private func broadcastStatusRefresh() async throws {
+        let deadLetters = try await deadLetterCount()
         statusBroadcaster.send(SyncStatus(
-            phase: .idle, lastSyncedAt: lastSyncedAt,
-            failedUploads: 0, deadLetters: try await deadLetterCount()
+            phase: SyncStatus.settledPhase(failedUploads: 0, deadLetters: deadLetters),
+            lastSyncedAt: lastSyncedAt,
+            failedUploads: 0, deadLetters: deadLetters
         ))
     }
 
@@ -1016,22 +1033,25 @@ public actor SyncEngine {
     /// reset so the next pull re-fetches whatever remote version the LWW gate skipped while the row
     /// was dirty (APPS-505).
     private func recordFailure(_ entry: OutboxEntry, groupSeqs: [Int64], attempts: Int, now: Date, park: Bool, error: Error) async throws {
+        // Classify here, while the live Error still exists — `DeadLetter` is rebuilt from this row long
+        // after it's gone, and prose can't be reclassified after the fact (issue #52).
+        let kind = SyncFailure.classify(error).wireValue
         try await db.write { db in
             try db.execute(
                 sql: """
                     UPDATE \(SyncSchema.outboxTable)
-                    SET attempts = ?, last_attempt_at = ?, last_error = ?, dead_lettered = ?
+                    SET attempts = ?, last_attempt_at = ?, last_error = ?, failure_kind = ?, dead_lettered = ?
                     WHERE seq = ?
                     """,
-                arguments: [attempts, now, "\(error)", park ? 1 : 0, entry.seq]
+                arguments: [attempts, now, "\(error)", kind, park ? 1 : 0, entry.seq]
             )
             if park {
                 let others = groupSeqs.filter { $0 != entry.seq }
                 if !others.isEmpty {
                     let placeholders = others.map { _ in "?" }.joined(separator: ", ")
                     try db.execute(
-                        sql: "UPDATE \(SyncSchema.outboxTable) SET dead_lettered = 1, last_error = ? WHERE seq IN (\(placeholders))",
-                        arguments: StatementArguments(["\(error)"] as [any DatabaseValueConvertible] + others.map { $0 as any DatabaseValueConvertible })
+                        sql: "UPDATE \(SyncSchema.outboxTable) SET dead_lettered = 1, last_error = ?, failure_kind = ? WHERE seq IN (\(placeholders))",
+                        arguments: StatementArguments(["\(error)", kind] as [any DatabaseValueConvertible] + others.map { $0 as any DatabaseValueConvertible })
                     )
                 }
                 try Self.resetCursor(db, table: entry.tableName)

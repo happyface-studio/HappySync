@@ -2,18 +2,18 @@
 
 ## Sync-status UI
 
-Consume `engine.status` and derive a single health boolean. An `idle` status is **not** the same as
-"everything uploaded".
+Consume `engine.status` and ask `isHealthy`. `.idle` means settled **and** clean; a pass that
+completed while writes are still failing or parked settles as `.degraded`.
 
 ```swift
 for await status in engine.status {
     switch status.phase {
-    case .idle:     break
+    case .idle:     showSynced()                    // settled and clean
     case .syncing:  showSpinner()
-    case .failed(let reason): showBanner(reason)
+    case .degraded: showPending(status.failedUploads + status.deadLetters)
+    case .failed(let failure): showBanner(failure)  // classified SyncFailure — see below
     }
-    let healthy = status.phase == .idle && status.failedUploads == 0 && status.deadLetters == 0
-    // failedUploads > 0  → some local changes haven't reached the server yet (degraded, retrying)
+    // failedUploads > 0  → some local changes haven't reached the server yet (retrying)
     // deadLetters   > 0  → some writes parked and need inspection/repair (see below)
 }
 ```
@@ -33,12 +33,37 @@ A failed upload is classified, not swallowed:
 A dead-lettered entry stops retrying **and** stops counting as a dirty row, so it never permanently
 blocks downloads for its key.
 
+### What the app sees
+
+The classification is public as `SyncFailure`, on `Phase.failed` and on `DeadLetter.failure`. It
+answers *what to show the user*; the retry decision is already made, and is visible as
+`failedUploads` (still retrying) vs `deadLetters` (parked):
+
+| `SyncFailure` | Raised by | What the app should do |
+|---|---|---|
+| `.network` | `URLError`, Postgres `08xxx` | Nothing — it recovers |
+| `.authExpired` | 401/403, `PGRST301`/`PGRST302` | Nothing at first; prompt re-auth if it persists |
+| `.permissionDenied` | `42501` | Surface it — a policy bug or a real permissions problem |
+| `.constraintViolation(code:)` | `23xxx` | Inspect the row; the write will never land as-is |
+| `.schemaMismatch(column:)` | `42703`, `PGRST204` | Prompt an app update (or restore the server column) |
+| `.server(status:)` | any other HTTP status, incl. 5xx | Nothing — retried; surface if it persists |
+| `.other(String)` | anything unrecognised, transient Postgres states | Log the text |
+
+`.network` means the request got no answer at all; a server that answered with a 5xx is
+`.server(status:)`, so the status code isn't thrown away. Never substring-match `lastError` — that's
+what the enum exists to replace.
+
 ## Repairing dead letters
 
 ```swift
 let parked = try await engine.deadLetters()
 for letter in parked {
-    print("\(letter.op) \(letter.table)/\(letter.pk) failed: \(letter.lastError ?? "unknown")")
+    switch letter.failure {
+    case .permissionDenied:              reportPolicyBug(letter) // fix RLS, then retryDeadLetters()
+    case .schemaMismatch(let column):    promptAppUpdate(column)
+    case .constraintViolation(let code): inspect(letter, code)
+    default: log("\(letter.op) \(letter.table)/\(letter.pk): \(letter.lastError ?? "unknown")")
+    }
 }
 
 // After fixing the cause (an RLS/policy change, a schema migration, an app update):
@@ -98,7 +123,7 @@ rules so any single migration is safe for every client in the field:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Writes never reach the server; `deadLetters` climbing | RLS rejects (`42501`) or a constraint violation | `deadLetters()` → read `lastError`; fix the policy/data, then `retryDeadLetters()`. |
+| Writes never reach the server; `deadLetters` climbing | RLS rejects (`42501`) or a constraint violation | `deadLetters()` → switch on `failure` (`lastError` for the raw text); fix the policy/data, then `retryDeadLetters()`. |
 | A device never sees the server's version of its **own** write | Missing `updatedAt` trigger (the engine already strips the client's `updatedAt` from every upload, so a stale client value can't be the cause) | Add the server trigger. |
 | Rows on an insert-only table never download to other devices | The table's `cursorColumn` has no server default — the engine never uploads it, so it lands null | `default now()` (or a trigger) on that column server-side. |
 | Whole public catalog downloads to every device | RLS broader than the partition, no `scopeColumn` | Declare `scopeColumn` + supply the engine `scope:` closure. |
@@ -108,4 +133,4 @@ rules so any single migration is safe for every client in the field:
 | `SyncEngine.init` throws `missingLocalTable` / `missingPrimaryKeyColumn` | The `tables` manifest names a table (or key column) the local schema doesn't have | Run your app's migrations **before** constructing the engine; fix the manifest name. It throws rather than silently syncing nothing for that table. |
 | Some writes sync, one code path never does | A write that bypasses the declared tables — writing a table not in the manifest, or a `DatabasePool` reader-side hack | Add the table to the manifest. Writes to declared tables are captured by triggers, so there is no way to "forget" to enqueue one. |
 | Offline-long device resurrects deleted rows | `maxOfflineGap` > server tombstone retention | Set `maxOfflineGap` ≤ retention. |
-| Idle status shows healthy but changes aren't syncing | Reading `phase` only | Health must include `failedUploads == 0 && deadLetters == 0`. |
+| Idle status shows healthy but changes aren't syncing | Reading `phase == .idle` as health | Ask `status.isHealthy`. The engine now settles such a pass as `.degraded`, so a `switch` over the phase surfaces it. |

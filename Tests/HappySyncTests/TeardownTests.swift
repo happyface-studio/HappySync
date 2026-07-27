@@ -124,7 +124,7 @@ import Supabase
     consumer.cancel()
 }
 
-@Test func stopSettlesStatusToIdleKeepingCounts() async throws {
+@Test func stopSettlesStatusToDegradedKeepingCounts() async throws {
     let db = try recipesDB()
     let remote = FakeRemote(failUpserts: 99, permanentUpserts: true) // parks the write on its first attempt
     let engine = try SyncEngine(
@@ -141,9 +141,11 @@ import Supabase
     await engine.stop()
 
     // stop() leaves a settled, non-syncing status whose outbox counts still surface the parked write —
-    // teardown doesn't touch the outbox, so hiding them would read as healthy.
+    // teardown doesn't touch the outbox, so hiding them would read as healthy. And it settles *through*
+    // those counts: a stopped engine with a parked write is `.degraded`, not `.idle` (issue #51).
     var afterStop = engine.status.makeAsyncIterator()
     let settled = await afterStop.next()
-    #expect(settled?.phase == .idle)
+    #expect(settled?.phase == .degraded)
     #expect(settled?.deadLetters == 1)
+    #expect(settled?.isHealthy == false)
 }

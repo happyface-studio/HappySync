@@ -58,16 +58,43 @@ public init(
 
 ```swift
 public struct SyncStatus {
-    public enum Phase { case idle; case syncing; case failed(String) }
+    public enum Phase {
+        case idle          // settled and clean — genuinely healthy
+        case syncing
+        case degraded      // settled, but writes are still failing or parked
+        case failed(SyncFailure)
+    }
     public var phase: Phase
     public var lastSyncedAt: Date?     // last successful pull/push, or nil
     public var failedUploads: Int      // entries retrying with backoff (attempts > 0, not parked)
     public var deadLetters: Int        // entries parked after a permanent 4xx or exhausted retries
+    public var isHealthy: Bool         // phase == .idle && both counts zero
 }
 ```
 
-**Health = `phase == .idle && failedUploads == 0 && deadLetters == 0`.** An idle status can still
-carry failing or parked uploads — surface them.
+**Ask `status.isHealthy`.** `.idle` on a status the engine broadcast already implies it — the engine
+derives `.idle` vs `.degraded` from the counts — but `isHealthy` is the one read that stays correct
+on a `SyncStatus` you construct yourself, and it's the one that documents the intent.
+
+## SyncFailure
+
+The classified cause carried by `Phase.failed` and `DeadLetter.failure` — so an app can branch on
+*why* instead of substring-matching PostgREST prose.
+
+```swift
+public enum SyncFailure: Error, Sendable, Equatable {
+    case network                            // URLError, dropped connection, Postgres 08xxx
+    case authExpired                        // 401/403, PGRST301/302 — prompt re-auth
+    case permissionDenied                   // 42501 — RLS rejected the write
+    case constraintViolation(code: String)  // 23xxx — unique, FK, not-null, check
+    case schemaMismatch(column: String?)    // 42703 / PGRST204 — prompt an app update
+    case server(status: Int)                // the server answered, including 5xx
+    case other(String)                      // unrecognised — original text preserved
+}
+```
+
+The kind says *what to show*, not whether to retry: `failedUploads` vs `deadLetters` is what tells
+you a write is still being retried or has been parked.
 
 ## DeadLetter
 
@@ -78,7 +105,8 @@ public struct DeadLetter {
     public let pk: String
     public let op: SyncOp        // .upsert | .delete
     public let attempts: Int     // upload attempts charged before parking
-    public let lastError: String?// the repair breadcrumb — why it parked
+    public let failure: SyncFailure // classified cause — branch on it to offer the right repair
+    public let lastError: String?// the raw breadcrumb behind `failure`, for logs and bug reports
     public let queuedAt: Date
 }
 ```

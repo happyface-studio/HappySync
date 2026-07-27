@@ -99,10 +99,22 @@ public enum SyncOp: String, Sendable, Codable {
 /// Engine status, surfaced as an `AsyncStream` for the app's sync-status UI.
 public struct SyncStatus: Sendable, Equatable {
     public enum Phase: Sendable, Equatable {
+        /// Settled and clean: the last pass completed and nothing is failing or parked. This is
+        /// genuinely "everything is fine" — see `.degraded` for the case it used to be confused with.
         case idle
         case syncing
-        /// Last sync attempt failed; carries a human-readable reason.
-        case failed(String)
+        /// Settled, but writes are outstanding: the last pass completed (so nothing is *broken*) while
+        /// `failedUploads`/`deadLetters` are nonzero — some local changes haven't reached the server.
+        ///
+        /// This case exists because `.idle` previously meant only "no pass is running", which reads as
+        /// health and isn't: a UI switching on the phase showed a green checkmark while the user's
+        /// writes sat parked. The counts stay on `SyncStatus` rather than riding as an associated
+        /// value, so there's one source of truth for them (issue #51).
+        case degraded
+        /// The last sync attempt threw — the pass itself failed, not an individual write. Carries the
+        /// classified cause so the app can branch on it (issue #52); `SyncFailure.other` preserves the
+        /// original text for anything unrecognised.
+        case failed(SyncFailure)
     }
 
     public var phase: Phase
@@ -124,6 +136,25 @@ public struct SyncStatus: Sendable, Equatable {
         self.failedUploads = failedUploads
         self.deadLetters = deadLetters
     }
+
+    /// **The** way to ask whether sync is healthy: the last pass settled *and* nothing is failing or
+    /// parked. `phase == .idle` alone was the tempting read and the wrong one — it says no pass is
+    /// running, which is also true while a user's writes sit in the outbox failing (issue #51).
+    ///
+    /// The engine now derives `.idle` vs `.degraded` from these same counts, so on a status the engine
+    /// broadcast this is equivalent to `phase == .idle`. It still checks all three, because a
+    /// `SyncStatus` a consumer constructed (a preview, a test fixture) can pair `.idle` with nonzero
+    /// counts and shouldn't be reported healthy.
+    public var isHealthy: Bool {
+        phase == .idle && failedUploads == 0 && deadLetters == 0
+    }
+
+    /// The phase a **settled** status takes for a given pair of outbox counts — `.idle` when clean,
+    /// `.degraded` when writes are outstanding. One place, so every settle path (the end of a pass,
+    /// teardown, a dead-letter repair) agrees on what `.idle` is allowed to mean.
+    static func settledPhase(failedUploads: Int, deadLetters: Int) -> Phase {
+        failedUploads == 0 && deadLetters == 0 ? .idle : .degraded
+    }
 }
 
 /// A dead-lettered outbox entry, surfaced so the consumer can inspect, retry, or discard it
@@ -138,20 +169,26 @@ public struct DeadLetter: Sendable {
     public let op: SyncOp
     /// How many upload attempts were charged before the entry parked.
     public let attempts: Int
-    /// The last upload error's text, if one was recorded — the repair breadcrumb.
+    /// Why the upload failed, classified — so repair UI can branch on the cause (offer re-auth, prompt
+    /// an app update, report an RLS bug) instead of substring-matching `lastError` (issue #52).
+    /// Persisted with the entry, so it survives the process that classified it.
+    public let failure: SyncFailure
+    /// The last upload error's text, if one was recorded — the raw breadcrumb behind `failure`, kept
+    /// for logs and bug reports.
     public let lastError: String?
     /// When the write was first enqueued.
     public let queuedAt: Date
 
     public init(
         seq: Int64, table: String, pk: String, op: SyncOp,
-        attempts: Int, lastError: String?, queuedAt: Date
+        attempts: Int, failure: SyncFailure, lastError: String?, queuedAt: Date
     ) {
         self.seq = seq
         self.table = table
         self.pk = pk
         self.op = op
         self.attempts = attempts
+        self.failure = failure
         self.lastError = lastError
         self.queuedAt = queuedAt
     }

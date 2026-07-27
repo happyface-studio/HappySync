@@ -63,9 +63,9 @@ try await databaseQueue.write { db in
 try await engine.pullNow()
 
 for await status in engine.status {
-    // drive sync-status UI: .idle / .syncing / .failed.
-    // Health is `phase == .idle && failedUploads == 0 && deadLetters == 0` — an idle status can
-    // still carry failing/parked uploads (APPS-470).
+    // drive sync-status UI: .idle / .syncing / .degraded / .failed(SyncFailure).
+    // Ask `status.isHealthy` — .degraded is a settled pass with writes still failing or parked,
+    // and .failed carries a classified cause you can branch on (APPS-470).
 }
 ```
 

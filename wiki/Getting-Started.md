@@ -137,14 +137,19 @@ try await engine.pullNow()
 
 ## 6. Show sync status
 
-An `idle` status can still carry failing or parked uploads, so derive one health boolean:
+Ask `isHealthy` — never `phase == .idle` alone. A settled pass with writes still failing or parked
+is `.degraded`, so switching on the phase forces you to confront it:
 
 ```swift
 for await status in engine.status {
-    let healthy = status.phase == .idle
-        && status.failedUploads == 0
-        && status.deadLetters == 0
-    // status.phase: .idle | .syncing | .failed(reason)
+    guard !status.isHealthy else { return showSynced() }
+    switch status.phase {
+    case .idle, .syncing: break                     // .idle here means healthy; .syncing is in flight
+    case .degraded: showPending(status.failedUploads + status.deadLetters)
+    case .failed(.authExpired): promptReauth()      // classified — no string matching
+    case .failed(.network): break                   // recovers on its own; show nothing
+    case .failed(let failure): showBanner(failure)
+    }
 }
 ```
 

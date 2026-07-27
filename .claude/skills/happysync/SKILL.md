@@ -51,8 +51,9 @@ CRDTs and no conflict-resolution RPC.
 3. **Lifecycle** — `await engine.start()` after sign-in; **`await engine.stop()` before wiping
    or replacing the database** on sign-out / account switch. `stop()` is async and awaits the
    in-flight pass.
-4. **Surfacing health** — an `idle` status can still carry failing or parked uploads. Health is
-   `phase == .idle && failedUploads == 0 && deadLetters == 0`. See `references/operations.md`.
+4. **Surfacing health** — ask `status.isHealthy`, never `phase == .idle` alone. A settled pass with
+   writes still failing or parked is `.degraded`, and `.failed` carries a classified `SyncFailure`
+   you can branch on. See `references/operations.md`.
 
 ## Minimal integration
 
@@ -101,8 +102,10 @@ Drive status UI:
 
 ```swift
 for await status in engine.status {
-    let healthy = status.phase == .idle && status.failedUploads == 0 && status.deadLetters == 0
-    // .idle / .syncing / .failed(reason); failedUploads = retrying, deadLetters = parked
+    guard !status.isHealthy else { return showSynced() }
+    // .idle (settled + clean) / .syncing / .degraded (settled, writes outstanding) /
+    // .failed(SyncFailure); failedUploads = retrying, deadLetters = parked
+    if case .failed(.authExpired) = status.phase { promptReauth() }
 }
 ```
 
