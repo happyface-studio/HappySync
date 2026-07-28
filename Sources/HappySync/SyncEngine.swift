@@ -172,7 +172,11 @@ public actor SyncEngine {
     /// - Parameters:
     ///   - db: GRDB writer (`DatabaseQueue` or `DatabasePool`) — the local source of truth.
     ///   - supabase: Supabase client for PostgREST upsert/pull and the Realtime doorbell.
-    ///   - tables: Synced tables in any order; the engine sorts them by `dependsOn`.
+    ///   - tables: Synced tables **in any order** — the engine sorts them by `dependsOn`, which it
+    ///     derives from the schema's own foreign keys unless a spec declares one (issue #49). Each is
+    ///     validated against the local schema here, so a field naming a column the table doesn't have
+    ///     throws `SyncError.invalidManifest` rather than syncing wrong: run the app's migrations
+    ///     before constructing the engine.
     ///   - auth: Returns a fresh Supabase access token, called before each authenticated batch.
     ///   - scope: Resolves the current user's download-partition value (auth uid) for tables that
     ///     declare a `scopeColumn`. Defaults to `nil` (no partition beyond RLS). Called per pull, so
@@ -217,21 +221,26 @@ public actor SyncEngine {
         deadLetterAfter: Int = 8,
         maxOfflineGap: TimeInterval = 30 * 24 * 3600
     ) throws {
+        // The manifest is checked against the schema — and its `dependsOn` filled in from the schema's
+        // foreign keys — before anything else reads it, so `self.tables` only ever holds specs the
+        // database has agreed with (issue #49). Migrating first is what makes that check meaningful:
+        // the app's own tables have to exist before the manifest can be validated against them.
+        try SyncSchema.migrator().migrate(db)
+        let resolved = try db.write { try SyncManifest.resolve($0, tables: tables) }
+
         self.db = db
         self.remote = remote
-        self.tables = tables
+        self.tables = resolved
         self.pageSize = pageSize
         self.doorbell = doorbell
         self.pollInterval = pollInterval
         self.debounceInterval = debounceInterval
         self.scope = scope
-        self.hasScopedTables = tables.contains { $0.scopeColumn != nil }
+        self.hasScopedTables = resolved.contains { $0.scopeColumn != nil }
         self.deadLetterAfter = deadLetterAfter
         self.maxOfflineGap = maxOfflineGap
         self.statusBroadcaster = StatusBroadcaster(initial: SyncStatus())
         self.outboxObserver = OutboxObserver()
-
-        try SyncSchema.migrator().migrate(db)
 
         // Wake the runner when a trigger queues a write, so a direct GRDB write uploads as promptly as
         // `enqueue`'s own poke used to (issue #48). `weak self`: GRDB holds the observer only as long
@@ -254,7 +263,7 @@ public actor SyncEngine {
         try db.write { db in
             // Insurance only: `applying` is transactional, so a crash mid-apply already rolled it back.
             try SyncTriggers.setApplying(db, 0)
-            try SyncTriggers.install(db, tables: tables)
+            try SyncTriggers.install(db, tables: resolved)
         }
     }
 
@@ -467,7 +476,7 @@ public actor SyncEngine {
                 resyncDeferred = !checkCompleted
             }
             try await drainOutbox()
-            try await pullNow()
+            try await pull()
         } catch is StopRequested {
             // stop() flipped `stopping` mid-pass; the pass unwound at a transaction boundary. Every
             // unit is transactional, so what already committed is consistent and the next start()
@@ -712,11 +721,20 @@ public actor SyncEngine {
         }
     }
 
+    /// Runs a cursor pull now — the app-driven nudge for a foreground return or a pull-to-refresh.
+    /// Downloads otherwise happen on their own, from the Realtime doorbell and the periodic poll.
+    ///
+    /// See `pull()` for what a pull does.
+    public func pullNow() async throws {
+        _ = try await pull()
+    }
+
     /// Pulls rows changed since each table's `(updated_at, id)` cursor and applies them
     /// last-write-wins. Upserts run parents-first (so a child's FK target exists before the child);
     /// tombstones are deferred and applied children-first (so a parent is never deleted out from
     /// under a child). Each page's applies + cursor-advance happen in one transaction; pages are
     /// pulled until one comes back short.
+    ///
     /// Returns the set of primary keys each table's fetch returned this pull. On a full pull (cursors
     /// cleared, as the stale-cursor resync does) that's every pk the server currently holds — the
     /// input the resync reconcile diffs against local rows (APPS-471). On an incremental pull it's
@@ -726,8 +744,14 @@ public actor SyncEngine {
     /// distinct from an empty set, which means its fetch completed and the server returned zero
     /// rows. The resync reconcile relies on that distinction to avoid treating "not pulled" as
     /// "server holds nothing" (APPS-501).
+    ///
+    /// **Internal**, and the return value is why (issue #55): that skipped-vs-empty distinction is an
+    /// invariant of `fullResync`'s reconcile, and it's the only caller that can act on it. Nobody
+    /// outside the engine can do anything correct with a `[String: Set<String>]` of primary keys, and
+    /// the distinction it encodes is a trap for anyone who tries — so the public entry point is
+    /// `pullNow()`, which returns nothing.
     @discardableResult
-    public func pullNow() async throws -> [String: Set<String>] {
+    func pull() async throws -> [String: Set<String>] {
         let order = topologicalOrder(tables)
         var pendingDeletes: [PendingDelete] = []
         var seenPks: [String: Set<String>] = [:]
@@ -879,7 +903,7 @@ public actor SyncEngine {
     /// every non-dirty local row (APPS-501).
     func fullResync() async throws {
         try await db.write { db in try db.execute(sql: "DELETE FROM \(SyncSchema.stateTable)") }
-        let seen = try await pullNow() // full pull (cursors cleared) → every pk the server holds
+        let seen = try await pull() // full pull (cursors cleared) → every pk the server holds
         for spec in tables {
             if stopping { throw StopRequested() } // teardown: bail between reconcile steps (APPS-513)
             guard let seenPks = seen[spec.name] else { continue }

@@ -22,7 +22,7 @@ public init(
 | `func stop() async` | **Async.** Awaits the in-flight pass, quiesces (no more DB writes / network), unsubscribes Realtime. Settles `status` to `.idle` but leaves subscriptions open. `start()` re-subscribes cleanly. Call **before** wiping/replacing the DB. |
 | `func enqueue(_ op: SyncOp, table: String, row: some Encodable & Sendable) throws` | **Deprecated.** Performs the write; the table's capture trigger queues it. Write GRDB directly instead. Throws `SyncError`. |
 | `func syncNow()` | Fire-and-forget nudge (foreground, pull-to-refresh). Not needed after a write — the engine wakes on queued writes itself. |
-| `@discardableResult func pullNow() async throws -> [String: Set<String>]` | Cursor pull now; returns server primary keys seen per table. |
+| `func pullNow() async throws` | Cursor pull now — the app-driven nudge (foreground return, pull-to-refresh). Returns nothing. |
 | `var status: AsyncStream<SyncStatus>` | `nonisolated`. Live status for the UI. Each access is an independent stream replaying the latest snapshot; it survives `stop()`/`start()` and only ends when the engine is deallocated. |
 | `func deadLetters() async throws -> [DeadLetter]` | Inspect parked entries. |
 | `func retryDeadLetters(_ seqs: [Int64]? = nil) async throws` | Re-queue parked writes (specific `seq`s, or all). |
@@ -36,7 +36,7 @@ public init(
     primaryKey: String = "id",
     cursorColumn: String = "updatedAt",    // change-time column the cursor orders/filters/advances by
                                            // — server-stamped: never included in an upload payload
-    dependsOn: [String] = [],              // FK parents; drives sync + delete ordering
+    dependsOn: [String]? = nil,            // nil = derive from the schema's FKs; drives sync + delete ordering
     jsonColumns: [String] = [],            // JSON text locally ↔ json/jsonb remote
     serverOwnedColumns: [String] = [],     // *extra* RPC-managed columns; stripped too, applied on download
     scopeColumn: String? = nil,            // partition column when RLS is broader than the partition
@@ -47,7 +47,7 @@ public init(
 
 | Field | Notes |
 |---|---|
-| `dependsOn` | Real FK dependencies. Parents upsert/download before children; children tombstone before parents. |
+| `dependsOn` | FK dependencies. Parents upsert/download before children; children tombstone before parents. Leave it `nil` (the default) and the engine reads `PRAGMA foreign_key_list` at init and uses the table's real FK parents. Declare it only to **override** that for a *logical* parent with no FK constraint — an explicit list replaces the derived one rather than adding to it, and every name in it must be a declared `SyncTable`. A self-reference (a tree table) is dropped from either form. |
 | `scopeColumn` | Requires the engine `scope:` closure. While no partition value is available (cold launch, signed out), the table's pull is skipped and the stale-resync check stays armed — never wipes an un-pulled table. |
 | `conflictColumns` | Merges a fresh-pk insert onto an existing server row by a secondary `UNIQUE` (avoids a permanent 409). The merge **re-keys the server row to the client's pk** → **leaf tables only**, or you orphan children. |
 | `serverColumns` | Opt-in backstop; a stale list silently stops uploading a real column. Prefer the client-first removal rule. Downloads need no equivalent (they intersect against the local schema). |
@@ -116,16 +116,47 @@ public struct DeadLetter {
 ```swift
 public enum SyncOp: String, Codable { case upsert; case delete }
 
-public enum SyncError: Error {
-    case notImplemented(String)
+public enum SyncError: Error, CustomStringConvertible {
     case unknownTable(String)                      // deprecated enqueue on an undeclared table
     case missingPrimaryKey(table: String, column: String)
     case encoding(String)
-    case missingLocalTable(String)                 // declared SyncTable has no local table (init)
-    case missingPrimaryKeyColumn(table: String, column: String)
+    case invalidManifest(table: String, reason: ManifestProblem)   // the manifest doesn't match the schema (init)
     case recursiveTriggersUnavailable              // PRAGMA recursive_triggers could not be enabled
 }
+
+public enum ManifestProblem: Equatable, CustomStringConvertible {
+    case duplicateDeclaration                             // the same table declared twice
+    case noSuchTable(didYouMean: String?)                 // no local table of that name
+    case noSuchColumn(field: String, column: String, didYouMean: String?)
+    case unknownDependency(String)                        // dependsOn names an undeclared SyncTable
+    case conflictColumnsOnParentTable(referencedBy: String)
+    case serverColumnsOmitPrimaryKey(String)
+}
 ```
+
+### Manifest validation
+
+`SyncEngine.init` checks every declared `SyncTable` against the local schema before it installs a
+single trigger, and throws `SyncError.invalidManifest` naming the table, the field and the value.
+Each of these used to fail silently and late — the wrong partition downloads, a column corrupts in
+both directions, an FK-order violation surfaces days later as a dead letter on another device.
+
+- `name` must be a local table; `primaryKey`, `cursorColumn`, `scopeColumn`, `jsonColumns`,
+  `conflictColumns` and `serverOwnedColumns` must each name a column on it, **spelled exactly** as
+  the schema spells it. Case counts even though SQLite would resolve either spelling: these names go
+  to PostgREST verbatim, and a camelCase Postgres identifier is quoted and matched
+  case-sensitively — so `scopeColumn: "userID"` against a `userId` column works locally and 400s (or
+  silently filters on nothing) on the wire. A case-only mismatch is reported with a "did you mean".
+- `serverColumns` is **not** checked against the local schema — it describes the *server's* schema,
+  which is allowed to differ. It may not omit the primary key, since the payload is intersected
+  against it.
+- `conflictColumns` is rejected on a table anything else foreign-keys, enforcing the leaf-only rule
+  that was previously documentation alone. The scan covers unsynced children too.
+- `dependsOn` entries must name declared tables.
+- The same table may not be declared twice.
+
+`SyncError` and `ManifestProblem` both print a full sentence, so the message stands on its own in a
+crash log.
 
 ## Writing
 

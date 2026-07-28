@@ -2,6 +2,9 @@ import GRDB
 
 /// Internal bookkeeping tables HappySync owns. The app never reads or writes these directly.
 enum SyncSchema {
+    /// Shared by every internal table below, so a schema scan can tell the engine's own tables from
+    /// the app's without listing them (see `LocalSchema`).
+    static let tablePrefix = "_sync_"
     /// One row per pending upload, drained in `seq` order (APPS-413).
     static let outboxTable = "_sync_outbox"
     /// One row per synced table, holding the last applied `(updated_at, id)` cursor (APPS-414).

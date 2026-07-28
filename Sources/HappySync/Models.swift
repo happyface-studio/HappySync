@@ -13,8 +13,21 @@ public struct SyncTable: Sendable, Hashable {
     /// time. Defaults to `updatedAt`; an immutable insert-only table overrides it (e.g.
     /// `recipe_translations` cursors on `translatedAt`, since it has no `updatedAt`).
     public let cursorColumn: String
-    /// Names of tables this one references via foreign keys. Drives sync ordering.
-    public let dependsOn: [String]
+    /// Names of tables this one references via foreign keys. Drives sync ordering — parents upload
+    /// before children, and children delete before parents.
+    ///
+    /// `nil` (the default) means **derive it from the schema**: the engine reads `PRAGMA
+    /// foreign_key_list` at init and uses this table's real foreign-key parents, narrowed to tables
+    /// the manifest declares (issue #49). The FK graph is already in the database, so restating it
+    /// here is work the consumer shouldn't have to do — and a restatement that drifts from the schema
+    /// surfaces days later as a constraint dead-letter on another device.
+    ///
+    /// Declare it explicitly to **override** that, for the case the schema can't express: a *logical*
+    /// dependency with no real FK constraint (e.g. a `recipeId` column carrying no `REFERENCES`
+    /// clause). An explicit list replaces the derived one rather than adding to it, and every name in
+    /// it must be a declared `SyncTable`. A self-reference is dropped from either form — a tree table
+    /// can't be uploaded before itself, and SQLite's cascade walks it at delete time.
+    public let dependsOn: [String]?
     /// Columns stored as JSON/JSONB that need encode/decode rather than scalar mapping.
     public let jsonColumns: [String]
     /// Extra columns the server owns (e.g. RPC-managed counters) — stripped from every upsert so a
@@ -54,7 +67,7 @@ public struct SyncTable: Sendable, Hashable {
         name: String,
         primaryKey: String = "id",
         cursorColumn: String = "updatedAt",
-        dependsOn: [String] = [],
+        dependsOn: [String]? = nil,
         jsonColumns: [String] = [],
         serverOwnedColumns: [String] = [],
         scopeColumn: String? = nil,
@@ -87,6 +100,23 @@ public struct SyncTable: Sendable, Hashable {
     /// `deletedAt = null` to un-tombstone a re-created row.
     var uploadExcludedColumns: Set<String> {
         Set(serverOwnedColumns).union([cursorColumn])
+    }
+
+    /// This spec with `dependsOn` pinned to the list `SyncManifest.resolve` settled on — declared, or
+    /// introspected from the schema's foreign keys. The engine's manifest holds only resolved specs,
+    /// so nothing downstream of init has to re-decide what `nil` meant.
+    func dependingOn(_ tables: [String]) -> SyncTable {
+        SyncTable(
+            name: name,
+            primaryKey: primaryKey,
+            cursorColumn: cursorColumn,
+            dependsOn: tables,
+            jsonColumns: jsonColumns,
+            serverOwnedColumns: serverOwnedColumns,
+            scopeColumn: scopeColumn,
+            conflictColumns: conflictColumns,
+            serverColumns: serverColumns
+        )
     }
 }
 
@@ -195,25 +225,43 @@ public struct DeadLetter: Sendable {
 }
 
 /// Errors thrown by the engine's public API.
-public enum SyncError: Error, Sendable {
-    /// Functionality scheduled for a later milestone is not wired up yet.
-    case notImplemented(String)
+public enum SyncError: Error, Sendable, CustomStringConvertible {
     /// The deprecated `enqueue` shim was called for a table not declared in the engine's `tables`.
     case unknownTable(String)
     /// The encoded row had no value for the table's primary-key column.
     case missingPrimaryKey(table: String, column: String)
     /// The row could not be encoded to SQLite column values.
     case encoding(String)
-    /// A declared `SyncTable` has no table of that name in the local database, so its write-capture
-    /// triggers can't be installed. Create the table (run the app's migrations) before constructing
-    /// the engine — the manifest and the schema must agree, or the table would silently sync nothing
-    /// (issue #48).
-    case missingLocalTable(String)
-    /// A declared `SyncTable`'s `primaryKey` column doesn't exist on the local table — usually a typo
-    /// in the manifest, or a table whose key column isn't `id`.
-    case missingPrimaryKeyColumn(table: String, column: String)
+    /// A declared `SyncTable` doesn't match the local schema — thrown by `SyncEngine.init`, which
+    /// validates the whole manifest against the database before installing a single trigger (issue
+    /// #49). `reason` names the field and the value at fault; see `ManifestProblem`.
+    ///
+    /// Every one of these used to be silent: the table simply never synced, or the wrong partition
+    /// downloaded, or a column corrupted in both directions. Failing loudly at launch is the point —
+    /// run the app's migrations before constructing the engine, then fix what the message names.
+    case invalidManifest(table: String, reason: ManifestProblem)
     /// `PRAGMA recursive_triggers` could not be enabled on the writer connection. Without it a
     /// REPLACE-displaced row (and, on older SQLite, a `ON DELETE CASCADE` child) is deleted locally
     /// without a tombstone ever reaching the server (issue #48).
     case recursiveTriggersUnavailable
+
+    /// A message that stands on its own in a crash log — every case names what to go and fix, since
+    /// most of these are configuration errors surfaced at app launch.
+    public var description: String {
+        switch self {
+        case .unknownTable(let table):
+            "HappySync: enqueue(table: \"\(table)\") — no SyncTable of that name is declared"
+        case .missingPrimaryKey(let table, let column):
+            "HappySync: the row enqueued for \"\(table)\" has no value for its primary key \"\(column)\""
+        case .encoding(let detail):
+            "HappySync: could not encode row — \(detail)"
+        case .invalidManifest(let table, let reason):
+            "HappySync: SyncTable(\"\(table)\") — \(reason)"
+        case .recursiveTriggersUnavailable:
+            """
+            HappySync: PRAGMA recursive_triggers could not be enabled on the writer connection — \
+            without it a locally deleted row can lose its tombstone and survive on the server forever
+            """
+        }
+    }
 }

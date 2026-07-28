@@ -109,6 +109,10 @@ func nextDelay(consecutiveFailures: Int, pollInterval: TimeInterval) -> TimeInte
 /// Orders tables so a parent always precedes its children (Kahn's algorithm over `dependsOn`).
 /// Used to upload parents before children; reverse the result to delete children before parents.
 /// `dependsOn` entries naming tables outside the set are ignored.
+///
+/// The engine only ever calls this with a manifest `SyncManifest.resolve` has settled, so `dependsOn`
+/// is non-nil there; an unresolved `nil` means "derive from the schema", which needs a database and
+/// so can only be read as "no declared dependencies" here.
 func topologicalOrder(_ tables: [SyncTable]) -> [String] {
     let known = Set(tables.map(\.name))
     var emitted: [String] = []
@@ -117,7 +121,7 @@ func topologicalOrder(_ tables: [SyncTable]) -> [String] {
 
     while !remaining.isEmpty {
         let ready = remaining.filter { table in
-            table.dependsOn.filter(known.contains).allSatisfy(done.contains)
+            (table.dependsOn ?? []).filter(known.contains).allSatisfy(done.contains)
         }
         guard !ready.isEmpty else {
             // ponytail: FK graph is a DAG; this guard only stops an infinite loop on a cycle —

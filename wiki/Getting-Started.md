@@ -21,10 +21,19 @@ Or in Xcode: **File → Add Package Dependencies →** `https://github.com/happy
 
 ## 2. Declare your tables
 
-Each synced table is a `SyncTable`, declared once, in FK-dependency order (parents before children).
-Only `name` is required. Every declared table must **already exist** in your local schema when the
-engine is constructed — it installs write-capture triggers on each one, and throws
-`SyncError.missingLocalTable` if the manifest and the schema disagree. Run your migrations first.
+Each synced table is a `SyncTable`, declared once, **in any order** — the engine sorts the manifest
+by FK dependency itself. Only `name` is required.
+
+Every declared table must **already exist** in your local schema when the engine is constructed, so
+run your migrations first. `SyncEngine.init` validates the whole manifest against that schema and
+throws `SyncError.invalidManifest(table:reason:)` — naming the table, the field and the value — if
+anything disagrees: a table that isn't there, or a `cursorColumn` / `scopeColumn` / `jsonColumns` /
+`conflictColumns` / `serverOwnedColumns` entry naming a column the table doesn't have. Each of those
+used to fail silently and late, so it's worth reading the message rather than working around it.
+
+You don't declare `dependsOn`: the engine reads your foreign keys at init and derives it. Pass one
+explicitly only for a *logical* parent your schema has no FK for (see
+[Cascade](#delete-with-cascade)).
 
 Declare `ON DELETE CASCADE` on child foreign keys if you want a parent delete to remove (and
 tombstone) its children — see [Delete](#delete-with-cascade) below.
@@ -34,8 +43,8 @@ import HappySync
 
 let tables = [
     SyncTable(name: "recipes", jsonColumns: ["nutrition"]),
-    SyncTable(name: "recipeIngredients", dependsOn: ["recipes"]),
-    SyncTable(name: "recipeSteps", dependsOn: ["recipes"], jsonColumns: ["temperature"]),
+    SyncTable(name: "recipeIngredients"),                            // dependsOn derived from the FK
+    SyncTable(name: "recipeSteps", jsonColumns: ["temperature"]),
 ]
 ```
 

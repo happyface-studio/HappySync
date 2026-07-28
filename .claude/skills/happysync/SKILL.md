@@ -43,11 +43,13 @@ CRDTs and no conflict-resolution RPC.
 1. **Server schema** — every synced table needs a server-stamped `updatedAt` trigger, a
    `deletedAt` tombstone column, RLS scoped to `auth.uid()`, and Realtime publication. This is
    non-negotiable: LWW compares a *server* clock. See `references/server-setup.md`.
-2. **The table manifest** — declare every synced table as a `SyncTable`, in FK dependency order.
-   Each must already exist locally when you construct the engine (run your migrations first): it
-   installs capture triggers on them and throws `SyncError.missingLocalTable` otherwise. Declare
-   `ON DELETE CASCADE` on child FKs so a parent delete tombstones its children. See "Declaring
-   tables" below and `references/api.md`.
+2. **The table manifest** — declare every synced table as a `SyncTable`, **in any order** (the engine
+   sorts by FK dependency, which it derives from your schema — you don't declare `dependsOn`). Each
+   must already exist locally when you construct the engine (run your migrations first): init
+   validates the whole manifest against the schema and throws
+   `SyncError.invalidManifest(table:reason:)` — naming the table, field and value — for anything that
+   disagrees. Declare `ON DELETE CASCADE` on child FKs so a parent delete tombstones its children.
+   See "Declaring tables" below and `references/api.md`.
 3. **Lifecycle** — `await engine.start()` after sign-in; **`await engine.stop()` before wiping
    or replacing the database** on sign-out / account switch. `stop()` is async and awaits the
    in-flight pass.
@@ -74,7 +76,7 @@ let engine = try SyncEngine(
     supabase: client,                        // your SupabaseClient
     tables: [
         SyncTable(name: "recipes", jsonColumns: ["nutrition"]),
-        SyncTable(name: "recipeIngredients", dependsOn: ["recipes"]),
+        SyncTable(name: "recipeIngredients"),   // dependsOn derived from the FK
     ],
     auth: { await session.accessToken }      // fresh access token per call
 )
@@ -124,7 +126,9 @@ before `stop()` keeps receiving updates after the next `start()`.
 `SyncTable` is the per-table descriptor. Only `name` is required; everything else is defaulted.
 Common fields:
 
-- `dependsOn: [String]` — parent tables referenced by FK. Drives upload/download/delete ordering.
+- `dependsOn: [String]?` — parent tables referenced by FK. Drives upload/download/delete ordering.
+  Leave it `nil` (the default): the engine derives it from your schema at init. Declare it only to
+  override, for a *logical* parent with no FK constraint.
 - `jsonColumns: [String]` — columns stored as JSON text locally ↔ `json`/`jsonb` in Postgres.
 - `scopeColumn: String?` — set **only** when RLS is broader than the sync partition (e.g. a
   public catalog readable as `isPublic OR userId = auth.uid()`); pair with the engine's `scope:`

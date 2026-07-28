@@ -335,13 +335,16 @@ func queuedOps(_ db: any DatabaseReader) async throws -> [String] {
     }
 }
 
-/// A DB with one `recipes` domain table (id, title, updated_at) plus HappySync's internal tables.
+/// A DB with one `recipes` domain table (id, title, nutrition, updatedAt) plus HappySync's internal
+/// tables. `nutrition` is the JSON column, so a manifest declaring `jsonColumns: ["nutrition"]`
+/// against this fixture names a column that exists — which init now checks (issue #49).
 func recipesDB() throws -> DatabaseQueue {
     let db = try DatabaseQueue()
     try db.write { db in
         try db.create(table: "recipes") { t in
             t.column("id", .text).primaryKey()
             t.column("title", .text)
+            t.column("nutrition", .text)
             t.column("updatedAt", .text)
         }
     }
