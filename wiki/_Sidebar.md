@@ -5,6 +5,7 @@
 - [[Server Setup]]
 - [[API Reference]]
 - [[Operations and Troubleshooting]]
+- [[Testing]]
 - [[Architecture]]
 - [[Claude Skill]]
 

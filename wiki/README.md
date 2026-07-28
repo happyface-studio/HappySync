@@ -14,6 +14,7 @@ GitHub resolves `Getting Started` → `Getting-Started.md`, so keep filenames hy
 | `Server-Setup.md` | Server Setup |
 | `API-Reference.md` | API Reference |
 | `Operations-and-Troubleshooting.md` | Operations and Troubleshooting |
+| `Testing.md` | Testing |
 | `Architecture.md` | Architecture |
 | `Claude-Skill.md` | Claude Skill |
 | `_Sidebar.md` | Sidebar nav (all pages) |

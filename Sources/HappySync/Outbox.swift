@@ -4,9 +4,17 @@ import GRDB
 /// Per-table download position: the `(updated_at, id)` of the last applied row. Stored as a
 /// **tuple**, not a bare timestamp, so resuming a pull never skips rows that share a millisecond
 /// across a page boundary.
-struct SyncCursor: Sendable, Equatable {
-    var updatedAt: String
-    var id: String
+///
+/// Public because it appears in `SyncRemote.fetch` — a custom or fake remote has to be able to read
+/// the position it's being asked to resume from (issue #53).
+public struct SyncCursor: Sendable, Equatable {
+    public var updatedAt: String
+    public var id: String
+
+    public init(updatedAt: String, id: String) {
+        self.updatedAt = updatedAt
+        self.id = id
+    }
 }
 
 /// One pending upload, as read back from `_sync_outbox`.

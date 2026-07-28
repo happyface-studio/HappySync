@@ -205,3 +205,45 @@ An update that changes a row's primary key queues both an upsert of the new key 
 the old. Declare `ON DELETE CASCADE` on child foreign keys to have a parent delete tombstone its
 children. Internally, the engine suppresses the triggers (via a one-row `_sync_control.applying`
 flag) while it writes server state locally, so downloads never re-enqueue themselves.
+
+## Testing seams (`HappySyncTestSupport`)
+
+The network seams are public, so a consumer's tests drive sync with fakes instead of a live Supabase
+project. `HappySyncTestSupport` is a **separate product** — add it to the test target only.
+
+```swift
+import HappySync
+import HappySyncTestSupport
+
+let remote = InMemorySyncRemote(dataset: ["recipes": [serverRow]])   // seedable server in-process
+let engine = try SyncEngine.forTesting(
+    db: db, remote: remote, tables: manifest,
+    pageSize: 500, doorbell: SilentDoorbell(),      // pageSize: 1 forces pagination
+    pollInterval: 999, debounceInterval: 0.02,      // long poll = only the passes the test triggers
+    scope: { nil }, deadLetterAfter: 8
+)
+```
+
+Everything but the network is production code — same drain, pull, retry classification, cascade
+ordering — so a test here asserts shipped behaviour.
+
+- `InMemorySyncRemote` (actor): `upsertCalls` / `deleteCalls` / `fetchCalls` / `lastScope` record
+  what the client sent; `seed(_:rows:)` publishes a change "another device" made; `representation:`
+  supplies the server's response (server-normalized values, a `conflictColumns` merge);
+  `onUpsert`/`onFetch` hooks suspend the *n*-th call so a test can race a local write against an
+  in-flight upload.
+- Failure injection: `failUpserts` / `failFetches` counts with a `SimulatedFailure` —
+  `.transient` (retried), `.permanent` (parks on the first attempt), or `.error(anError)` which
+  applies the **production** classification to a real `HTTPError`/`PostgrestError`. Use `99` for
+  "always".
+- `ManualDoorbell`: `fire()` rings the current subscription; `ringScopes` and `liveSubscriptions`
+  prove an auth change re-subscribed and tore the old one down; `fire(subscription: 0)` rings a
+  torn-down one.
+- `AsyncSignal` (`fire()`/`wait()`/`isFired`) and `eventually { … }` for background convergence —
+  never a fixed `Task.sleep` plus one assertion.
+- A bespoke double is three methods on `SyncRemote`. Signal permanence by conforming the thrown
+  error to `ClassifiedSyncError`, or wrap a real one with `RemoteFailure(classifying:)`. Anything
+  unclassified is treated as transient.
+
+The three tests worth writing first: a cascade delete queues every child's tombstone; status reaches
+`.degraded` when an upload parks; `stop()` has quiesced the engine before sign-out wipes the DB.

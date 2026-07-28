@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // APPS-475: RowCoding.encode must map a Codable Date to a canonical ISO-8601 string, not the
@@ -30,8 +31,8 @@ import Supabase
             t.column("updatedAt", .text)
         }
     }
-    let remote = FakeRemote()
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
 
     try await write(db, "INSERT INTO recipes (id, title, createdAt) VALUES ('r1', 'Soup', '2026-07-02T10:00:00.123Z')")
 
@@ -112,7 +113,7 @@ import Supabase
     try await db.write {
         try $0.execute(sql: "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1','Local','2026-07-02T10:00:00.123456Z')")
     }
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [["id": "r1", "title": "Remote", "updatedAt": "2026-07-02T10:00:00.123789Z"]]
     ])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
@@ -131,7 +132,7 @@ import Supabase
     try await db.write {
         try $0.execute(sql: "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1','Local','2026-07-02T10:00:00Z')")
     }
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [["id": "r1", "title": "Remote", "updatedAt": "2026-07-02T10:00:00.001Z"]]
     ])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)

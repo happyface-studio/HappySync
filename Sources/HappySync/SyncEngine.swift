@@ -206,9 +206,61 @@ public actor SyncEngine {
         )
     }
 
-    /// Injects the `SyncRemote`/`SyncDoorbell` seams directly — used by tests to drive sync with
-    /// fakes. `pageSize` forces pagination on a small dataset; `pollInterval`/`debounceInterval` let
-    /// tests shrink the scheduler's timing without waiting on production intervals.
+    /// An engine wired to **injected** `SyncRemote`/`SyncDoorbell` seams instead of a Supabase
+    /// client — the entry point for testing a sync integration with no network and no Supabase
+    /// project (issue #53).
+    ///
+    /// Pair it with the `HappySyncTestSupport` product, whose `InMemorySyncRemote` holds seedable
+    /// server state and injectable failures and whose `ManualDoorbell` rings on command:
+    ///
+    /// ```swift
+    /// let remote = InMemorySyncRemote(dataset: ["recipes": [serverRow]])
+    /// let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: manifest)
+    /// try await db.write { try $0.execute(sql: "DELETE FROM recipes WHERE id = ?", arguments: [id]) }
+    /// try await engine.syncNow()
+    /// #expect(await remote.deleteCalls.map(\.pk).sorted() == expectedTombstones)
+    /// ```
+    ///
+    /// Everything else behaves exactly as the production engine does — same drain, same pull, same
+    /// retry classification — so what a test proves here is what ships. It is a **factory rather
+    /// than an initializer** so `init(db:supabase:tables:auth:)` stays the obvious way to build a
+    /// real one, and a test-only wiring never gets reached for by accident in app code.
+    ///
+    /// - Parameters:
+    ///   - pageSize: Download page size. Shrink it (e.g. `1`) to force pagination on a small dataset.
+    ///   - pollInterval: Seconds between periodic convergence passes. Raise it (e.g. `999`) when a
+    ///     test wants only the passes it triggers itself.
+    ///   - debounceInterval: Seconds a doorbell burst coalesces over before one pull runs.
+    ///   - deadLetterAfter: Failed attempts before a transient entry parks. Lower it to reach the
+    ///     dead-letter path without driving eight retries.
+    public static func forTesting(
+        db: any DatabaseWriter,
+        remote: any SyncRemote,
+        tables: [SyncTable],
+        pageSize: Int = 500,
+        doorbell: any SyncDoorbell = SilentDoorbell(),
+        pollInterval: TimeInterval = 30,
+        debounceInterval: TimeInterval = 0.3,
+        scope: @escaping @Sendable () async -> String? = { nil },
+        deadLetterAfter: Int = 8,
+        maxOfflineGap: TimeInterval = 30 * 24 * 3600
+    ) throws -> SyncEngine {
+        try SyncEngine(
+            db: db,
+            remote: remote,
+            tables: tables,
+            pageSize: pageSize,
+            doorbell: doorbell,
+            pollInterval: pollInterval,
+            debounceInterval: debounceInterval,
+            scope: scope,
+            deadLetterAfter: deadLetterAfter,
+            maxOfflineGap: maxOfflineGap
+        )
+    }
+
+    /// Injects the `SyncRemote`/`SyncDoorbell` seams directly. Reached publicly through
+    /// `forTesting(db:remote:tables:…)`, which documents the parameters.
     init(
         db: any DatabaseWriter,
         remote: any SyncRemote,

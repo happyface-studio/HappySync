@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // Issue #48 deprecated `enqueue` in favour of plain GRDB writes, but keeps it working for one release
@@ -22,8 +23,8 @@ private func shimEnqueue(
 @available(*, deprecated)
 @Test func enqueueUpsertWritesTheRowAndIsCapturedOnce() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote()
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
 
     try await shimEnqueue(engine, .upsert, table: "recipes", row: ["id": "r1", "title": "Soup"])
 
@@ -40,7 +41,7 @@ private func shimEnqueue(
 @Test func enqueueDeleteRemovesTheRowAndQueuesATombstone() async throws {
     let db = try recipesDB()
     try await db.write { try $0.execute(sql: "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')") }
-    let engine = try SyncEngine(db: db, remote: FakeRemote(), tables: [SyncTable(name: "recipes")])
+    let engine = try SyncEngine.forTesting(db: db, remote: InMemorySyncRemote(), tables: [SyncTable(name: "recipes")])
 
     try await shimEnqueue(engine, .delete, table: "recipes", row: ["id": "r1"])
 
@@ -54,8 +55,8 @@ private func shimEnqueue(
     // APPS-475: a `Date` property must encode as ISO-8601 text, not JSONEncoder's default Double.
     struct NewRecipe: Encodable, Sendable { let id: String; let title: String; let updatedAt: Date }
     let db = try recipesDB()
-    let remote = FakeRemote()
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     let date = try #require(SyncTimestamp.date(from: "2026-07-02T10:00:00.123Z"))
 
     try await shimEnqueue(engine, .upsert, table: "recipes", row: NewRecipe(id: "r1", title: "Soup", updatedAt: date))
@@ -73,7 +74,7 @@ private func shimEnqueue(
 
 @available(*, deprecated)
 @Test func enqueueUnknownTableThrows() async throws {
-    let engine = try SyncEngine(db: try recipesDB(), remote: FakeRemote(), tables: [SyncTable(name: "recipes")])
+    let engine = try SyncEngine.forTesting(db: try recipesDB(), remote: InMemorySyncRemote(), tables: [SyncTable(name: "recipes")])
     await #expect(throws: SyncError.self) {
         try await shimEnqueue(engine, .upsert, table: "notdeclared", row: ["id": "x"])
     }
@@ -82,7 +83,7 @@ private func shimEnqueue(
 @available(*, deprecated)
 @Test func enqueueMissingPrimaryKeyThrows() async throws {
     let db = try recipesDB()
-    let engine = try SyncEngine(db: db, remote: FakeRemote(), tables: [SyncTable(name: "recipes")])
+    let engine = try SyncEngine.forTesting(db: db, remote: InMemorySyncRemote(), tables: [SyncTable(name: "recipes")])
     await #expect(throws: SyncError.self) {
         try await shimEnqueue(engine, .upsert, table: "recipes", row: ["title": "no id here"])
     }

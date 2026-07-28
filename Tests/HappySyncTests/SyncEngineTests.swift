@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 private func makeEngine(tables: [SyncTable] = []) throws -> SyncEngine {

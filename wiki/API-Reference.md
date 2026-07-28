@@ -172,6 +172,56 @@ try await db.write { try $0.execute(sql: "DELETE FROM recipes WHERE id = ?", arg
 Declare `ON DELETE CASCADE` on child foreign keys to have a parent delete tombstone its children.
 The engine enables `PRAGMA recursive_triggers` on the writer connection at init.
 
+## Testing seams
+
+The network seams are public, so a consumer can drive sync with fakes instead of a live Supabase
+project. Full guide: **[[Testing]]**.
+
+```swift
+// The engine, with the network injected. Otherwise identical to the production one.
+static func SyncEngine.forTesting(
+    db: any DatabaseWriter, remote: any SyncRemote, tables: [SyncTable],
+    pageSize: Int = 500, doorbell: any SyncDoorbell = SilentDoorbell(),
+    pollInterval: TimeInterval = 30, debounceInterval: TimeInterval = 0.3,
+    scope: @Sendable () async -> String? = { nil },
+    deadLetterAfter: Int = 8, maxOfflineGap: TimeInterval = 30 * 24 * 3600
+) throws -> SyncEngine
+
+protocol SyncRemote: Sendable {                  // the upload/download surface
+    func upsert(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON]
+    func delete(table: String, primaryKey: String, pk: String) async throws
+    func fetch(table: String, cursorColumn: String, since: SyncCursor?, primaryKey: String,
+               scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]]
+}
+protocol SyncDoorbell: Sendable {                // the Realtime wake signal
+    func ring(scope: String?) -> AsyncStream<Void>
+}
+struct SilentDoorbell: SyncDoorbell              // never rings; the default
+struct SyncCursor { var updatedAt: String; var id: String }   // per-table download position
+struct ScopeFilter { let column: String; let value: String }  // resolved partition filter
+
+protocol ClassifiedSyncError: Error { var isPermanent: Bool { get } }  // retryable, or park it?
+struct RemoteFailure: ClassifiedSyncError {
+    init(isPermanent: Bool, underlying: Error)
+    init(classifying underlying: Error)          // production classification of a real transport error
+}
+```
+
+An error that conforms to neither is treated as **transient** — safer to retry than to silently drop
+a user's write.
+
+### HappySyncTestSupport
+
+A separate product; add it to your test target only.
+
+```swift
+actor InMemorySyncRemote: SyncRemote              // seedable server, recorded calls, injectable failures
+final class ManualDoorbell: SyncDoorbell          // rings on fire(); records every re-subscription
+actor AsyncSignal                                 // one-shot rendezvous: fire() / wait() / isFired
+func eventually(timeout: Duration = .seconds(5), _ condition: () async -> Bool) async -> Bool
+enum SimulatedFailure { case transient, permanent, error(any Error) }
+```
+
 ## SyncSchema (migrator sharing)
 
 ```swift

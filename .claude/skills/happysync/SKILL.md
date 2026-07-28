@@ -152,6 +152,8 @@ contract: the repo's `docs/SYNC-CONTRACT.md`.
   `DeadLetter`, `SyncOp`, `SyncError`), signatures, and per-field behavior.
 - `references/operations.md` — status UI, dead-letter inspect/retry/discard, teardown/account
   switch, stale-cursor full resync, schema evolution, and troubleshooting.
+- `references/api.md` → *Testing seams* — the public `SyncRemote`/`SyncDoorbell` seams and the
+  `HappySyncTestSupport` fakes, for testing a sync integration with no Supabase project.
 
 ## Rules of thumb
 
@@ -166,5 +168,7 @@ contract: the repo's `docs/SYNC-CONTRACT.md`.
   writes to the store you're deleting (or uploads the old user's rows with the new user's token).
 - **A nonzero `failedUploads`/`deadLetters` on an idle status means degraded, not broken** —
   surface it; don't show a green checkmark.
+- **Test sync offline rather than not at all.** `SyncEngine.forTesting` + `InMemorySyncRemote` make
+  cascade deletes, parked uploads and the sign-out order assertable without a backend.
 - **Schema migrations are additive and staggered** (App Store lag): add columns server-first,
   remove them client-first. See `references/operations.md` → schema evolution.

@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // APPS-472: same-(table, pk) outbox entries collapse to their net effect at drain, so a
@@ -45,8 +46,8 @@ private func tombstoneableRecipesDB() throws -> DatabaseQueue {
 @Test func deleteThenRecreateSamePkUploadsOnceAlive() async throws {
     let db = try tombstoneableRecipesDB()
     try await db.write { try $0.execute(sql: "INSERT INTO recipes (id, title) VALUES ('r1', 'Original')") }
-    let remote = FakeRemote()
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
 
     // Offline: delete r1, then re-create it under the same pk — two plain writes, two captured ops.
     try await write(db, "DELETE FROM recipes WHERE id = 'r1'")
@@ -72,8 +73,8 @@ private func tombstoneableRecipesDB() throws -> DatabaseQueue {
 @Test func recreateThenDeleteSamePkCollapsesToDelete() async throws {
     let db = try recipesDB()
     try await db.write { try $0.execute(sql: "INSERT INTO recipes (id, title) VALUES ('r1', 'X')") }
-    let remote = FakeRemote()
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "UPDATE recipes SET title = 'Edited' WHERE id = 'r1'")
     try await write(db, "DELETE FROM recipes WHERE id = 'r1'")
 
@@ -87,8 +88,8 @@ private func tombstoneableRecipesDB() throws -> DatabaseQueue {
 
 @Test func twoUpsertsSamePkCollapseToOneFreshPayload() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote()
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'First')")
     try await write(db, "UPDATE recipes SET title = 'Second' WHERE id = 'r1'")
 
