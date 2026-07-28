@@ -68,10 +68,13 @@ public actor InMemorySyncRemote: SyncRemote {
     /// The value stamped into the cursor column of every successful upsert's representation, standing
     /// in for the server's `BEFORE UPDATE` trigger. Read it to assert a row was marked clean at the
     /// server's time rather than the client's.
-    public let serverUpdatedAt: String
+    ///
+    /// `nonisolated` so `#expect(stamped == remote.serverUpdatedAt)` needs no `await`: the value is
+    /// immutable and `Sendable`, but a cross-module actor `let` is isolated unless it says otherwise.
+    public nonisolated let serverUpdatedAt: String
     /// Which column `serverUpdatedAt` is stamped into — match the manifest's `cursorColumn` when a
     /// table cursors on something other than `updatedAt`.
-    public let cursorColumn: String
+    public nonisolated let cursorColumn: String
 
     /// Every upsert the drain has issued, in order — table, uploaded payload, and the PostgREST
     /// conflict target (nil = conflict on the primary key).
