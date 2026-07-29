@@ -2,13 +2,14 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // MARK: - Apply + tuple cursor
 
 @Test func pullAppliesRemoteRowAndAdvancesTupleCursor() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [["id": "r1", "title": "Soup", "updatedAt": "2026-06-30T10:00:00.000Z"]]
     ])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
@@ -38,7 +39,7 @@ import Supabase
             t.column("translatedAt", .text)
         }
     }
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipe_translations": [["id": "t1", "lang": "de", "translatedAt": "2026-06-30T10:00:00.000Z"]]
     ])
     let engine = try makeEngine(
@@ -71,7 +72,7 @@ private func seedRecipe(_ db: DatabaseQueue, id: String, title: String, updatedA
 @Test func pullSkipsRemoteRowOlderThanLocal() async throws {
     let db = try recipesDB()
     try await seedRecipe(db, id: "r1", title: "Local", updatedAt: "2026-06-30T11:00:00.000Z")
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [["id": "r1", "title": "Stale Remote", "updatedAt": "2026-06-30T10:00:00.000Z"]]
     ])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
@@ -85,7 +86,7 @@ private func seedRecipe(_ db: DatabaseQueue, id: String, title: String, updatedA
 @Test func pullAppliesRemoteRowNewerThanLocal() async throws {
     let db = try recipesDB()
     try await seedRecipe(db, id: "r1", title: "Old", updatedAt: "2026-06-30T09:00:00.000Z")
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [["id": "r1", "title": "Fresh", "updatedAt": "2026-06-30T10:00:00.000Z"]]
     ])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
@@ -98,7 +99,7 @@ private func seedRecipe(_ db: DatabaseQueue, id: String, title: String, updatedA
 
 @Test func pullDoesNotClobberDirtyLocalRow() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [["id": "r1", "title": "Remote Wins?", "updatedAt": "2026-06-30T10:00:00.000Z"]]
     ])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
@@ -124,7 +125,7 @@ private func seedRecipe(_ db: DatabaseQueue, id: String, title: String, updatedA
         }
         try db.execute(sql: "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Doomed', '2026-06-30T09:00:00.000Z')")
     }
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [["id": "r1", "title": "Doomed", "updatedAt": "2026-06-30T10:00:00.000Z", "deletedAt": "2026-06-30T10:00:00.000Z"]]
     ])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
@@ -152,7 +153,7 @@ private func seedRecipe(_ db: DatabaseQueue, id: String, title: String, updatedA
         try db.execute(sql: "INSERT INTO recipes (id, updatedAt) VALUES ('r1', '2026-06-30T09:00:00.000Z')")
         try db.execute(sql: "INSERT INTO recipeIngredients (id, recipeId, updatedAt) VALUES ('i1', 'r1', '2026-06-30T09:00:00.000Z')")
     }
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [["id": "r1", "updatedAt": "2026-06-30T10:00:00.000Z", "deletedAt": "2026-06-30T10:00:00.000Z"]],
         "recipeIngredients": [["id": "i1", "recipeId": "r1", "updatedAt": "2026-06-30T10:00:00.000Z", "deletedAt": "2026-06-30T10:00:00.000Z"]],
     ])
@@ -178,14 +179,14 @@ private func seedRecipe(_ db: DatabaseQueue, id: String, title: String, updatedA
     let db = try recipesDB()
     // r2 and r3 share a millisecond; with page size 1 the page boundary falls between them, so a
     // bare-timestamp cursor would drop r3. The (updatedAt, id) tuple cursor must keep it.
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [
             ["id": "r1", "title": "A", "updatedAt": "2026-06-30T10:00:00.000Z"],
             ["id": "r2", "title": "B", "updatedAt": "2026-06-30T10:00:01.000Z"],
             ["id": "r3", "title": "C", "updatedAt": "2026-06-30T10:00:01.000Z"],
         ]
     ])
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], pageSize: 1)
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")], pageSize: 1)
 
     try await engine.pullNow()
 
@@ -204,7 +205,7 @@ private func seedRecipe(_ db: DatabaseQueue, id: String, title: String, updatedA
     // recipes(id, title, updatedAt) schema doesn't have. The pull must apply the known columns and
     // complete — not throw `table recipes has no column named servings` and brick every pass (APPS-504).
     let db = try recipesDB()
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [[
             "id": "r1", "title": "Soup", "updatedAt": "2026-06-30T10:00:00.000Z",
             "servings": .integer(4),
@@ -226,7 +227,7 @@ private func seedRecipe(_ db: DatabaseQueue, id: String, title: String, updatedA
     // Multiple unknown columns in one wire row are all dropped; the known columns still apply. Guards
     // the intersection when a server migration adds more than one column at a time (APPS-504).
     let db = try recipesDB()
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [[
             "id": "r1", "title": "Curry", "updatedAt": "2026-06-30T10:00:00.000Z",
             "servings": .integer(4), "spiceLevel": "hot", "calories": .integer(520),

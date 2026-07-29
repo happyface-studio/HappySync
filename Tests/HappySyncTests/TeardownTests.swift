@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // APPS-473: stop() must await the in-flight sync pass, so a consumer can wipe/replace the database
@@ -9,14 +10,15 @@ import Supabase
 
 @Test func stopAwaitsInFlightSyncPass() async throws {
     let db = try recipesDB()
-    let started = Signal()
-    let gate = Signal()
-    let remote = GatedRemote(
-        started: started, gate: gate,
+    let started = AsyncSignal()
+    let gate = AsyncSignal()
+    let remote = InMemorySyncRemote(
         dataset: ["recipes": [["id": "r1", "title": "Applied", "updatedAt": "2026-07-02T10:00:00.000Z"]]]
     )
+    // Block the pull inside `fetch` so the pass is provably in flight when stop() is called.
+    await remote.onFetch { _ in await started.fire(); await gate.wait() }
     // Long poll, silent doorbell → the only pass is the immediate one start() kicks.
-    let engine = try SyncEngine(
+    let engine = try SyncEngine.forTesting(
         db: db, remote: remote, tables: [SyncTable(name: "recipes")],
         doorbell: SilentDoorbell(), pollInterval: 999
     )
@@ -25,7 +27,7 @@ import Supabase
     await started.wait() // the pull is now in-flight, blocked in fetch
 
     // Launch stop() and record when it returns. While the pass is blocked, stop must NOT return.
-    let stopped = Signal()
+    let stopped = AsyncSignal()
     let stopTask = Task { await engine.stop(); await stopped.fire() }
 
     try await Task.sleep(for: .milliseconds(60))
@@ -46,17 +48,22 @@ import Supabase
 
 @Test func stopBailsAtPageBoundaryMidPull() async throws {
     let db = try recipesDB()
-    let started = Signal()
-    let gate = Signal()
+    let started = AsyncSignal()
+    let gate = AsyncSignal()
     // Three single-row pages; the 2nd fetch blocks so the test can stop() mid-pull.
     let rows: [[String: AnyJSON]] = [
         ["id": "r0", "title": "r0", "updatedAt": "2026-01-01T00:00:00.000Z"],
         ["id": "r1", "title": "r1", "updatedAt": "2026-01-01T00:00:00.001Z"],
         ["id": "r2", "title": "r2", "updatedAt": "2026-01-01T00:00:00.002Z"],
     ]
-    let remote = PagedGatedRemote(rows: rows, gateOnFetch: 2, started: started, gate: gate)
+    let remote = InMemorySyncRemote(dataset: ["recipes": rows])
+    await remote.onFetch { call in
+        guard call == 2 else { return }             // block only page 2, mid-pull
+        await started.fire()
+        await gate.wait()
+    }
     // pageSize 1 → one row per fetch; long poll + silent doorbell → the only pass is start()'s.
-    let engine = try SyncEngine(
+    let engine = try SyncEngine.forTesting(
         db: db, remote: remote, tables: [SyncTable(name: "recipes")],
         pageSize: 1, doorbell: SilentDoorbell(), pollInterval: 999
     )
@@ -64,7 +71,7 @@ import Supabase
     await engine.start()
     await started.wait() // page 1 (r0) applied; page 2's fetch is blocked mid-pull
 
-    let stopped = Signal()
+    let stopped = AsyncSignal()
     let stopTask = Task { await engine.stop(); await stopped.fire() }
     try await Task.sleep(for: .milliseconds(60)) // let stop() flip `stopping` before the gate releases
     #expect(await stopped.isFired == false)      // still waiting on the in-flight (blocked) fetch
@@ -74,11 +81,11 @@ import Supabase
 
     let ids = try await db.read { try String.fetchAll($0, sql: "SELECT id FROM recipes ORDER BY id") }
     #expect(ids == ["r0", "r1"])          // page 3 (r2) never applied — teardown bailed at the boundary
-    #expect(await remote.fetchCount == 2) // …and never fetched page 3
+    #expect(await remote.fetchCalls == 2) // …and never fetched page 3
 
     // Restart resumes from the advanced cursor: the un-fetched row converges with no duplicates.
-    let engine2 = try SyncEngine(
-        db: db, remote: PagedGatedRemote(rows: rows, gateOnFetch: 99, started: Signal(), gate: Signal()),
+    let engine2 = try SyncEngine.forTesting(
+        db: db, remote: InMemorySyncRemote(dataset: ["recipes": rows]),
         tables: [SyncTable(name: "recipes")], pageSize: 1, doorbell: SilentDoorbell(), pollInterval: 999
     )
     try await engine2.runSyncOnce()
@@ -95,8 +102,8 @@ import Supabase
 
 @Test func statusStreamStillDeliversAfterStopThenStart() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(dataset: ["recipes": [["id": "r1", "title": "Soup", "updatedAt": "2026-07-02T10:00:00.000Z"]]])
-    let engine = try SyncEngine(
+    let remote = InMemorySyncRemote(dataset: ["recipes": [["id": "r1", "title": "Soup", "updatedAt": "2026-07-02T10:00:00.000Z"]]])
+    let engine = try SyncEngine.forTesting(
         db: db, remote: remote, tables: [SyncTable(name: "recipes")],
         doorbell: SilentDoorbell(), pollInterval: 999
     )
@@ -126,8 +133,8 @@ import Supabase
 
 @Test func stopSettlesStatusToDegradedKeepingCounts() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 99, permanentUpserts: true) // parks the write on its first attempt
-    let engine = try SyncEngine(
+    let remote = InMemorySyncRemote(failUpserts: 99, upsertFailure: .permanent) // parks the write on its first attempt
+    let engine = try SyncEngine.forTesting(
         db: db, remote: remote, tables: [SyncTable(name: "recipes")],
         doorbell: SilentDoorbell(), pollInterval: 999
     )

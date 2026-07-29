@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // Issue #52: the engine classifies remote failures precisely, then used to stringify all of it at the
@@ -86,8 +87,8 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
     #expect(SyncFailure.classify(error) == .schemaMismatch(column: "nutrition"))
     #expect(remoteErrorIsPermanent(error) == false) // …but not permanent — retried, not parked
 
-    let remote = FakeRemote(failUpserts: 1, upsertError: error)
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 8)
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(error))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 8)
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox()
@@ -140,8 +141,8 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
     let db = try recipesDB()
     // RLS rejected the write: the one case an app most needs to tell apart, and the one that used to
     // arrive as an unparseable String.
-    let remote = FakeRemote(failUpserts: 1, upsertError: pg("42501", "new row violates row-level security policy"))
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(pg("42501", "new row violates row-level security policy")))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox() // permanent → parks immediately
@@ -153,8 +154,8 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
 
 @Test func deadLetterKeepsTheConstraintCodeAcrossTheRoundTrip() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 1, upsertError: pg("23505", "duplicate key value violates unique constraint"))
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(pg("23505", "duplicate key value violates unique constraint")))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox()
@@ -169,8 +170,8 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
     let db = try recipesDB()
     // Two edits to one row collapse to a single net op; when it parks, the whole group parks — and the
     // classification must land on every entry, not just the net one.
-    let remote = FakeRemote(failUpserts: 1, upsertError: pg("42501", "rls"))
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(pg("42501", "rls")))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
     try await write(db, "UPDATE recipes SET title = 'Stew' WHERE id = 'r1'")
 
@@ -183,7 +184,7 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
 
 @Test func aParkedEntryWithNoStoredKindStillReadsAsAFailure() async throws {
     let db = try recipesDB()
-    let engine = try SyncEngine(db: db, remote: FakeRemote(), tables: [SyncTable(name: "recipes")])
+    let engine = try SyncEngine.forTesting(db: db, remote: InMemorySyncRemote(), tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
     // Parked by hand with no `failure_kind` — an entry from before happysync_v5, or one an operator
     // parked directly. It must degrade to `.other`, never fail the read.
@@ -197,8 +198,8 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
     let db = try recipesDB()
     // `.server(status:)` end to end — classified from a live HTTPError, written to `failure_kind`,
     // read back through `deadLetters()`. The pure wire test can't catch a break in that path.
-    let remote = FakeRemote(failUpserts: 1, upsertError: httpError(404))
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(httpError(404)))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox() // 404 is permanent → parks at once
@@ -210,8 +211,8 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
 
 @Test func retryClearsTheStoredFailureKind() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 1, upsertError: pg("42501", "rls"))
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(pg("42501", "rls")))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
     try await engine.drainOutbox() // parks with failure_kind = permissionDenied
 
@@ -226,8 +227,8 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
 @Test func aFailedPassCarriesTheClassifiedCause() async throws {
     let db = try recipesDB()
     // The pull 401s — the pass itself fails, as opposed to an individual write failing.
-    let remote = FakeRemote(failFetches: 1, fetchError: httpError(401))
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failFetches: 1, fetchFailure: .error(httpError(401)))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
 
     await #expect(throws: (any Error).self) { try await engine.runSyncOnce() }
 
@@ -252,7 +253,7 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
 
 @Test func aCleanPassSettlesIdleAndHealthy() async throws {
     let db = try recipesDB()
-    let engine = try SyncEngine(db: db, remote: FakeRemote(), tables: [SyncTable(name: "recipes")])
+    let engine = try SyncEngine.forTesting(db: db, remote: InMemorySyncRemote(), tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.runSyncOnce() // the write uploads cleanly
@@ -265,8 +266,8 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
 
 @Test func repairingTheLastDeadLetterReturnsTheStatusToIdle() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 1, permanentUpserts: true)
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .permanent)
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
     try await engine.runSyncOnce() // parks r1 → degraded
 
@@ -286,8 +287,8 @@ private func pg(_ code: String?, _ message: String = "") -> PostgrestError {
     // The repair broadcast used to assert `failedUploads: 0` instead of reading it, so clearing the
     // last parked entry settled `.idle` — a green checkmark over a write that was still failing —
     // until the next drain corrected it. That is precisely the misread this PR exists to remove.
-    let remote = FakeRemote(failUpserts: 99) // every upload fails transiently
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 8)
+    let remote = InMemorySyncRemote(failUpserts: 99) // every upload fails transiently
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 8)
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r2', 'Stew')")
 

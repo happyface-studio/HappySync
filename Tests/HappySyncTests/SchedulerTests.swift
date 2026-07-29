@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // MARK: - Retry-delay policy
@@ -70,7 +71,7 @@ private struct SeededGenerator: RandomNumberGenerator {
 
 @Test func failedSyncDrivesStatusToFailed() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failFetches: 1)
+    let remote = InMemorySyncRemote(failFetches: 1)
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
     var status = engine.status.makeAsyncIterator()
     _ = await status.next() // initial idle replay
@@ -87,11 +88,11 @@ private struct SeededGenerator: RandomNumberGenerator {
 
 @Test func doorbellBurstTriggersExactlyOnePull() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote()
-    let doorbell = FakeDoorbell()
+    let remote = InMemorySyncRemote()
+    let doorbell = ManualDoorbell()
     // A comfortably large debounce so a synchronous burst reliably lands inside one window even under
     // load (issue #19); long poll so only the doorbell drives pulls.
-    let engine = try SyncEngine(
+    let engine = try SyncEngine.forTesting(
         db: db, remote: remote, tables: [SyncTable(name: "recipes")],
         doorbell: doorbell, pollInterval: 999, debounceInterval: 0.5
     )
@@ -110,10 +111,10 @@ private struct SeededGenerator: RandomNumberGenerator {
 
 @Test func periodicPollConvergesWhenDoorbellSilent() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote()
+    let remote = InMemorySyncRemote()
     // SilentDoorbell never rings — convergence must come entirely from the periodic poll, proving
     // the engine still syncs if the Realtime channel drops.
-    let engine = try SyncEngine(
+    let engine = try SyncEngine.forTesting(
         db: db, remote: remote, tables: [SyncTable(name: "recipes")],
         doorbell: SilentDoorbell(), pollInterval: 0.03, debounceInterval: 0.3
     )
@@ -130,9 +131,9 @@ private struct SeededGenerator: RandomNumberGenerator {
 
 @Test func localWriteTriggersDrainWithoutSyncNow() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote()
+    let remote = InMemorySyncRemote()
     // Long poll, silent doorbell → the only thing that can drive an upload is the local write itself.
-    let engine = try SyncEngine(
+    let engine = try SyncEngine.forTesting(
         db: db, remote: remote, tables: [SyncTable(name: "recipes")],
         doorbell: SilentDoorbell(), pollInterval: 999, debounceInterval: 0.02
     )
@@ -149,10 +150,10 @@ private struct SeededGenerator: RandomNumberGenerator {
 
 @Test func burstOfWritesCoalescesIntoOneDrainPass() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote()
+    let remote = InMemorySyncRemote()
     // A large debounce so the 20 sequential writes finish before it fires — the burst then coalesces
     // into one drain instead of splitting across windows under load (issue #19).
-    let engine = try SyncEngine(
+    let engine = try SyncEngine.forTesting(
         db: db, remote: remote, tables: [SyncTable(name: "recipes")],
         doorbell: SilentDoorbell(), pollInterval: 999, debounceInterval: 0.5
     )
@@ -175,9 +176,9 @@ private struct SeededGenerator: RandomNumberGenerator {
 
 @Test func syncNowForcesAnImmediatePull() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote()
+    let remote = InMemorySyncRemote()
     // Long poll interval, silent doorbell → only an explicit nudge can cause another pull.
-    let engine = try SyncEngine(
+    let engine = try SyncEngine.forTesting(
         db: db, remote: remote, tables: [SyncTable(name: "recipes")],
         doorbell: SilentDoorbell(), pollInterval: 999, debounceInterval: 0.3
     )

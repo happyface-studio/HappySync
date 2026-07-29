@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // APPS-508: the engine must let the consumer inspect, retry, and discard dead-lettered outbox
@@ -12,8 +13,8 @@ import Supabase
 
 @Test func deadLettersListParkedEntriesWithDetail() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 1, permanentUpserts: true) // parks on the first attempt
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .permanent) // parks on the first attempt
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox() // r1 parks permanently
@@ -30,8 +31,8 @@ import Supabase
 
 @Test func deadLettersOmitEntriesStillRetrying() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 1) // transient — retried, not parked
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 8)
+    let remote = InMemorySyncRemote(failUpserts: 1) // transient — retried, not parked
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 8)
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox() // fails transiently, stays pending (not parked)
@@ -44,8 +45,8 @@ import Supabase
 @Test func retryDeadLettersReuploadsAfterCauseFixed() async throws {
     let db = try recipesDB()
     // Parks on the first attempt (permanent), then the remote accepts writes — the cause is "fixed".
-    let remote = FakeRemote(failUpserts: 1, permanentUpserts: true)
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .permanent)
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox() // parks r1
@@ -70,8 +71,8 @@ import Supabase
 
 @Test func retryDeadLettersSelectsBySeq() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 99, permanentUpserts: true) // every write parks
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 99, upsertFailure: .permanent) // every write parks
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'A')")
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r2', 'B')")
     try await engine.drainOutbox() // both park
@@ -86,8 +87,8 @@ import Supabase
 
 @Test func retryRefreshesStatusSoDeadLettersDropImmediately() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 1, permanentUpserts: true)
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .permanent)
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
     try await engine.runSyncOnce() // parks r1; status shows one dead letter
 
@@ -106,11 +107,11 @@ import Supabase
     // The parked local edit is *newer* than the server row, so plain LWW keeps the local version
     // even after the entry stops blocking downloads — the row is stuck diverged (APPS-505). Discard
     // must still converge it back to the server's copy.
-    let remote = FakeRemote(
-        failUpserts: 1, permanentUpserts: true,
-        dataset: ["recipes": [["id": "r1", "title": "Server Wins", "updatedAt": "2026-06-30T12:00:00.000Z"]]]
+    let remote = InMemorySyncRemote(
+        dataset: ["recipes": [["id": "r1", "title": "Server Wins", "updatedAt": "2026-06-30T12:00:00.000Z"]]],
+        failUpserts: 1, upsertFailure: .permanent
     )
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Poison', '2026-07-01T09:00:00.000Z')")
 
     try await engine.drainOutbox() // parks the poison entry
@@ -132,15 +133,14 @@ import Supabase
     let db = try recipesDB()
     // A local delete that could never propagate parks; the server still holds the row. Discarding the
     // delete means "accept the server's version" — the row must come back locally.
-    let remote = FakeRemote(
-        failUpserts: 0,
+    let remote = InMemorySyncRemote(
         dataset: ["recipes": [["id": "r1", "title": "Still Here", "updatedAt": "2026-06-30T12:00:00.000Z"]]]
     )
     // Seeded before the engine exists, so only the delete below is captured.
     try await db.write { try $0.execute(sql: "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Local', '2026-06-01T00:00:00.000Z')") }
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "DELETE FROM recipes WHERE id = 'r1'") // removes the local row + queues a delete
-    // Park the queued delete by hand — the delete path can't be failed via FakeRemote, but the repair
+    // Park the queued delete by hand — the delete path can't be failed via InMemorySyncRemote, but the repair
     // API operates purely on `_sync_outbox` state regardless of *why* an entry parked.
     try await db.write { try $0.execute(sql: "UPDATE _sync_outbox SET dead_lettered = 1 WHERE pk='r1'") }
 
@@ -157,8 +157,8 @@ import Supabase
 
 @Test func discardKeepsRowWithAStillPendingWrite() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 1, permanentUpserts: true)
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .permanent)
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Parked')")
     try await engine.drainOutbox() // parks the first write
 
@@ -179,10 +179,10 @@ import Supabase
     // Two *parked* entries on the same row. Discarding one seq must still reset the local row toward
     // the server's version: the sibling that stays parked has stopped retrying, so — unlike a live
     // pending write — it isn't a reason to leave the row diverged (APPS-508 follow-up).
-    let remote = FakeRemote(
+    let remote = InMemorySyncRemote(
         dataset: ["recipes": [["id": "r1", "title": "Server", "updatedAt": "2026-06-30T12:00:00.000Z"]]]
     )
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'First', '2026-07-01T09:00:00.000Z')")
     try await write(db, "UPDATE recipes SET title = 'Second', updatedAt = '2026-07-01T10:00:00.000Z' WHERE id = 'r1'")
     // Park both by hand — two dead-lettered siblings on one (table, pk).

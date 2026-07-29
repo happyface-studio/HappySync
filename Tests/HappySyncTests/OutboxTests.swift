@@ -2,9 +2,10 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
-// FakeRemote, makeEngine, and recipesDB live in TestSupport.swift.
+// InMemorySyncRemote, makeEngine, and recipesDB live in TestSupport.swift.
 
 // MARK: - FK topological ordering
 
@@ -71,8 +72,8 @@ import Supabase
 
 @Test func drainUploadsPendingUpsertStampsUpdatedAtAndClearsEntry() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote()
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox()
@@ -105,8 +106,8 @@ import Supabase
             t.column("updatedAt", .text)
         }
     }
-    let remote = FakeRemote()
-    let engine = try SyncEngine(
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(
         db: db,
         remote: remote,
         tables: [SyncTable(name: "recipeIngredients", dependsOn: ["recipes"]), SyncTable(name: "recipes")]
@@ -123,8 +124,8 @@ import Supabase
 
 @Test func drainUploadsSameTableInSeqOrder() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote()
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('a', 'first')")
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('b', 'second')")
 
@@ -140,13 +141,13 @@ import Supabase
     let db = try recipesDB()
     // The server normalizes `title` on write (a trigger/default the client can't compute) and stamps
     // the cursor. The whole representation must land locally — not just the cursor column.
-    let remote = RepresentationRemote { row in
+    let remote = InMemorySyncRemote(representation: { row in
         var server = row
         server["title"] = .string("Normalized Soup")
         server["updatedAt"] = .string("2026-06-30T12:00:00.000Z")
         return server
-    }
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    })
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox()
@@ -164,9 +165,12 @@ import Supabase
 
 @Test func drainDoesNotOverwriteAnEditEnqueuedWhileUploadInFlight() async throws {
     let db = try recipesDB()
-    let started = Signal(), gate = Signal()
-    let remote = UpsertGatedRemote(started: started, gate: gate)
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let started = AsyncSignal(), gate = AsyncSignal()
+    let remote = InMemorySyncRemote()
+    // Hold every upload open in the remote until the test releases it, so the drain is suspended
+    // mid-upsert with a competing local edit landing behind it.
+    await remote.onUpsert { _ in await started.fire(); await gate.wait() }
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     // Drive the drain concurrently; it uploads "Soup" then blocks in `upsert` awaiting the server.
@@ -200,13 +204,13 @@ import Supabase
             t.column("updatedAt", .text)
         }
     }
-    let remote = RepresentationRemote { row in
+    let remote = InMemorySyncRemote(representation: { row in
         var server = row
         server["cookedCount"] = .integer(7) // the merged server total, not the 1 this client sent
         server["updatedAt"] = .string("2026-06-30T12:00:00.000Z")
         return server
-    }
-    let engine = try SyncEngine(
+    })
+    let engine = try SyncEngine.forTesting(
         db: db,
         remote: remote,
         tables: [SyncTable(name: "userRecipeInteractions", conflictColumns: ["userId", "recipeId"])]
@@ -242,8 +246,8 @@ import Supabase
             t.column("updatedAt", .text)
         }
     }
-    let remote = FakeRemote()
-    let engine = try SyncEngine(
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(
         db: db,
         remote: remote,
         tables: [SyncTable(name: "userRecipeInteractions", conflictColumns: ["userId", "recipeId"])]
@@ -259,8 +263,8 @@ import Supabase
     // No conflictColumns declared → the upsert conflicts on the primary key (onConflict nil), the
     // engine's default. Guards against every table paying the id-churn cost of a merge it doesn't need.
     let db = try recipesDB()
-    let remote = FakeRemote()
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox()
@@ -272,8 +276,8 @@ import Supabase
 
 @Test func failedUpsertIsKeptCountedAndRetriedIdempotently() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 1) // first upsert throws, then succeeds
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1) // first upsert throws, then succeeds
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     // First drain: upsert fails — entry stays, attempts bumped, row not yet marked clean.
@@ -323,8 +327,8 @@ import Supabase
             t.column("updatedAt", .text)
         }
     }
-    let remote = FakeRemote()
-    let engine = try SyncEngine(
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(
         db: db,
         remote: remote,
         tables: [SyncTable(name: "userRecipeInteractions", serverOwnedColumns: ["cookedCount"])]
@@ -344,8 +348,8 @@ import Supabase
 
 @Test func drainNeverUploadsTheCursorColumn() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote()
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
 
     // A row carrying an explicit client `updatedAt` — the shape the download path leaves behind too.
     try await write(db, "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Soup', '2020-01-01T00:00:00.000Z')")
@@ -371,8 +375,8 @@ import Supabase
             t.column("translatedAt", .text)
         }
     }
-    let remote = FakeRemote()
-    let engine = try SyncEngine(
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(
         db: db,
         remote: remote,
         // serverColumns names it explicitly: even an allow-listed cursor column stays off the wire.
@@ -407,8 +411,8 @@ import Supabase
             t.column("updatedAt", .text)
         }
     }
-    let remote = FakeRemote()
-    let engine = try SyncEngine(
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(
         db: db,
         remote: remote,
         tables: [SyncTable(name: "recipes", serverColumns: ["id", "title", "updatedAt"])]
@@ -428,8 +432,8 @@ import Supabase
     try await db.write { db in
         try db.execute(sql: "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
     }
-    let remote = FakeRemote()
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
 
     try await write(db, "DELETE FROM recipes WHERE id = 'r1'")
 

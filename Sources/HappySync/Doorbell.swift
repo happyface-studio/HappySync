@@ -5,7 +5,10 @@ import Supabase
 /// Payloads are deliberately discarded — a ring only triggers a debounced `pullNow()`, and all
 /// correctness stays in the idempotent cursor-pull. Abstracted behind a protocol so the scheduler
 /// can be driven by a fake in tests; the production conformance is the only place touching Realtime.
-protocol SyncDoorbell: Sendable {
+///
+/// Public alongside `SyncRemote` so a consumer can drive convergence deterministically in its own
+/// tests — `ManualDoorbell` from `HappySyncTestSupport` rings on command (issue #53).
+public protocol SyncDoorbell: Sendable {
     /// A stream that yields `()` whenever a watched row changes, filtered to the partition `scope`
     /// (the signed-in user's uid, or nil when signed out). The engine re-invokes this with a new
     /// scope on an auth change, terminating the previous stream first — so scoped tables ring for
@@ -15,8 +18,9 @@ protocol SyncDoorbell: Sendable {
 
 /// A doorbell that never rings — the default when no Realtime client is wired. The engine still
 /// converges through its periodic pull, so this is a safe fallback rather than a broken one.
-struct SilentDoorbell: SyncDoorbell {
-    func ring(scope: String?) -> AsyncStream<Void> { AsyncStream { _ in } }
+public struct SilentDoorbell: SyncDoorbell {
+    public init() {}
+    public func ring(scope: String?) -> AsyncStream<Void> { AsyncStream { _ in } }
 }
 
 /// `SyncDoorbell` over a Supabase Realtime channel. Subscribes to `postgres_changes` for the

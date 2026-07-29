@@ -29,6 +29,7 @@ status, and retry/backoff. It does **not** own reads or schema.
 | **[[Server Setup]]** | The required Supabase schema: `updatedAt` trigger, `deletedAt` tombstones, RLS, Realtime. |
 | **[[API Reference]]** | Every public type and method with signatures and field semantics. |
 | **[[Operations and Troubleshooting]]** | Status UI, dead-letter repair, teardown, schema evolution, a troubleshooting table. |
+| **[[Testing]]** | Test your sync integration offline with the shipped fakes — no Supabase project. |
 | **[[Architecture]]** | How upload, download, LWW, the doorbell, and cascades fit together. |
 | **[[Claude Skill]]** | Install the HappySync Claude skill so your AI assistant integrates it correctly. |
 

@@ -203,6 +203,32 @@ try await engine.discardDeadLetters([badSeq])
 
 Both mutations refresh the status stream immediately, so `deadLetters` drops as soon as they return.
 
+## Testing your integration
+
+Sync is where bugs are silent and data-losing, and it's usually untested — because testing it looks
+like it needs a live Supabase project. It doesn't. The `SyncRemote` / `SyncDoorbell` seams the
+engine's own tests run on are public, and the `HappySyncTestSupport` product ships the fakes:
+
+```swift
+// In your test target's dependencies: .product(name: "HappySyncTestSupport", package: "HappySync")
+import HappySync
+import HappySyncTestSupport
+
+let remote = InMemorySyncRemote()      // a server in the test process: seedable, recording, failable
+let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: MyApp.syncTables)
+await engine.start()
+
+// One plain delete — SQLite cascades, and each child's capture trigger queues its own tombstone.
+try await db.write { try $0.execute(sql: "DELETE FROM recipes WHERE id = 'r1'") }
+#expect(await eventually { await remote.deleteCalls.count == 3 })
+```
+
+Everything but the network is the code that ships, so what the test proves is what the app does.
+Inject failures with `InMemorySyncRemote(failUpserts: 1, upsertFailure: .permanent)` to reach the
+dead-letter path, ring a `ManualDoorbell` to drive convergence on demand, and hold a call in flight
+with `onUpsert`/`onFetch` to race a local write against an upload. See the
+[Testing](https://github.com/happyface-studio/HappySync/wiki/Testing) wiki page.
+
 ## Requirements
 
 - Swift 6, iOS 16+ / macOS 13+

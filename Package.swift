@@ -7,6 +7,9 @@ let package = Package(
     platforms: [.iOS(.v16), .macOS(.v13)],
     products: [
         .library(name: "HappySync", targets: ["HappySync"]),
+        // Fakes for the SyncRemote/SyncDoorbell seams, so a consumer can test its sync integration
+        // offline. Import from a test target only — it ships no production code (issue #53).
+        .library(name: "HappySyncTestSupport", targets: ["HappySyncTestSupport"]),
     ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.11.0"),
@@ -22,10 +25,20 @@ let package = Package(
                 .product(name: "Supabase", package: "supabase-swift"),
             ]
         ),
+        .target(
+            name: "HappySyncTestSupport",
+            dependencies: [
+                "HappySync",
+                .product(name: "Supabase", package: "supabase-swift"),
+            ]
+        ),
         .testTarget(
             name: "HappySyncTests",
             dependencies: [
                 "HappySync",
+                // Our own tests drive sync through the same fakes consumers get, so the public
+                // seams can't drift from what they're documented to do.
+                "HappySyncTestSupport",
                 .product(name: "GRDB", package: "GRDB.swift"),
                 .product(name: "Supabase", package: "supabase-swift"),
             ]

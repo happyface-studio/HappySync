@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // recipeGraphDB / recipeGraphTables / write / queuedOps live in TestSupport.swift.
@@ -28,7 +29,7 @@ private func seedGraph(_ db: any DatabaseWriter, engine: SyncEngine, _ statement
 
 @Test func deletingParentCascadesToChildrenAndQueuesTombstones() async throws {
     let db = try recipeGraphDB()
-    let engine = try SyncEngine(db: db, remote: FakeRemote(), tables: recipeGraphTables)
+    let engine = try SyncEngine.forTesting(db: db, remote: InMemorySyncRemote(), tables: recipeGraphTables)
     try await seedGraph(db, engine: engine, [
         "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')",
         "INSERT INTO recipeIngredients (id, recipeId) VALUES ('i1', 'r1'), ('i2', 'r1')",
@@ -71,8 +72,8 @@ private func seedGraph(_ db: any DatabaseWriter, engine: SyncEngine, _ statement
 
 @Test func cascadeDrainsTombstonesChildrenBeforeParent() async throws {
     let db = try recipeGraphDB()
-    let remote = FakeRemote()
-    let engine = try SyncEngine(db: db, remote: remote, tables: recipeGraphTables)
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: recipeGraphTables)
     try await seedGraph(db, engine: engine, [
         "INSERT INTO recipes (id) VALUES ('r1')",
         "INSERT INTO recipeIngredients (id, recipeId) VALUES ('i1', 'r1')",
@@ -98,7 +99,7 @@ private func seedGraph(_ db: any DatabaseWriter, engine: SyncEngine, _ statement
 
 @Test func deletingLeafParentQueuesOnlyItsOwnTombstone() async throws {
     let db = try recipeGraphDB()
-    let engine = try SyncEngine(db: db, remote: FakeRemote(), tables: recipeGraphTables)
+    let engine = try SyncEngine.forTesting(db: db, remote: InMemorySyncRemote(), tables: recipeGraphTables)
     try await seedGraph(db, engine: engine, ["INSERT INTO recipes (id) VALUES ('r1')"])
 
     try await write(db, "DELETE FROM recipes WHERE id = 'r1'")
@@ -112,7 +113,7 @@ private func seedGraph(_ db: any DatabaseWriter, engine: SyncEngine, _ statement
     // Deleting a recipeStep (a child that is itself a parent) removes its recipeStepIngredients but
     // leaves the recipe and its recipeIngredients intact.
     let db = try recipeGraphDB()
-    let engine = try SyncEngine(db: db, remote: FakeRemote(), tables: recipeGraphTables)
+    let engine = try SyncEngine.forTesting(db: db, remote: InMemorySyncRemote(), tables: recipeGraphTables)
     try await seedGraph(db, engine: engine, [
         "INSERT INTO recipes (id) VALUES ('r1')",
         "INSERT INTO recipeIngredients (id, recipeId) VALUES ('i1', 'r1')",
@@ -152,9 +153,9 @@ private func seedGraph(_ db: any DatabaseWriter, engine: SyncEngine, _ statement
             t.column("updatedAt", .text)
         }
     }
-    let engine = try SyncEngine(
+    let engine = try SyncEngine.forTesting(
         db: db,
-        remote: FakeRemote(),
+        remote: InMemorySyncRemote(),
         tables: [SyncTable(name: "recipes"), SyncTable(name: "mealPlans", dependsOn: ["recipes"])]
     )
     try await seedGraph(db, engine: engine, [
@@ -181,7 +182,7 @@ private func seedGraph(_ db: any DatabaseWriter, engine: SyncEngine, _ statement
             t.column("updatedAt", .text)
         }
     }
-    let engine = try SyncEngine(db: db, remote: FakeRemote(), tables: [SyncTable(name: "nodes", dependsOn: ["nodes"])])
+    let engine = try SyncEngine.forTesting(db: db, remote: InMemorySyncRemote(), tables: [SyncTable(name: "nodes", dependsOn: ["nodes"])])
     try await seedGraph(db, engine: engine, [
         "INSERT INTO nodes (id, parentId) VALUES ('n1', NULL), ('n2', 'n1'), ('n3', 'n2')",
     ])
@@ -200,14 +201,14 @@ private func seedGraph(_ db: any DatabaseWriter, engine: SyncEngine, _ statement
     // The server already tombstoned the children (its own trigger did, per contract §1/§2). Applying
     // the parent's tombstone cascades locally, but none of it may be queued back for upload.
     let db = try recipeGraphDB()
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [[
             "id": "r1", "title": "Soup",
             // Strictly newer than the `serverUpdatedAt` the seeding drain stamped on the local row.
             "updatedAt": "2026-07-01T00:00:00.000Z", "deletedAt": "2026-07-01T00:00:00.000Z",
         ]],
     ])
-    let engine = try SyncEngine(db: db, remote: remote, tables: recipeGraphTables)
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: recipeGraphTables)
     try await seedGraph(db, engine: engine, [
         "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Soup', '2026-01-01T00:00:00.000Z')",
         "INSERT INTO recipeSteps (id, recipeId) VALUES ('s1', 'r1')",

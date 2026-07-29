@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import GRDB
+import HappySyncTestSupport
 @testable import HappySync
 
 // Issue #49: the manifest is eight strings per table, and every typo in one used to fail silently and
@@ -285,7 +286,7 @@ private func manifestDB() throws -> DatabaseQueue {
     // wrong — and it runs *before* the DDL, so no half-installed set of triggers is left behind.
     let db = try manifestDB()
     #expect(throws: SyncError.self) {
-        _ = try SyncEngine(db: db, remote: FakeRemote(), tables: [SyncTable(name: "recipes", scopeColumn: "userID")])
+        _ = try SyncEngine.forTesting(db: db, remote: InMemorySyncRemote(), tables: [SyncTable(name: "recipes", scopeColumn: "userID")])
     }
     let triggers = try installedTriggerCount(db)
     #expect(triggers == 0)
@@ -294,9 +295,9 @@ private func manifestDB() throws -> DatabaseQueue {
 @Test func aValidManifestBuildsAnEngineAndInstallsItsTriggers() throws {
     // The negative space: none of the above fires on a manifest that matches its schema.
     let db = try manifestDB()
-    _ = try SyncEngine(
+    _ = try SyncEngine.forTesting(
         db: db,
-        remote: FakeRemote(),
+        remote: InMemorySyncRemote(),
         tables: [
             SyncTable(name: "recipes", jsonColumns: ["nutrition"], scopeColumn: "userId"),
             SyncTable(name: "recipeIngredients"),

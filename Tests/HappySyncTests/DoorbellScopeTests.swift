@@ -3,6 +3,7 @@ import Foundation
 import os
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // APPS-509: the Realtime doorbell must track auth changes. It used to resolve the partition scope
@@ -37,10 +38,10 @@ private func scopedRecipesDB() throws -> DatabaseQueue {
 
 @Test func signInReSubscribesDoorbellAndRingsWithoutStopStart() async throws {
     let db = try scopedRecipesDB()
-    let remote = FakeRemote()
-    let doorbell = FakeDoorbell()
+    let remote = InMemorySyncRemote()
+    let doorbell = ManualDoorbell()
     let scope = ScopeBox() // nil = signed out at start (cold launch before session restore)
-    let engine = try SyncEngine(
+    let engine = try SyncEngine.forTesting(
         db: db, remote: remote,
         tables: [SyncTable(name: "recipes", scopeColumn: "userId")],
         doorbell: doorbell, pollInterval: 999, debounceInterval: 0.02,
@@ -65,11 +66,11 @@ private func scopedRecipesDB() throws -> DatabaseQueue {
 
 @Test func userSwitchReFiltersDoorbellAndOldEventsStopPoking() async throws {
     let db = try scopedRecipesDB()
-    let remote = FakeRemote()
-    let doorbell = FakeDoorbell()
+    let remote = InMemorySyncRemote()
+    let doorbell = ManualDoorbell()
     let scope = ScopeBox()
     scope.value = "u1" // signed in as u1 from the start
-    let engine = try SyncEngine(
+    let engine = try SyncEngine.forTesting(
         db: db, remote: remote,
         tables: [SyncTable(name: "recipes", scopeColumn: "userId")],
         doorbell: doorbell, pollInterval: 999, debounceInterval: 0.02,
@@ -110,10 +111,10 @@ private func scopedRecipesDB() throws -> DatabaseQueue {
     // With no scoped tables the subscription filter doesn't depend on the uid, so an auth change
     // must not churn the channel — the doorbell subscribes exactly once.
     let db = try recipesDB()
-    let doorbell = FakeDoorbell()
+    let doorbell = ManualDoorbell()
     let scope = ScopeBox()
-    let remote = FakeRemote()
-    let engine = try SyncEngine(
+    let remote = InMemorySyncRemote()
+    let engine = try SyncEngine.forTesting(
         db: db, remote: remote,
         tables: [SyncTable(name: "recipes")], // unscoped
         doorbell: doorbell, pollInterval: 999, debounceInterval: 0.02,

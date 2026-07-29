@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // APPS-469: a scoped table filters downloads (and the Realtime doorbell) to the current user's
@@ -26,7 +27,7 @@ private func scopedRecipesDB() throws -> DatabaseQueue {
     let db = try scopedRecipesDB()
     // The remote holds two users' rows (as CookThis's shared `recipes` table does); the scoped pull
     // must apply only the signed-in user's row, never the other user's.
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [
             ["id": "r1", "title": "Mine", "userId": "u1", "updatedAt": "2026-06-30T10:00:00.000Z"],
             ["id": "r2", "title": "Theirs", "userId": "u2", "updatedAt": "2026-06-30T10:00:01.000Z"],
@@ -50,7 +51,7 @@ private func scopedRecipesDB() throws -> DatabaseQueue {
 @Test func pullUnscopedTableAppliesEveryRow() async throws {
     // Sanity: a table with no scopeColumn behaves exactly as before — no filter, all rows applied.
     let db = try scopedRecipesDB()
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [
             ["id": "r1", "title": "A", "userId": "u1", "updatedAt": "2026-06-30T10:00:00.000Z"],
             ["id": "r2", "title": "B", "userId": "u2", "updatedAt": "2026-06-30T10:00:01.000Z"],

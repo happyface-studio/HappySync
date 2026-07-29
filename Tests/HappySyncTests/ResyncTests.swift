@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // APPS-471: a device offline past the server's tombstone-purge horizon never sees the tombstones
@@ -26,7 +27,7 @@ private func markLastSynced(_ db: any DatabaseWriter, _ date: Date) async throws
             try db.execute(sql: "INSERT INTO recipes (id, title, updatedAt) VALUES (?, ?, '2026-01-01T00:00:00.000Z')", arguments: [id, id])
         }
     }
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [["id": "r1", "title": "r1", "updatedAt": "2026-01-01T00:00:00.000Z"]]
     ])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
@@ -46,7 +47,7 @@ private func markLastSynced(_ db: any DatabaseWriter, _ date: Date) async throws
     // A local row absent from the server, but the device synced moments ago → NOT stale, so no
     // reconcile. (If resync ran unconditionally, r2 would be wrongly deleted.)
     try await db.write { try $0.execute(sql: "INSERT INTO recipes (id, title, updatedAt) VALUES ('r2', 'keep', '2026-01-01T00:00:00.000Z')") }
-    let remote = FakeRemote(dataset: ["recipes": []])
+    let remote = InMemorySyncRemote(dataset: ["recipes": []])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
     try await markLastSynced(db, Date()) // synced just now
 
@@ -61,7 +62,7 @@ private func markLastSynced(_ db: any DatabaseWriter, _ date: Date) async throws
     // fresh install's local-only rows as purged deletes.
     let db = try recipesDB()
     try await db.write { try $0.execute(sql: "INSERT INTO recipes (id, title, updatedAt) VALUES ('r2', 'keep', '2026-01-01T00:00:00.000Z')") }
-    let remote = FakeRemote(dataset: ["recipes": []])
+    let remote = InMemorySyncRemote(dataset: ["recipes": []])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
 
     try await engine.runSyncOnce()
@@ -108,7 +109,7 @@ private actor ScopeBox {
             )
         }
     }
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [["id": "r1", "title": "r1", "userId": "u1", "updatedAt": "2026-01-01T00:00:00.000Z"]]
     ])
     let scopeBox = ScopeBox(nil) // session not restored yet
@@ -147,7 +148,7 @@ private actor ScopeBox {
     // holds nothing, so non-dirty local rows are purged deletes and must still be dropped.
     let db = try recipesDB()
     try await db.write { try $0.execute(sql: "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'stale', '2026-01-01T00:00:00.000Z')") }
-    let remote = FakeRemote(dataset: ["recipes": []])
+    let remote = InMemorySyncRemote(dataset: ["recipes": []])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)
     try await markLastSynced(db, Date(timeIntervalSinceNow: -100 * 24 * 3600))
 
@@ -176,7 +177,7 @@ private actor ScopeBox {
     let db = try recipesDB()
     // r2 was deleted server-side and its tombstone has been purged (it's absent from the server).
     try await db.write { try $0.execute(sql: "INSERT INTO recipes (id, title, updatedAt) VALUES ('r2','purged','2026-01-01T00:00:00.000Z')") }
-    let remote = FakeRemote(dataset: [
+    let remote = InMemorySyncRemote(dataset: [
         "recipes": [["id": "r1", "title": "r1", "updatedAt": "2026-01-01T00:00:00.000Z"]]
     ])
     let engine = try makeEngine(db: db, tables: [SyncTable(name: "recipes")], remote: remote)

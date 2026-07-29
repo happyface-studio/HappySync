@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import GRDB
 import Supabase
+import HappySyncTestSupport
 @testable import HappySync
 
 // APPS-470: upload failures must be visible, backed off per entry, and dead-lettered — not silently
@@ -64,8 +65,8 @@ private func httpError(_ code: Int) -> HTTPError {
 
 @Test func drainSkipsEntryStillInsideBackoffWindow() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 1) // first upsert fails (transient), then would succeed
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1) // first upsert fails (transient), then would succeed
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox() // attempt 1 fails, last_attempt_at = now
@@ -80,8 +81,8 @@ private func httpError(_ code: Int) -> HTTPError {
 
 @Test func permanentFailureDeadLettersImmediately() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 1, permanentUpserts: true)
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .permanent)
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     let outcome = try await engine.drainOutbox()
@@ -99,8 +100,8 @@ private func httpError(_ code: Int) -> HTTPError {
 @Test func authFailureIsRetriedNotParked() async throws {
     let db = try recipesDB()
     // A single 401 (stale token) on the first attempt, then auth has recovered and the write lands.
-    let remote = FakeRemote(failUpserts: 1, upsertError: httpError(401))
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 2)
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(httpError(401)))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 2)
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     let outcome = try await engine.drainOutbox() // 401 → transient auth failure, not a dead letter
@@ -122,8 +123,8 @@ private func httpError(_ code: Int) -> HTTPError {
 @Test func transientPostgrestStateIsRetried() async throws {
     let db = try recipesDB()
     // 40001 serialization_failure surfaces as a PostgrestError but is a transient Postgres state.
-    let remote = FakeRemote(failUpserts: 1, upsertError: PostgrestError(code: "40001", message: "serialization_failure"))
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(PostgrestError(code: "40001", message: "serialization_failure")))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     let outcome = try await engine.drainOutbox()
@@ -140,8 +141,8 @@ private func httpError(_ code: Int) -> HTTPError {
 @Test func constraintViolationPostgrestParksImmediately() async throws {
     let db = try recipesDB()
     // 23505 unique_violation is a PostgrestError the server will never accept as-is → dead-letter now.
-    let remote = FakeRemote(failUpserts: 1, upsertError: PostgrestError(code: "23505", message: "unique_violation"))
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(PostgrestError(code: "23505", message: "unique_violation")))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     let outcome = try await engine.drainOutbox()
@@ -155,9 +156,9 @@ private func httpError(_ code: Int) -> HTTPError {
     let db = try recipesDB()
     let entryCount = 5
     // Every upload in the first drain pass 401s (token stale at cold launch); afterwards auth refreshed.
-    let remote = FakeRemote(failUpserts: entryCount, upsertError: httpError(401))
+    let remote = InMemorySyncRemote(failUpserts: entryCount, upsertFailure: .error(httpError(401)))
     // A deliberately tiny cap: proves auth failures don't park even when the budget is nearly spent.
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 2)
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 2)
     for i in 0..<entryCount {
         try await write(db, "INSERT INTO recipes (id, title) VALUES (?, ?)", ["r\(i)", "T\(i)"])
     }
@@ -176,8 +177,8 @@ private func httpError(_ code: Int) -> HTTPError {
 
 @Test func transientFailureDeadLettersAfterCap() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 99) // always fails (transient)
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 2)
+    let remote = InMemorySyncRemote(failUpserts: 99) // always fails (transient)
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 2)
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.drainOutbox()          // attempt 1 — still retrying
@@ -193,11 +194,11 @@ private func httpError(_ code: Int) -> HTTPError {
     let db = try recipesDB()
     // A poison local edit parks after failing permanently; a newer remote version of the same row
     // must still apply. If the LWW dirty gate counted the parked entry, the row would wedge forever.
-    let remote = FakeRemote(
-        failUpserts: 1, permanentUpserts: true,
-        dataset: ["recipes": [["id": "r1", "title": "Server Wins", "updatedAt": "2026-06-30T12:00:00.000Z"]]]
+    let remote = InMemorySyncRemote(
+        dataset: ["recipes": [["id": "r1", "title": "Server Wins", "updatedAt": "2026-06-30T12:00:00.000Z"]]],
+        failUpserts: 1, upsertFailure: .permanent
     )
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Poison', '2026-06-30T09:00:00.000Z')")
 
     try await engine.drainOutbox() // parks the poison entry
@@ -212,11 +213,11 @@ private func httpError(_ code: Int) -> HTTPError {
     // Device B's newer version sits on the server; Device A's poison local edit is older and parks
     // permanently. A pull while A's row is still dirty skips B's version but advances the cursor past
     // it — so after the entry dead-letters, the skipped version must still be re-fetched (APPS-505).
-    let remote = FakeRemote(
-        failUpserts: 1, permanentUpserts: true,
-        dataset: ["recipes": [["id": "r1", "title": "Server Wins", "updatedAt": "2026-06-30T12:00:00.000Z"]]]
+    let remote = InMemorySyncRemote(
+        dataset: ["recipes": [["id": "r1", "title": "Server Wins", "updatedAt": "2026-06-30T12:00:00.000Z"]]],
+        failUpserts: 1, upsertFailure: .permanent
     )
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
     try await write(db, "INSERT INTO recipes (id, title, updatedAt) VALUES ('r1', 'Poison', '2026-06-30T09:00:00.000Z')")
 
     // 1. Pull while the row is dirty: the queued upload should win, so the server version is skipped —
@@ -239,8 +240,8 @@ private func httpError(_ code: Int) -> HTTPError {
 
 @Test func statusSurfacesFailedThenDeadLetteredUploads() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 99) // always fails transiently
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 2)
+    let remote = InMemorySyncRemote(failUpserts: 99) // always fails transiently
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 2)
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.runSyncOnce() // attempt 1 fails; pull succeeds
@@ -263,8 +264,8 @@ private func httpError(_ code: Int) -> HTTPError {
 
 @Test func statusStaysFailingWhenDrainSkipsEntryInBackoffWindow() async throws {
     let db = try recipesDB()
-    let remote = FakeRemote(failUpserts: 99) // always fails transiently
-    let engine = try SyncEngine(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 5)
+    let remote = InMemorySyncRemote(failUpserts: 99) // always fails transiently
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 5)
     try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
 
     try await engine.runSyncOnce() // attempt 1 fails; entry now inside its per-entry backoff window

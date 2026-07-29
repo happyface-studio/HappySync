@@ -4,9 +4,14 @@ import Supabase
 /// A resolved partition filter applied to a download alongside the cursor: `column = value`. The
 /// value is the current user's partition key (e.g. the Supabase auth uid), resolved per pull — so
 /// signing in as a different user re-scopes without re-declaring tables. See APPS-469.
-struct ScopeFilter: Sendable, Equatable {
-    let column: String
-    let value: String
+public struct ScopeFilter: Sendable, Equatable {
+    public let column: String
+    public let value: String
+
+    public init(column: String, value: String) {
+        self.column = column
+        self.value = value
+    }
 }
 
 /// A remote failure the drain can classify for retry (APPS-470). Conform a thrown error to signal
@@ -14,16 +19,34 @@ struct ScopeFilter: Sendable, Equatable {
 /// write as-is — RLS, constraint, validation) are dead-lettered immediately; everything else is
 /// treated as transient and retried with backoff. Unrecognized errors default to transient — safer
 /// to retry than to silently drop a user's write.
-protocol ClassifiedSyncError: Error {
+///
+/// Public so a custom `SyncRemote` — or a test double simulating a poison write — can say which of
+/// the two it is, instead of leaving the drain to guess transient and burn eight retries on a write
+/// the server was never going to accept.
+public protocol ClassifiedSyncError: Error {
     var isPermanent: Bool { get }
 }
 
 /// Wraps a transport error with a retry classification, preserving the underlying error's text so
 /// the `last_error` telemetry breadcrumb stays useful.
-struct RemoteFailure: ClassifiedSyncError, CustomStringConvertible {
-    let isPermanent: Bool
-    let underlying: Error
-    var description: String { "\(underlying)" }
+public struct RemoteFailure: ClassifiedSyncError, CustomStringConvertible {
+    public let isPermanent: Bool
+    public let underlying: Error
+    public var description: String { "\(underlying)" }
+
+    public init(isPermanent: Bool, underlying: Error) {
+        self.isPermanent = isPermanent
+        self.underlying = underlying
+    }
+
+    /// Wraps `underlying` with **the classification the production remote would give it** — the same
+    /// `PostgrestError` code / HTTP status table `SupabaseRemote` applies. A test double raising a
+    /// real transport error (`HTTPError(401)`, `PostgrestError(code: "42501")`) should build its
+    /// failure this way, so the drain sees exactly what it would see in the field rather than a
+    /// hand-picked permanence that may not match.
+    public init(classifying underlying: Error) {
+        self.init(isPermanent: remoteErrorIsPermanent(underlying), underlying: underlying)
+    }
 }
 
 /// True when a transport error is **permanent** — the server will never accept the write as-is, so
@@ -86,10 +109,15 @@ func remoteErrorIsAuthTransient(_ error: Error) -> Bool {
     return false
 }
 
-/// The server side of the upload path. Abstracted behind a protocol so the drain can be unit-tested
-/// with a fake that records call order and simulates failures — the production conformance is the
-/// only place that touches the network.
-protocol SyncRemote: Sendable {
+/// The server side of the sync path. Abstracted behind a protocol so the drain can be driven by a
+/// fake that records call order and simulates failures — the production conformance
+/// (`SupabaseRemote`) is the only place that touches the network.
+///
+/// Public so a consumer can test its own integration offline: build the engine with
+/// `SyncEngine.forTesting(db:remote:tables:)` and an `InMemorySyncRemote` from the
+/// `HappySyncTestSupport` product, and questions like "does deleting a recipe queue tombstones for
+/// its children?" become assertions instead of a live Supabase project (issue #53).
+public protocol SyncRemote: Sendable {
     /// Upserts one row and returns the server's representation, which carries the stamped
     /// cursor column (`updatedAt`) the drain writes back locally to mark the row clean. `onConflict`
     /// is the comma-joined columns of a secondary unique constraint to use as the PostgREST conflict
