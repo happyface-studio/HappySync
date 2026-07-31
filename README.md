@@ -247,10 +247,14 @@ deliberately generic, but is pressure-tested against one real app before it's tr
 
 ## Documentation & Claude skill
 
+- **[Documentation](https://swiftpackageindex.com/happyface-studio/HappySync/documentation/happysync)**
+  — Getting Started, Server Setup, Operations & Troubleshooting, Testing, Architecture, and every
+  public symbol. Built from [`Sources/HappySync/Documentation.docc`](Sources/HappySync/Documentation.docc);
+  `swift package generate-documentation` builds it locally.
 - **[Example app](Examples)** — a runnable two-table SwiftUI demo against the in-memory fake, with
   the Supabase migrations for when you point it at a real project.
-- **[Wiki](https://github.com/happyface-studio/HappySync/wiki)** — Getting Started, Server Setup,
-  API Reference, Operations & Troubleshooting, and Architecture. (Sources live in [`wiki/`](wiki).)
+- **[Wiki](https://github.com/happyface-studio/HappySync/wiki)** — points at the documentation
+  above, and hosts the Claude skill page. (Sources live in [`wiki/`](wiki).)
 - **[Sync contract](docs/SYNC-CONTRACT.md)** — the language-neutral contract every client and the
   server must honor.
 - **Claude skill** — [`.claude/skills/happysync/`](.claude/skills/happysync) is an installable

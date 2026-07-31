@@ -11,6 +11,14 @@ jobs:
       - uses: actions/checkout@v4
       - run: swift test
 
+  docs:
+    # The DocC catalog is the documentation now, so a broken link or an unresolvable symbol
+    # reference should surface here rather than on Swift Package Index (issue #57).
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift package --allow-writing-to-directory ./docs-build generate-documentation --target HappySync --output-path ./docs-build
+
   example:
     # The example is a separate package that consumes this one by path, so it catches an API change
     # the library's own tests can't see — and its tests assert the behaviours the demo puts on

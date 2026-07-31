@@ -16,6 +16,9 @@ let package = Package(
         // supabase-community is the fork CookThis consumes; matching the URL (and SPM
         // identity) lets the app share one supabase-swift instead of resolving two.
         .package(url: "https://github.com/supabase-community/supabase-swift.git", from: "2.0.0"),
+        // Build-tools only: `swift package generate-documentation` / `preview-documentation` for the
+        // DocC catalog (issue #57). Swift Package Index builds the same catalog from `.spi.yml`.
+        .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.3.0"),
     ],
     targets: [
         .target(

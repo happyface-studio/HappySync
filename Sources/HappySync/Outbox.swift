@@ -8,7 +8,10 @@ import GRDB
 /// Public because it appears in `SyncRemote.fetch` — a custom or fake remote has to be able to read
 /// the position it's being asked to resume from (issue #53).
 public struct SyncCursor: Sendable, Equatable {
+    /// The table's `cursorColumn` value of the last applied row — a server-stamped timestamp.
     public var updatedAt: String
+    /// That row's primary key, which breaks ties between rows sharing a `updatedAt` so a page
+    /// boundary can't skip one.
     public var id: String
 
     public init(updatedAt: String, id: String) {

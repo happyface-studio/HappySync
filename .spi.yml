@@ -1,0 +1,7 @@
+# Swift Package Index build settings. `documentation_targets` is what makes SPI build and host the
+# DocC catalog in Sources/HappySync/Documentation.docc, so the doc comments are reachable from a
+# browser instead of only from Xcode Quick Help (issue #57).
+version: 1
+builder:
+  configs:
+    - documentation_targets: [HappySync]

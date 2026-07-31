@@ -23,15 +23,21 @@ status, and retry/backoff. It does **not** own reads or schema.
 
 ## Start here
 
+The developer documentation is **[built from the source](https://swiftpackageindex.com/happyface-studio/HappySync/documentation/happysync)** — one copy, next to the symbols it
+describes. These wiki pages point at it:
+
 | Page | What's on it |
 |---|---|
-| **[[Getting Started]]** | Add the package, wire a `SyncEngine`, first write and pull. |
-| **[[Server Setup]]** | The required Supabase schema: `updatedAt` trigger, `deletedAt` tombstones, RLS, Realtime. |
-| **[[API Reference]]** | Every public type and method with signatures and field semantics. |
-| **[[Operations and Troubleshooting]]** | Status UI, dead-letter repair, teardown, schema evolution, a troubleshooting table. |
-| **[[Testing]]** | Test your sync integration offline with the shipped fakes — no Supabase project. |
-| **[[Architecture]]** | How upload, download, LWW, the doorbell, and cascades fit together. |
+| **[Getting Started](https://swiftpackageindex.com/happyface-studio/HappySync/documentation/happysync/gettingstarted)** | Add the package, wire a `SyncEngine`, first write and pull. |
+| **[Server Setup](https://swiftpackageindex.com/happyface-studio/HappySync/documentation/happysync/serversetup)** | The required Supabase schema: `updatedAt` trigger, `deletedAt` tombstones, RLS, Realtime. |
+| **[API Reference](https://swiftpackageindex.com/happyface-studio/HappySync/documentation/happysync)** | Every public type and method, generated from the source. |
+| **[Operations and Troubleshooting](https://swiftpackageindex.com/happyface-studio/HappySync/documentation/happysync/operations)** | Status UI, dead-letter repair, teardown, schema evolution, a troubleshooting table. |
+| **[Testing](https://swiftpackageindex.com/happyface-studio/HappySync/documentation/happysync/testingyourintegration)** | Test your sync integration offline with the shipped fakes — no Supabase project. |
+| **[Architecture](https://swiftpackageindex.com/happyface-studio/HappySync/documentation/happysync/architecture)** | How upload, download, LWW, the doorbell, and cascades fit together. |
 | **[[Claude Skill]]** | Install the HappySync Claude skill so your AI assistant integrates it correctly. |
+
+Want to *see* it work first? [`Examples/`](https://github.com/happyface-studio/HappySync/tree/main/Examples)
+is a two-table SwiftUI app wired to the in-memory fake — no Supabase project needed.
 
 ## Requirements
 
