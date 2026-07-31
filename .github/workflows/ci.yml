@@ -10,3 +10,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: swift test
+
+  example:
+    # The example is a separate package that consumes this one by path, so it catches an API change
+    # the library's own tests can't see — and its tests assert the behaviours the demo puts on
+    # screen, so the demo can't quietly rot (issue #58).
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test --package-path Examples

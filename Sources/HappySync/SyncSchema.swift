@@ -1,7 +1,9 @@
 import GRDB
 
-/// Internal bookkeeping tables HappySync owns. The app never reads or writes these directly.
-enum SyncSchema {
+/// Internal bookkeeping tables HappySync owns. The app never reads or writes these directly — the
+/// only public surface here is the migrator, for an app that runs its own `DatabaseMigrator` on the
+/// same database and therefore has to share one with the engine.
+public enum SyncSchema {
     /// Shared by every internal table below, so a schema scan can tell the engine's own tables from
     /// the app's without listing them (see `LocalSchema`).
     static let tablePrefix = "_sync_"
@@ -16,8 +18,9 @@ enum SyncSchema {
     /// writes don't queue themselves straight back into the outbox (issue #48).
     static let controlTable = "_sync_control"
 
-    /// A standalone migrator for HappySync's internal tables. Used when the engine owns the DB.
-    static func migrator() -> DatabaseMigrator {
+    /// A standalone migrator for HappySync's internal tables. Used when the engine owns the DB —
+    /// which it runs itself at init, so an app only needs this to migrate ahead of time.
+    public static func migrator() -> DatabaseMigrator {
         var migrator = DatabaseMigrator()
         register(into: &migrator)
         return migrator
@@ -30,7 +33,7 @@ enum SyncSchema {
     /// The per-table **write-capture triggers** (issue #48) are deliberately *not* here: they're
     /// derived from the `SyncTable` manifest, which is source code and ships without a schema version
     /// bump, so `SyncTriggers.install` (re)runs idempotently at every engine init instead.
-    static func register(into migrator: inout DatabaseMigrator) {
+    public static func register(into migrator: inout DatabaseMigrator) {
         migrator.registerMigration("happysync_v1") { db in
             try db.create(table: outboxTable) { t in
                 t.autoIncrementedPrimaryKey("seq")

@@ -12,6 +12,11 @@ CRDTs needed.
 > APPS-415) are all live. Next is M2 server prep (server-side `updated_at` triggers + `deleted_at`
 > tombstones) before the M3 CookThis cutover.
 
+**See it run first:** [`Examples/`](Examples) is a two-table SwiftUI app wired to the in-memory fake
+— no Supabase project, no schema, no credentials. `swift run --package-path Examples DemoApp` shows
+writes uploading with no engine call, a cascade delete tombstoning its children, a change arriving
+from "device B", a refused write parking, and the repair that unparks it.
+
 ## Model
 
 Local GRDB SQLite is the source of truth for reads (observed with `ValueObservation`). You write
@@ -242,6 +247,8 @@ deliberately generic, but is pressure-tested against one real app before it's tr
 
 ## Documentation & Claude skill
 
+- **[Example app](Examples)** — a runnable two-table SwiftUI demo against the in-memory fake, with
+  the Supabase migrations for when you point it at a real project.
 - **[Wiki](https://github.com/happyface-studio/HappySync/wiki)** — Getting Started, Server Setup,
   API Reference, Operations & Troubleshooting, and Architecture. (Sources live in [`wiki/`](wiki).)
 - **[Sync contract](docs/SYNC-CONTRACT.md)** — the language-neutral contract every client and the

@@ -1169,12 +1169,14 @@ public actor SyncEngine {
                 let servers = try await remote.upsert(table: spec.name, rows: payloads, onConflict: onConflict)
                 let matched = Self.match(servers, to: uploads, primaryKey: spec.primaryKey)
                 try await stampAndClear(
-                    zip(uploads, matched).map { ConfirmedUpload(entry: $0, server: $1, seqs: seqs(of: $0)) },
+                    zip(uploads, matched).map { entry, server in
+                        ConfirmedUpload(entry: entry, server: server, seqs: seqs(of: entry))
+                    },
                     spec: spec
                 )
             case .delete:
                 try await remote.delete(table: spec.name, primaryKey: spec.primaryKey, pks: chunk.map(\.pk))
-                try await clear(chunk.flatMap(seqs(of:)))
+                try await clear(chunk.flatMap { seqs(of: $0) })
             }
             return true
         } catch {
@@ -1209,9 +1211,9 @@ public actor SyncEngine {
     /// key is `"7"` there and must be compared as one; anything that isn't a scalar key is no key.
     private static func wireKey(_ value: AnyJSON) -> String? {
         switch value {
-        case .string(let string): string
-        case .integer(let int): String(int)
-        default: nil
+        case .string(let string): return string
+        case .integer(let int): return String(int)
+        default: return nil
         }
     }
 
