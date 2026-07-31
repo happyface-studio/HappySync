@@ -52,6 +52,25 @@ let tables = [
 `serverOwnedColumns`, `serverColumns`, `cursorColumn` — including when to reach for each and what
 breaks if you get it wrong.
 
+### Declaring them from your record types
+
+If your tables have GRDB record types, declare the manifest from those instead and the table names
+stop being strings you can mistype or forget to update:
+
+```swift
+let tables = [
+    SyncTable.table(Recipe.self, jsonColumns: [Recipe.Columns.nutrition]),
+    SyncTable.table(RecipeIngredient.self),          // dependsOn still derived from the FK
+    SyncTable.table(RecipeStep.self, dependsOn: [Recipe.self]),
+]
+```
+
+Renaming a record's `databaseTableName` is now a build error at the manifest rather than a table
+that quietly stops syncing. Column names are as checked as your record makes them: GRDB's
+conventional `enum Columns` ties each one to a single declaration, while a bare `Column("nutrition")`
+is exactly as unchecked as the string was. Both forms produce the same ``SyncTable``, so mixing them
+in one manifest is fine — reach for the string form for a table with no Swift record type.
+
 ## 3. Create and start the engine
 
 ```swift

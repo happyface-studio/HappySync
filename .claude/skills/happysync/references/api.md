@@ -61,6 +61,19 @@ public init(
 )
 ```
 
+Declared from a GRDB record type instead, so a rename is a build error rather than a table that
+quietly stops syncing (#50). Same `SyncTable`, so a manifest can mix both forms — keep the string
+form for a table with no Swift record type:
+
+```swift
+SyncTable.table(Recipe.self, jsonColumns: [Recipe.Columns.nutrition])   // name from databaseTableName
+SyncTable.table(RecipeStep.self, dependsOn: [Recipe.self])              // dependency as a type
+```
+
+Columns are as checked as the record makes them: GRDB's conventional `enum Columns` ties each name
+to one declaration; a bare `Column("nutrition")` is exactly as unchecked as the string was. Either
+way `SyncEngine.init` still validates every name against the live schema.
+
 Field gotchas:
 
 - **`dependsOn`** is normally left alone: `nil` (the default) means the engine reads

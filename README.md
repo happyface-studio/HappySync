@@ -74,6 +74,20 @@ for await status in engine.status {
 }
 ```
 
+If your tables have GRDB record types, declare the manifest from those and the table names stop being
+strings that can go stale — a rename becomes a build error rather than a table that quietly stops
+syncing:
+
+```swift
+tables: [
+    SyncTable.table(Recipe.self, jsonColumns: [Recipe.Columns.nutrition]),
+    SyncTable.table(RecipeIngredient.self),   // dependsOn still derived from the schema's FKs
+]
+```
+
+Both forms produce the same `SyncTable`, so a manifest can mix them — keep the string form for a
+table with no Swift record type.
+
 For a table whose RLS is broader than the sync partition (e.g. a shared `recipes` table readable as
 `isPublic OR userId = auth.uid()`), declare a `scopeColumn` and supply the partition value so the
 engine downloads only the user's rows instead of the whole catalog:
