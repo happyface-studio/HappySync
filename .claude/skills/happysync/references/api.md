@@ -228,14 +228,16 @@ Everything but the network is production code — same drain, pull, retry classi
 ordering — so a test here asserts shipped behaviour.
 
 - `InMemorySyncRemote` (actor): `upsertCalls` / `deleteCalls` / `fetchCalls` / `lastScope` record
-  what the client sent; `seed(_:rows:)` publishes a change "another device" made; `representation:`
-  supplies the server's response (server-normalized values, a `conflictColumns` merge);
-  `onUpsert`/`onFetch` hooks suspend the *n*-th call so a test can race a local write against an
-  in-flight upload.
+  what the client sent; `upsertRequests` / `deleteRequests` record how many round trips it took,
+  which batching makes fewer than the per-row call counts (#54); `seed(_:rows:)` publishes a change
+  "another device" made; `representation:` supplies the server's response (server-normalized values,
+  a `conflictColumns` merge); `onUpsert`/`onFetch` hooks suspend the *n*-th call so a test can race a
+  local write against an in-flight upload.
 - Failure injection: `failUpserts` / `failFetches` counts with a `SimulatedFailure` —
   `.transient` (retried), `.permanent` (parks on the first attempt), or `.error(anError)` which
   applies the **production** classification to a real `HTTPError`/`PostgrestError`. Use `99` for
-  "always".
+  "always". `failUpserts` counts **requests**: a rejected batch spends one, and so does each row of
+  the per-row re-run that follows it.
 - `ManualDoorbell`: `fire()` rings the current subscription; `ringScopes` and `liveSubscriptions`
   prove an auth change re-subscribed and tore the old one down; `fire(subscription: 0)` rings a
   torn-down one.
@@ -243,7 +245,8 @@ ordering — so a test here asserts shipped behaviour.
   never a fixed `Task.sleep` plus one assertion.
 - A bespoke double is three methods on `SyncRemote`. Signal permanence by conforming the thrown
   error to `ClassifiedSyncError`, or wrap a real one with `RemoteFailure(classifying:)`. Anything
-  unclassified is treated as transient.
+  unclassified is treated as transient. The batched `upsert(table:rows:)` / `delete(table:pks:)` the
+  drain prefers default to looping over the single-row calls, so implementing them is optional.
 
 The three tests worth writing first: a cascade delete queues every child's tombstone; status reaches
 `.degraded` when an upload parks; `stop()` has quiesced the engine before sign-out wipes the DB.

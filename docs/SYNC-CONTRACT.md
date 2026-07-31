@@ -74,6 +74,14 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
 - **PostgREST upsert** with `Prefer: return=representation` for `.upsert`; soft-delete for
   `.delete`. Both are **idempotent by primary key**, so retries are safe; back off exponentially
   **per entry** (`last_attempt_at` gates the window) and count `attempts`.
+- **Uploads are batched, failures are not (#54).** Consecutive entries sharing a table and an op go
+  out as **one** request — an array body for the upsert, `in.(…)` for the tombstone update — capped
+  at 256 rows, so a backlog costs ⌈N/256⌉ round trips per run rather than N. Entries are never
+  reordered to make a bigger batch, so the FK order below survives. A rejected batch identifies the
+  request, not the row, so the chunk is **re-run one entry at a time** and only the entries that
+  genuinely fail are classified, retried and parked: batch speed on the healthy path, per-entry
+  diagnostics on the unhealthy one. The failed batch itself charges no attempts — otherwise one
+  poison row would spend the retry budget of every healthy row beside it.
 - **The full representation is written back locally (APPS-506).** On a successful upsert the server
   row — column defaults, trigger-normalized fields, recomputed `serverOwnedColumns`, and (for a
   `conflictColumns` upsert) the **merged** row re-keyed to the client's pk (APPS-478) — is applied to

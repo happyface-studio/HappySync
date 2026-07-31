@@ -50,6 +50,11 @@ optimistically. A background drain processes entries in `seq` order:
   server's, so LWW would skip the row forever). The write-back is skipped for a row that gained a
   newer outbox entry mid-flight — the pending edit wins.
 - **FK ordering:** upsert parents before children; tombstone children before parents.
+- **Batched requests, per-entry failures.** Consecutive entries for the same table and op are sent as
+  one request (up to 256 rows), so a 500-row backlog is a handful of round trips instead of 500.
+  Entries are never reordered to make a bigger batch, so the FK order above holds. When the server
+  rejects a batch it hasn't said *which* row it objected to, so the chunk is re-run one entry at a
+  time — the poison row parks alone and its neighbours upload.
 - **Per-entry backoff** with jitter; failures are classified permanent vs transient (see
   [[Operations and Troubleshooting]]).
 

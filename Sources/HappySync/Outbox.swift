@@ -90,6 +90,29 @@ func orderForUpload(_ entries: [OutboxEntry], tables: [SyncTable]) -> [OutboxEnt
     // `collapseOutbox`, which nets each key to one op before this FK ordering runs (APPS-472).
 }
 
+/// Groups an already-ordered run of pending uploads into the chunks the drain sends as one request
+/// each: **consecutive** entries sharing a table and an op, capped at `limit` (issue #54).
+///
+/// Adjacency is the whole rule — entries are never reordered to make a bigger batch, so the FK-safe
+/// order `orderForUpload` produced survives intact and a chunk is always one PostgREST call's worth:
+/// one table, one op, one conflict target. The cap bounds both the request size and the blast radius
+/// of the per-row fallback a rejected chunk falls back to.
+func uploadChunks(_ entries: [OutboxEntry], limit: Int) -> [[OutboxEntry]] {
+    let limit = max(1, limit)
+    var chunks: [[OutboxEntry]] = []
+    for entry in entries {
+        let extendsLast = chunks.last.map { chunk in
+            chunk.count < limit && chunk[0].tableName == entry.tableName && chunk[0].op == entry.op
+        } ?? false
+        if extendsLast {
+            chunks[chunks.count - 1].append(entry)
+        } else {
+            chunks.append([entry])
+        }
+    }
+    return chunks
+}
+
 /// Exponential backoff between drain passes for an entry that has failed `attempts` times, with
 /// **±20% jitter** so a user's devices that failed together — a shared outage, one expired session —
 /// don't retry in lockstep and thundering-herd the server the moment it recovers (APPS-514). Capped

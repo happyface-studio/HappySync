@@ -123,13 +123,45 @@ public protocol SyncRemote: Sendable {
     /// is the comma-joined columns of a secondary unique constraint to use as the PostgREST conflict
     /// target, or nil to conflict on the primary key (the default). See APPS-478.
     func upsert(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON]
+    /// Upserts a **batch** of rows for one table in a single request, returning one representation
+    /// per row. Every row carries the same columns and the same `onConflict` target, so this is one
+    /// PostgREST call rather than `rows.count` of them (issue #54).
+    ///
+    /// The default implementation forwards to the single-row `upsert` in a loop, so an existing
+    /// conformance keeps working unchanged — override it to get the batch. Either way the drain
+    /// treats a thrown error as rejecting the **whole** batch and re-runs the rows one at a time, so
+    /// a single poison row parks alone instead of taking its neighbours with it.
+    func upsert(table: String, rows: [[String: AnyJSON]], onConflict: String?) async throws -> [[String: AnyJSON]]
     /// Propagates a delete for one row, keyed by primary key (soft delete — sets the tombstone).
     func delete(table: String, primaryKey: String, pk: String) async throws
+    /// Propagates a **batch** of deletes for one table in a single request. Defaults to looping over
+    /// the single-row `delete`; see the batch `upsert` for the failure contract.
+    func delete(table: String, primaryKey: String, pks: [String]) async throws
     /// Fetches up to `limit` rows changed since `cursor`, ordered by the `(cursorColumn, id)` tuple
     /// so the caller can resume exactly where it left off. Tombstoned rows (`deletedAt != null`)
     /// are included. When `scope` is set, only rows matching `scope.column = scope.value` are
     /// returned (the download partition — orthogonal to the cursor).
     func fetch(table: String, cursorColumn: String, since cursor: SyncCursor?, primaryKey: String, scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]]
+}
+
+/// Batch defaults, so `SyncRemote` stays the same three methods to implement. A conformance that
+/// can genuinely send one request per batch (`SupabaseRemote` does) overrides them; one that can't
+/// loses nothing but the round trips.
+public extension SyncRemote {
+    func upsert(table: String, rows: [[String: AnyJSON]], onConflict: String?) async throws -> [[String: AnyJSON]] {
+        var representations: [[String: AnyJSON]] = []
+        representations.reserveCapacity(rows.count)
+        for row in rows {
+            representations.append(try await upsert(table: table, row: row, onConflict: onConflict))
+        }
+        return representations
+    }
+
+    func delete(table: String, primaryKey: String, pks: [String]) async throws {
+        for pk in pks {
+            try await delete(table: table, primaryKey: primaryKey, pk: pk)
+        }
+    }
 }
 
 /// `SyncRemote` over a Supabase PostgREST client. Idempotent by primary key, so the drain can
@@ -139,33 +171,54 @@ struct SupabaseRemote: SyncRemote {
     let auth: @Sendable () async -> String
 
     func upsert(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON] {
+        try await send(table: table, rows: [row], onConflict: onConflict).first ?? row
+    }
+
+    /// One PostgREST request for the whole batch: an array body upserts against the same conflict
+    /// target, and the representation comes back one row per uploaded row, in request order (issue
+    /// #54). PostgREST requires every object in the body to carry the same keys — which holds here,
+    /// since a table's payloads are built from the same column list — and rejects the request
+    /// outright otherwise, which the drain reads as "re-run this chunk one row at a time".
+    func upsert(table: String, rows: [[String: AnyJSON]], onConflict: String?) async throws -> [[String: AnyJSON]] {
+        try await send(table: table, rows: rows, onConflict: onConflict)
+    }
+
+    private func send(table: String, rows: [[String: AnyJSON]], onConflict: String?) async throws -> [[String: AnyJSON]] {
+        guard !rows.isEmpty else { return [] } // never spend a request (or send `[]`) on nothing
         let token = await auth()
         do {
             // onConflict nil → PostgREST conflicts on the primary key (its default); non-nil → the
             // named secondary unique constraint is the conflict target, merging onto the existing row.
-            let rows: [[String: AnyJSON]] = try await client
+            return try await client
                 .from(table)
-                .upsert(row, onConflict: onConflict, returning: .representation)
+                .upsert(rows, onConflict: onConflict, returning: .representation)
                 .setHeader(name: "Authorization", value: "Bearer \(token)")
                 .execute()
                 .value
-            return rows.first ?? row
         } catch {
             throw Self.classify(error) // tag permanence so the drain can dead-letter poison writes
         }
     }
 
     func delete(table: String, primaryKey: String, pk: String) async throws {
+        try await delete(table: table, primaryKey: primaryKey, pks: [pk])
+    }
+
+    func delete(table: String, primaryKey: String, pks: [String]) async throws {
+        guard !pks.isEmpty else { return } // an empty `in.()` is a filter no row matches — skip the trip
         let token = await auth()
         // Soft delete: set the tombstone so the deletion propagates on the next cursor pull (a hard
         // DELETE would simply vanish, never reaching other devices). The server's BEFORE UPDATE
         // trigger stamps updatedAt — advancing the cursor — and an AFTER trigger tombstones the row's
         // children. deletedAt is the marker; the server-stamped updatedAt is what ordering trusts.
+        //
+        // One request for the whole batch: `in.(pk, …)` tombstones every named row in a single
+        // UPDATE, the delete-side counterpart of the batched upsert (issue #54).
         do {
             try await client
                 .from(table)
                 .update(["deletedAt": AnyJSON.string(Self.nowISO8601())])
-                .eq(primaryKey, value: pk)
+                .in(primaryKey, values: pks)
                 .setHeader(name: "Authorization", value: "Bearer \(token)")
                 .execute()
         } catch {

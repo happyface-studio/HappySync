@@ -184,7 +184,8 @@ static func SyncEngine.forTesting(
     pageSize: Int = 500, doorbell: any SyncDoorbell = SilentDoorbell(),
     pollInterval: TimeInterval = 30, debounceInterval: TimeInterval = 0.3,
     scope: @Sendable () async -> String? = { nil },
-    deadLetterAfter: Int = 8, maxOfflineGap: TimeInterval = 30 * 24 * 3600
+    deadLetterAfter: Int = 8, maxOfflineGap: TimeInterval = 30 * 24 * 3600,
+    uploadChunkSize: Int = SyncEngine.defaultUploadChunkSize   // rows per upload request
 ) throws -> SyncEngine
 
 protocol SyncRemote: Sendable {                  // the upload/download surface
@@ -192,6 +193,11 @@ protocol SyncRemote: Sendable {                  // the upload/download surface
     func delete(table: String, primaryKey: String, pk: String) async throws
     func fetch(table: String, cursorColumn: String, since: SyncCursor?, primaryKey: String,
                scope: ScopeFilter?, limit: Int) async throws -> [[String: AnyJSON]]
+
+    // Batched forms — the drain prefers these; both default to looping over the single-row calls,
+    // so implementing them is optional and only costs round trips (issue #54).
+    func upsert(table: String, rows: [[String: AnyJSON]], onConflict: String?) async throws -> [[String: AnyJSON]]
+    func delete(table: String, primaryKey: String, pks: [String]) async throws
 }
 protocol SyncDoorbell: Sendable {                // the Realtime wake signal
     func ring(scope: String?) -> AsyncStream<Void>

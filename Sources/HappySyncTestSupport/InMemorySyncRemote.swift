@@ -76,11 +76,19 @@ public actor InMemorySyncRemote: SyncRemote {
     /// table cursors on something other than `updatedAt`.
     public nonisolated let cursorColumn: String
 
-    /// Every upsert the drain has issued, in order — table, uploaded payload, and the PostgREST
-    /// conflict target (nil = conflict on the primary key).
+    /// Every **row** the drain has upserted, in order — table, uploaded payload, and the PostgREST
+    /// conflict target (nil = conflict on the primary key). A batched upload records one entry per
+    /// row it carried, so this counts writes regardless of how they were packed; `upsertRequests`
+    /// counts the requests.
     public private(set) var upsertCalls: [(table: String, row: [String: AnyJSON], onConflict: String?)] = []
-    /// Every tombstone the drain has propagated, in order.
+    /// How many upsert **requests** were issued — the number of network round trips, which batching
+    /// makes smaller than `upsertCalls.count` (issue #54). A rejected batch counts here too, then the
+    /// drain's per-row re-run adds one request each.
+    public private(set) var upsertRequests = 0
+    /// Every tombstone the drain has propagated, in order — one entry per row, as for `upsertCalls`.
     public private(set) var deleteCalls: [(table: String, pk: String)] = []
+    /// How many delete **requests** were issued. See `upsertRequests`.
+    public private(set) var deleteRequests = 0
     /// How many download pages have been requested. One pull of a single-table manifest that fits in
     /// one page is one call, so this is the usual way to observe "a sync pass ran".
     public private(set) var fetchCalls = 0
@@ -100,7 +108,9 @@ public actor InMemorySyncRemote: SyncRemote {
     /// - Parameters:
     ///   - dataset: Server rows per table, as PostgREST would return them. Downloads are served from
     ///     here, filtered by scope and cursor and truncated to the page limit.
-    ///   - failUpserts: How many upserts throw before one succeeds. `99` stands in for "always".
+    ///   - failUpserts: How many upload **requests** throw before one succeeds — a rejected batch
+    ///     spends one, as does each row of the per-row re-run that follows it. `99` stands in for
+    ///     "always".
     ///   - upsertFailure: What those failures are — the difference between a write that retries and
     ///     one that parks.
     ///   - failFetches: How many downloads throw before one succeeds.
@@ -147,7 +157,7 @@ public actor InMemorySyncRemote: SyncRemote {
         dataset[table] ?? []
     }
 
-    /// Makes the next `count` upserts throw. Replaces any run still outstanding.
+    /// Makes the next `count` upload requests throw. Replaces any run still outstanding.
     public func failNextUpserts(_ count: Int, with failure: SimulatedFailure = .transient) {
         remainingUpsertFailures = count
         upsertFailure = failure
@@ -180,6 +190,29 @@ public actor InMemorySyncRemote: SyncRemote {
     // MARK: - SyncRemote
 
     public func upsert(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON] {
+        upsertRequests += 1
+        return try await store(table: table, row: row, onConflict: onConflict)
+    }
+
+    /// The batched upload the drain prefers (issue #54). One request, so an injected failure rejects
+    /// the **whole** batch before any of its rows is recorded — which is how PostgREST answers a
+    /// rejected array body, and what makes the drain fall back to one row at a time.
+    public func upsert(table: String, rows: [[String: AnyJSON]], onConflict: String?) async throws -> [[String: AnyJSON]] {
+        upsertRequests += 1
+        if remainingUpsertFailures > 0 {
+            remainingUpsertFailures -= 1
+            throw upsertFailure.makeError()
+        }
+        var representations: [[String: AnyJSON]] = []
+        for row in rows {
+            representations.append(try await store(table: table, row: row, onConflict: onConflict))
+        }
+        return representations
+    }
+
+    /// Records one uploaded row and answers with the server's representation of it. Shared by the
+    /// single-row and batched entry points, which own the request accounting.
+    private func store(table: String, row: [String: AnyJSON], onConflict: String?) async throws -> [String: AnyJSON] {
         upsertCalls.append((table, row, onConflict))
         if let upsertHook { await upsertHook(upsertCalls.count) }
         if remainingUpsertFailures > 0 {
@@ -193,7 +226,13 @@ public actor InMemorySyncRemote: SyncRemote {
     }
 
     public func delete(table: String, primaryKey: String, pk: String) async throws {
+        deleteRequests += 1
         deleteCalls.append((table, pk))
+    }
+
+    public func delete(table: String, primaryKey: String, pks: [String]) async throws {
+        deleteRequests += 1
+        for pk in pks { deleteCalls.append((table, pk)) }
     }
 
     public func fetch(

@@ -64,8 +64,10 @@ let remote = InMemorySyncRemote(dataset: [
 ])
 
 // What the client sent.
-await remote.upsertCalls    // [(table, row, onConflict)] in order
+await remote.upsertCalls    // [(table, row, onConflict)] in order — one entry per *row*
 await remote.deleteCalls    // [(table, pk)] — the tombstones
+await remote.upsertRequests // round trips, which batching makes fewer than upsertCalls.count (#54)
+await remote.deleteRequests // …and the same for tombstones
 await remote.fetchCalls     // download pages requested; the usual "a pass ran" signal
 await remote.lastScope      // the partition filter the engine resolved
 
@@ -82,6 +84,9 @@ InMemorySyncRemote(failUpserts: 1, upsertFailure: .transient)   // retried, then
 InMemorySyncRemote(failUpserts: 1, upsertFailure: .permanent)   // dead-lettered on the first attempt
 InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(HTTPError(…)))  // real error, real classification
 ```
+
+`failUpserts` counts **requests**, not rows: the drain batches a run of same-table writes into one
+call, so a rejected batch spends one — and the per-row re-run it triggers spends one per row.
 
 `.error` wraps a genuine transport error (`HTTPError`, `PostgrestError`, `URLError`) with the
 classification the production remote applies — so *"an RLS reject parks, an expired token doesn't"*
