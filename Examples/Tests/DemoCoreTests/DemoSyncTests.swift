@@ -48,8 +48,12 @@ import DemoCore
 @Test func aChangeFromAnotherDeviceArrivesThroughTheDoorbell() async throws {
     let sync = try DemoSync()
     let database = sync.db
+    let doorbell = sync.doorbell
     await sync.start()
     defer { Task { await sync.engine.stop() } }
+    // The engine subscribes during its first pass; ringing before that is a ring into the void (the
+    // periodic poll would still converge, just not in time to assert on).
+    #expect(await eventually { doorbell.liveSubscriptions >= 1 })
 
     // Realtime is a doorbell only: the ring triggers a pull, and the row arrives through the cursor
     // fetch — never from the event payload.
