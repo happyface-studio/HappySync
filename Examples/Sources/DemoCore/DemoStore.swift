@@ -90,12 +90,12 @@ public final class DemoStore: ObservableObject {
     // MARK: - Actions
 
     public func addList(title: String) async {
-        try? await sync.addList(title: title)
+        _ = try? await sync.addList(title: title)
     }
 
     public func addItem(title: String) async {
         guard let listID = selectedListID else { return }
-        try? await sync.addItem(title: title, to: listID)
+        _ = try? await sync.addItem(title: title, to: listID)
     }
 
     public func toggle(_ item: TodoItem) async {
