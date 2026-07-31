@@ -8,7 +8,10 @@ import GRDB
 /// Public because it appears in `SyncRemote.fetch` — a custom or fake remote has to be able to read
 /// the position it's being asked to resume from (issue #53).
 public struct SyncCursor: Sendable, Equatable {
+    /// The table's `cursorColumn` value of the last applied row — a server-stamped timestamp.
     public var updatedAt: String
+    /// That row's primary key, which breaks ties between rows sharing a `updatedAt` so a page
+    /// boundary can't skip one.
     public var id: String
 
     public init(updatedAt: String, id: String) {
@@ -88,6 +91,29 @@ func orderForUpload(_ entries: [OutboxEntry], tables: [SyncTable]) -> [OutboxEnt
     }
     // Same-`(table, pk)` mis-ordering (delete-then-recreate) is handled upstream by
     // `collapseOutbox`, which nets each key to one op before this FK ordering runs (APPS-472).
+}
+
+/// Groups an already-ordered run of pending uploads into the chunks the drain sends as one request
+/// each: **consecutive** entries sharing a table and an op, capped at `limit` (issue #54).
+///
+/// Adjacency is the whole rule — entries are never reordered to make a bigger batch, so the FK-safe
+/// order `orderForUpload` produced survives intact and a chunk is always one PostgREST call's worth:
+/// one table, one op, one conflict target. The cap bounds both the request size and the blast radius
+/// of the per-row fallback a rejected chunk falls back to.
+func uploadChunks(_ entries: [OutboxEntry], limit: Int) -> [[OutboxEntry]] {
+    let limit = max(1, limit)
+    var chunks: [[OutboxEntry]] = []
+    for entry in entries {
+        let extendsLast = chunks.last.map { chunk in
+            chunk.count < limit && chunk[0].tableName == entry.tableName && chunk[0].op == entry.op
+        } ?? false
+        if extendsLast {
+            chunks[chunks.count - 1].append(entry)
+        } else {
+            chunks.append([entry])
+        }
+    }
+    return chunks
 }
 
 /// Exponential backoff between drain passes for an entry that has failed `attempts` times, with

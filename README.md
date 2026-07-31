@@ -12,6 +12,11 @@ CRDTs needed.
 > APPS-415) are all live. Next is M2 server prep (server-side `updated_at` triggers + `deleted_at`
 > tombstones) before the M3 CookThis cutover.
 
+**See it run first:** [`Examples/`](Examples) is a two-table SwiftUI app wired to the in-memory fake
+— no Supabase project, no schema, no credentials. `swift run --package-path Examples DemoApp` shows
+writes uploading with no engine call, a cascade delete tombstoning its children, a change arriving
+from "device B", a refused write parking, and the repair that unparks it.
+
 ## Model
 
 Local GRDB SQLite is the source of truth for reads (observed with `ValueObservation`). You write
@@ -68,6 +73,20 @@ for await status in engine.status {
     // and .failed carries a classified cause you can branch on (APPS-470).
 }
 ```
+
+If your tables have GRDB record types, declare the manifest from those and the table names stop being
+strings that can go stale — a rename becomes a build error rather than a table that quietly stops
+syncing:
+
+```swift
+tables: [
+    SyncTable.table(Recipe.self, jsonColumns: [Recipe.Columns.nutrition]),
+    SyncTable.table(RecipeIngredient.self),   // dependsOn still derived from the schema's FKs
+]
+```
+
+Both forms produce the same `SyncTable`, so a manifest can mix them — keep the string form for a
+table with no Swift record type.
 
 For a table whose RLS is broader than the sync partition (e.g. a shared `recipes` table readable as
 `isPublic OR userId = auth.uid()`), declare a `scopeColumn` and supply the partition value so the
@@ -242,8 +261,14 @@ deliberately generic, but is pressure-tested against one real app before it's tr
 
 ## Documentation & Claude skill
 
-- **[Wiki](https://github.com/happyface-studio/HappySync/wiki)** — Getting Started, Server Setup,
-  API Reference, Operations & Troubleshooting, and Architecture. (Sources live in [`wiki/`](wiki).)
+- **[Documentation](https://swiftpackageindex.com/happyface-studio/HappySync/documentation/happysync)**
+  — Getting Started, Server Setup, Operations & Troubleshooting, Testing, Architecture, and every
+  public symbol. Built from [`Sources/HappySync/Documentation.docc`](Sources/HappySync/Documentation.docc);
+  `swift package generate-documentation` builds it locally.
+- **[Example app](Examples)** — a runnable two-table SwiftUI demo against the in-memory fake, with
+  the Supabase migrations for when you point it at a real project.
+- **[Wiki](https://github.com/happyface-studio/HappySync/wiki)** — points at the documentation
+  above, and hosts the Claude skill page. (Sources live in [`wiki/`](wiki).)
 - **[Sync contract](docs/SYNC-CONTRACT.md)** — the language-neutral contract every client and the
   server must honor.
 - **Claude skill** — [`.claude/skills/happysync/`](.claude/skills/happysync) is an installable

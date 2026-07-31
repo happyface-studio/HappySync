@@ -7,17 +7,23 @@ GitHub resolves `Getting Started` → `Getting-Started.md`, so keep filenames hy
 
 ## Pages
 
-| File | Wiki page |
-|---|---|
-| `Home.md` | Landing page |
-| `Getting-Started.md` | Getting Started |
-| `Server-Setup.md` | Server Setup |
-| `API-Reference.md` | API Reference |
-| `Operations-and-Troubleshooting.md` | Operations and Troubleshooting |
-| `Testing.md` | Testing |
-| `Architecture.md` | Architecture |
-| `Claude-Skill.md` | Claude Skill |
-| `_Sidebar.md` | Sidebar nav (all pages) |
+**The developer documentation lives in DocC**, not here — `Sources/HappySync/Documentation.docc/`,
+published by [Swift Package Index](https://swiftpackageindex.com/happyface-studio/HappySync/documentation/happysync)
+and readable in Xcode. It sits next to the symbols it documents, which is the only arrangement that
+keeps the two from drifting (issue #57). The pages below that used to hold that content are now
+one-paragraph pointers to it; edit the DocC article instead.
+
+| File | Wiki page | |
+|---|---|---|
+| `Home.md` | Landing page | index |
+| `Claude-Skill.md` | Claude Skill | the only full article left here |
+| `_Sidebar.md` | Sidebar nav | index |
+| `Getting-Started.md` | Getting Started | → DocC |
+| `Server-Setup.md` | Server Setup | → DocC |
+| `API-Reference.md` | API Reference | → DocC |
+| `Operations-and-Troubleshooting.md` | Operations and Troubleshooting | → DocC |
+| `Testing.md` | Testing | → DocC |
+| `Architecture.md` | Architecture | → DocC |
 
 ## Publish
 

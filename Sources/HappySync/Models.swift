@@ -122,7 +122,11 @@ public struct SyncTable: Sendable, Hashable {
 
 /// A pending sync operation recorded in the outbox.
 public enum SyncOp: String, Sendable, Codable {
+    /// The row exists locally and its current state should be uploaded — queued by an `INSERT` or an
+    /// `UPDATE`, and idempotent by primary key.
     case upsert
+    /// The row was removed locally and should be **soft**-deleted on the server (its tombstone set),
+    /// so the deletion propagates to other devices on their next pull.
     case delete
 }
 

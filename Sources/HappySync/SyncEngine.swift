@@ -87,6 +87,9 @@ public actor SyncEngine {
     private let tables: [SyncTable]
     private let remote: any SyncRemote
     private let pageSize: Int
+    /// Most entries the drain sends in one upload request. Bounds the request body and, since a
+    /// rejected chunk is re-run row by row, the blast radius of that fallback (issue #54).
+    private let uploadChunkSize: Int
     private let doorbell: any SyncDoorbell
     private let pollInterval: TimeInterval
     private let debounceInterval: TimeInterval
@@ -233,6 +236,8 @@ public actor SyncEngine {
     ///   - debounceInterval: Seconds a doorbell burst coalesces over before one pull runs.
     ///   - deadLetterAfter: Failed attempts before a transient entry parks. Lower it to reach the
     ///     dead-letter path without driving eight retries.
+    ///   - uploadChunkSize: Most entries per upload request. Shrink it (e.g. `2`) to force chunk
+    ///     boundaries on a small outbox.
     public static func forTesting(
         db: any DatabaseWriter,
         remote: any SyncRemote,
@@ -243,7 +248,8 @@ public actor SyncEngine {
         debounceInterval: TimeInterval = 0.3,
         scope: @escaping @Sendable () async -> String? = { nil },
         deadLetterAfter: Int = 8,
-        maxOfflineGap: TimeInterval = 30 * 24 * 3600
+        maxOfflineGap: TimeInterval = 30 * 24 * 3600,
+        uploadChunkSize: Int = SyncEngine.defaultUploadChunkSize
     ) throws -> SyncEngine {
         try SyncEngine(
             db: db,
@@ -255,9 +261,15 @@ public actor SyncEngine {
             debounceInterval: debounceInterval,
             scope: scope,
             deadLetterAfter: deadLetterAfter,
-            maxOfflineGap: maxOfflineGap
+            maxOfflineGap: maxOfflineGap,
+            uploadChunkSize: uploadChunkSize
         )
     }
+
+    /// Rows per upload request unless a caller says otherwise. Big enough that a realistic backlog is
+    /// a handful of round trips, small enough to keep a request body — and a rejected chunk's per-row
+    /// re-run — bounded (issue #54).
+    public static let defaultUploadChunkSize = 256
 
     /// Injects the `SyncRemote`/`SyncDoorbell` seams directly. Reached publicly through
     /// `forTesting(db:remote:tables:…)`, which documents the parameters.
@@ -271,7 +283,8 @@ public actor SyncEngine {
         debounceInterval: TimeInterval = 0.3,
         scope: @escaping @Sendable () async -> String? = { nil },
         deadLetterAfter: Int = 8,
-        maxOfflineGap: TimeInterval = 30 * 24 * 3600
+        maxOfflineGap: TimeInterval = 30 * 24 * 3600,
+        uploadChunkSize: Int = SyncEngine.defaultUploadChunkSize
     ) throws {
         // The manifest is checked against the schema — and its `dependsOn` filled in from the schema's
         // foreign keys — before anything else reads it, so `self.tables` only ever holds specs the
@@ -284,6 +297,7 @@ public actor SyncEngine {
         self.remote = remote
         self.tables = resolved
         self.pageSize = pageSize
+        self.uploadChunkSize = uploadChunkSize
         self.doorbell = doorbell
         self.pollInterval = pollInterval
         self.debounceInterval = debounceInterval
@@ -1071,6 +1085,13 @@ public actor SyncEngine {
     /// bumped and is skipped until its per-entry backoff window elapses; one that fails permanently
     /// (4xx) or exhausts `deadLetterAfter` retries is dead-lettered (parked). One failure never
     /// blocks the others.
+    ///
+    /// Uploads go out **in batches**: consecutive same-table, same-op entries are sent as one request
+    /// (issue #54), so a 500-row backlog is a handful of round trips rather than 500 sequential ones.
+    /// A rejected batch says which chunk the server refused, not which row — so the chunk is re-run
+    /// one entry at a time, and exactly the offending entries are classified and parked the way they
+    /// would have been without batching. Batch speed on the healthy path; unchanged diagnostics on
+    /// the unhealthy one.
     @discardableResult
     func drainOutbox(now: Date = Date()) async throws -> DrainOutcome {
         let pending = try await db.read { db in
@@ -1079,30 +1100,121 @@ public actor SyncEngine {
         // Net each (table, pk) to one op first (APPS-472), then FK-order the net ops.
         let collapsed = collapseOutbox(pending)
         let groupSeqs = Dictionary(uniqueKeysWithValues: collapsed.map { ($0.net.seq, $0.seqs) })
+        // Per-entry exponential backoff: drop an entry still inside its retry window so a failing
+        // entry isn't re-attempted on every drain pass (and doorbell ring and poll) — and never rides
+        // into a batch that would attempt it early. Dropping preserves the FK-safe relative order,
+        // so what's left still chunks into single-table, single-op requests.
+        let ready = orderForUpload(collapsed.map(\.net), tables: tables).filter { entry in
+            guard let last = entry.lastAttemptAt else { return true }
+            return now.timeIntervalSince(last) >= backoffDelay(attempts: entry.attempts)
+        }
         var outcome = DrainOutcome(failed: 0, deadLettered: 0)
-        for entry in orderForUpload(collapsed.map(\.net), tables: tables) {
-            if stopping { throw StopRequested() } // teardown: bail between entries — each clear is transactional (APPS-513)
-            // Per-entry exponential backoff: skip an entry still inside its retry window so a failing
-            // entry isn't re-attempted on every drain pass (and doorbell ring and poll).
-            if let last = entry.lastAttemptAt, now.timeIntervalSince(last) < backoffDelay(attempts: entry.attempts) {
-                continue
-            }
-            let seqs = groupSeqs[entry.seq] ?? [entry.seq]
-            do {
-                try await process(entry, clearing: seqs)
-            } catch {
-                // Auth-shaped failures (expired/refreshing token) recover out-of-band, so retry them
-                // without charging the retry budget — a token-refresh stretch mustn't dead-letter
-                // healthy writes and strip their dirty-row protection (APPS-502). Genuine transient
-                // failures still count toward `deadLetterAfter`; permanent ones park at once.
-                let attempts = remoteErrorIsAuthTransient(error) ? entry.attempts : entry.attempts + 1
-                // Permanent (4xx / constraint / RLS) → park now; transient → park once it exhausts the cap.
-                let park = remoteErrorIsPermanent(error) || attempts >= deadLetterAfter
-                try await recordFailure(entry, groupSeqs: seqs, attempts: attempts, now: now, park: park, error: error)
-                if park { outcome.deadLettered += 1 } else { outcome.failed += 1 }
+        for chunk in uploadChunks(ready, limit: uploadChunkSize) {
+            if stopping { throw StopRequested() } // teardown: bail between chunks — each clear is transactional (APPS-513)
+            // One request for the whole chunk; on any failure fall through to one request per entry,
+            // which is also the only path a single-entry chunk ever takes.
+            if chunk.count > 1, await uploadedAsBatch(chunk, groupSeqs: groupSeqs) { continue }
+            for entry in chunk {
+                if stopping { throw StopRequested() }
+                let seqs = groupSeqs[entry.seq] ?? [entry.seq]
+                do {
+                    try await process(entry, clearing: seqs)
+                } catch {
+                    // Auth-shaped failures (expired/refreshing token) recover out-of-band, so retry them
+                    // without charging the retry budget — a token-refresh stretch mustn't dead-letter
+                    // healthy writes and strip their dirty-row protection (APPS-502). Genuine transient
+                    // failures still count toward `deadLetterAfter`; permanent ones park at once.
+                    let attempts = remoteErrorIsAuthTransient(error) ? entry.attempts : entry.attempts + 1
+                    // Permanent (4xx / constraint / RLS) → park now; transient → park once it exhausts the cap.
+                    let park = remoteErrorIsPermanent(error) || attempts >= deadLetterAfter
+                    try await recordFailure(entry, groupSeqs: seqs, attempts: attempts, now: now, park: park, error: error)
+                    if park { outcome.deadLettered += 1 } else { outcome.failed += 1 }
+                }
             }
         }
         return outcome
+    }
+
+    /// Applies a whole chunk — same table, same op — as **one** request, returning false when it
+    /// didn't land so the caller re-runs the chunk entry by entry.
+    ///
+    /// Nothing is recorded against the entries on failure, deliberately: a rejected batch names the
+    /// request, not the row, so charging every entry an attempt would park up to `limit` healthy
+    /// writes for one poison neighbour. The per-entry re-run is what decides who was actually at
+    /// fault; the extra round trips it costs are paid only on the unhealthy path.
+    private func uploadedAsBatch(_ chunk: [OutboxEntry], groupSeqs: [Int64: [Int64]]) async -> Bool {
+        guard let spec = tables.first(where: { $0.name == chunk[0].tableName }) else {
+            return false // table no longer synced — let the per-entry path drop the stale entries
+        }
+        func seqs(of entry: OutboxEntry) -> [Int64] { groupSeqs[entry.seq] ?? [entry.seq] }
+        do {
+            switch chunk[0].op {
+            case .upsert:
+                // A row deleted locally before its upload went out has nothing to send: clear those
+                // entries and batch what's left, exactly as the per-entry path does one at a time.
+                var uploads: [OutboxEntry] = []
+                var payloads: [[String: AnyJSON]] = []
+                var vanished: [Int64] = []
+                for entry in chunk {
+                    if let payload = try await readPayload(spec: spec, pk: entry.pk) {
+                        uploads.append(entry)
+                        payloads.append(payload)
+                    } else {
+                        vanished.append(contentsOf: seqs(of: entry))
+                    }
+                }
+                try await clear(vanished)
+                guard !uploads.isEmpty else { return true }
+                let onConflict = spec.conflictColumns.isEmpty ? nil : spec.conflictColumns.joined(separator: ",")
+                let servers = try await remote.upsert(table: spec.name, rows: payloads, onConflict: onConflict)
+                let matched = Self.match(servers, to: uploads, primaryKey: spec.primaryKey)
+                try await stampAndClear(
+                    zip(uploads, matched).map { entry, server in
+                        ConfirmedUpload(entry: entry, server: server, seqs: seqs(of: entry))
+                    },
+                    spec: spec
+                )
+            case .delete:
+                try await remote.delete(table: spec.name, primaryKey: spec.primaryKey, pks: chunk.map(\.pk))
+                try await clear(chunk.flatMap { seqs(of: $0) })
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Pairs a batch upsert's returned representations with the rows that produced them, one slot per
+    /// upload and `nil` where no representation could be identified.
+    ///
+    /// Primary key first: it's the only match that can't put one row's server state onto another, and
+    /// PostgREST returns the full row so the key is there. Request order is the documented fallback,
+    /// taken only when the counts agree — a short or unkeyed response leaves those uploads unstamped,
+    /// which costs a re-download on the next pull rather than corrupting a row.
+    private static func match(
+        _ servers: [[String: AnyJSON]], to uploads: [OutboxEntry], primaryKey: String
+    ) -> [[String: AnyJSON]?] {
+        let byPK = Dictionary(
+            servers.compactMap { row -> (String, [String: AnyJSON])? in
+                guard let key = row[primaryKey].flatMap(Self.wireKey) else { return nil }
+                return (key, row)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let positional = servers.count == uploads.count
+        return uploads.enumerated().map { index, entry in
+            byPK[entry.pk] ?? (positional ? servers[index] : nil)
+        }
+    }
+
+    /// A wire primary key as the outbox stores it. `_sync_outbox.pk` has TEXT affinity, so an integer
+    /// key is `"7"` there and must be compared as one; anything that isn't a scalar key is no key.
+    private static func wireKey(_ value: AnyJSON) -> String? {
+        switch value {
+        case .string(let string): return string
+        case .integer(let int): return String(int)
+        default: return nil
+        }
     }
 
     /// Records a failed upload attempt: bumps `attempts`, stamps `last_attempt_at` (for the backoff
@@ -1173,7 +1285,7 @@ public actor SyncEngine {
             }
             let onConflict = spec.conflictColumns.isEmpty ? nil : spec.conflictColumns.joined(separator: ",")
             let server = try await remote.upsert(table: spec.name, row: payload, onConflict: onConflict)
-            try await stampAndClear(entry, spec: spec, server: server, seqs: seqs)
+            try await stampAndClear([ConfirmedUpload(entry: entry, server: server, seqs: seqs)], spec: spec)
         case .delete:
             try await remote.delete(table: spec.name, primaryKey: spec.primaryKey, pk: entry.pk)
             try await clear(seqs)
@@ -1196,9 +1308,18 @@ public actor SyncEngine {
         }
     }
 
-    /// Writes the server's representation back to the local row and clears the collapsed group's
-    /// entries in one transaction, so the row is marked clean (its cursor won't re-pull it) only
-    /// after the server confirms.
+    /// One confirmed upload waiting to be written back: the entry the server accepted, its
+    /// representation of the row (nil when a batch response couldn't be matched to this upload — see
+    /// `match`), and every outbox `seq` the entry's collapsed group covers.
+    private struct ConfirmedUpload: Sendable {
+        let entry: OutboxEntry
+        let server: [String: AnyJSON]?
+        let seqs: [Int64]
+    }
+
+    /// Writes the server's representation back to the local rows and clears the confirmed entries in
+    /// **one transaction**, so a row is marked clean (its cursor won't re-pull it) only after the
+    /// server confirms. A batch confirms as a unit, so it write-backs as one too.
     ///
     /// The representation carries what the client can't compute locally: column **defaults** the
     /// server filled in, **trigger-normalized** fields, recomputed `serverOwnedColumns`, and — for a
@@ -1214,20 +1335,25 @@ public actor SyncEngine {
     /// holds that pending edit — the same dirty-check the pull's `lwwAllows` gate uses. Clobbering it
     /// would lose the edit; it uploads on the next drain instead. The confirmed group's entries clear
     /// either way.
-    private func stampAndClear(_ entry: OutboxEntry, spec: SyncTable, server: [String: AnyJSON], seqs: [Int64]) async throws {
+    private func stampAndClear(_ confirmed: [ConfirmedUpload], spec: SyncTable) async throws {
+        guard !confirmed.isEmpty else { return }
         try await db.write { db in
-            // The server's own representation of the row we just uploaded — suppressed, or writing it
+            // The server's own representation of the rows we just uploaded — suppressed, or writing it
             // back would queue the very upload it confirms and the drain would never settle (issue #48).
             try SyncTriggers.applyingRemoteState(db) {
-                if try Self.writeBackAllowed(db, table: spec.name, pk: entry.pk, excluding: seqs) {
-                    try RowCoding.upsertLocalRow(
-                        db, table: spec.name, primaryKey: spec.primaryKey,
-                        columns: RowCoding.localColumns(from: server),
-                        restrictingTo: try RowCoding.tableColumns(db, table: spec.name)
-                    )
+                let knownColumns = try RowCoding.tableColumns(db, table: spec.name)
+                for upload in confirmed {
+                    guard let server = upload.server else { continue }
+                    if try Self.writeBackAllowed(db, table: spec.name, pk: upload.entry.pk, excluding: upload.seqs) {
+                        try RowCoding.upsertLocalRow(
+                            db, table: spec.name, primaryKey: spec.primaryKey,
+                            columns: RowCoding.localColumns(from: server),
+                            restrictingTo: knownColumns
+                        )
+                    }
                 }
             }
-            try Self.deleteEntries(db, seqs: seqs)
+            try Self.deleteEntries(db, seqs: confirmed.flatMap(\.seqs))
         }
     }
 
@@ -1247,6 +1373,7 @@ public actor SyncEngine {
     }
 
     private func clear(_ seqs: [Int64]) async throws {
+        guard !seqs.isEmpty else { return }
         try await db.write { db in try Self.deleteEntries(db, seqs: seqs) }
     }
 
