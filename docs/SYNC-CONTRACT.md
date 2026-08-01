@@ -81,7 +81,11 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
   request, not the row, so the chunk is **re-run one entry at a time** and only the entries that
   genuinely fail are classified, retried and parked: batch speed on the healthy path, per-entry
   diagnostics on the unhealthy one. The failed batch itself charges no attempts — otherwise one
-  poison row would spend the retry budget of every healthy row beside it.
+  poison row would spend the retry budget of every healthy row beside it. The per-row re-run only
+  makes sense for a *payload* rejection: a batch that failed for connectivity or auth reasons
+  (offline/`URLError`, Postgres `08xxx`, an expired token) has no row at fault, so the pass fails
+  instead — re-running it row by row would just multiply doomed requests — and the batch retries
+  whole after backoff.
 - **The full representation is written back locally (APPS-506).** On a successful upsert the server
   row — column defaults, trigger-normalized fields, recomputed `serverOwnedColumns`, and (for a
   `conflictColumns` upsert) the **merged** row re-keyed to the client's pk (APPS-478) — is applied to
@@ -94,11 +98,13 @@ newer `now()` and wins; a plain PostgREST upsert is sufficient.
 - **Failures are visible, not swallowed (APPS-470).** A failed upload surfaces in `SyncStatus`
   (`failedUploads` while retrying, `deadLetters` once parked) so a user whose writes are all failing
   never sees a healthy idle. Classify failures (APPS-502): **permanent** (constraint `23xxx`, RLS
-  `42501`, undefined-column `42703`, and other 4xx) dead-letter immediately; **transient** (network,
-  5xx, 408/429, transient Postgres states `40001`/`40P01`/`53xxx`/`08xxx`, and any unknown code)
-  retry with backoff until a cap, then dead-letter. **Auth-shaped** failures (401/403, PostgREST
-  `PGRST301`/`PGRST302`) are transient *and* exempt from the retry budget — a stale token recovers
-  out-of-band, so an expired-token stretch must not dead-letter the whole outbox. A dead-lettered
+  `42501`, undefined-column `42703`, and other 4xx) dead-letter immediately; **transient** (5xx,
+  408/429, transient Postgres states `40001`/`40P01`/`53xxx`, and any unknown code) retry with
+  backoff until a cap, then dead-letter. **Auth-shaped** failures (401/403, PostgREST
+  `PGRST301`/`PGRST302`) and **connection-shaped** failures (offline/`URLError`, Postgres `08xxx`)
+  are transient *and* exempt from the retry budget — a stale token recovers out-of-band, and a
+  device is *expected* to sit offline far longer than the backoff cap allows, so neither stretch
+  may dead-letter the outbox and strip its dirty-row protection. A dead-lettered
   entry stops retrying **and** stops counting as a dirty row, so
   it never permanently blocks downloads for its key (§3 LWW). Health is `status.isHealthy`; a settled
   pass with writes still failing or parked broadcasts `.degraded`, never `.idle`. The same
@@ -178,7 +184,11 @@ declares the same shape):
   stripped whether or not it's listed)
 - `scopeColumn` — partition column (e.g. `userId`) when RLS is broader than the sync partition;
   the engine filters downloads + the doorbell to `scopeColumn = <partition value>` (§1). Omit when
-  RLS already scopes the table to exactly the partition.
+  RLS already scopes the table to exactly the partition. The partition value may resolve *late*
+  (nil → uid at sign-in), but must not *change* to a different user's without a reset: per-table
+  cursors are partition-agnostic, so after uid → uid′ the new user's rows older than the previous
+  cursor would never download. An account switch goes through the teardown order — stop the
+  engine, wipe the local database, start again.
 - `conflictColumns` — columns of a **secondary unique constraint** to use as the PostgREST upsert
   conflict target (e.g. `["userId", "recipeId"]`), so a fresh-primary-key insert merges onto the
   existing server row instead of 409-ing on the duplicate. The merge re-keys the row to the

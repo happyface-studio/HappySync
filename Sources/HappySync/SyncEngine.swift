@@ -94,7 +94,9 @@ public actor SyncEngine {
     private let pollInterval: TimeInterval
     private let debounceInterval: TimeInterval
     /// Resolves the current user's download-partition value (auth uid) for tables that declare a
-    /// `scopeColumn`, or nil when signed out. Called per pull so a user switch re-scopes (APPS-469).
+    /// `scopeColumn`, or nil when signed out. Called per pull so sign-in after `start()` re-scopes
+    /// (APPS-469); a *different* user requires the stop → wipe → start teardown — see `init`'s
+    /// `scope` parameter.
     private let scope: @Sendable () async -> String?
     /// Whether any synced table declares a `scopeColumn`. When false the doorbell subscription is
     /// scope-independent, so an auth change needn't tear down and rebuild its channel (APPS-509).
@@ -120,8 +122,10 @@ public actor SyncEngine {
     private nonisolated let statusBroadcaster: StatusBroadcaster
     /// Structured logging for field diagnosis (APPS-514): pass lifecycle, dead-letters, stale-cursor
     /// resync, doorbell (re)subscription, and scoped-table skips. **Never logs row payloads or tokens**
-    /// (user content) — only table names, counts, primary keys (redacted in release builds by the
-    /// default `.private` interpolation), and error text.
+    /// (user content) — only table names, counts, classified failure kinds, and — at the default
+    /// `.private` level, redacted in release builds — primary keys and raw error text. The raw text
+    /// stays private because a server message can embed row values (a Postgres constraint DETAIL
+    /// names the offending key); the classified kind is structural and safe to expose.
     private let log = Logger(subsystem: "studio.happyface.happysync", category: "engine")
     private var isRunning = false
     private var lastSyncedAt: Date?
@@ -183,7 +187,11 @@ public actor SyncEngine {
     ///   - auth: Returns a fresh Supabase access token, called before each authenticated batch.
     ///   - scope: Resolves the current user's download-partition value (auth uid) for tables that
     ///     declare a `scopeColumn`. Defaults to `nil` (no partition beyond RLS). Called per pull, so
-    ///     a signed-in user change re-scopes without re-declaring tables. See APPS-469.
+    ///     sign-in after `start()` (nil → uid) re-scopes without re-declaring tables. See APPS-469.
+    ///     A *different user* signing in (uid → uid′) is **not** a re-scope: per-table cursors are
+    ///     partition-agnostic, so an account switch must go through the documented teardown —
+    ///     `await stop()`, wipe the database, `start()` — or rows the previous user's cursor already
+    ///     passed will never download for the new one.
     ///   - maxOfflineGap: If the device hasn't synced within this window, the first sync full-resyncs
     ///     to reconcile against purged tombstones. **Must be ≤ the server's tombstone-purge
     ///     retention.** Defaults to 30 days. See APPS-471.
@@ -554,8 +562,11 @@ public actor SyncEngine {
             log.info("sync pass aborted for teardown")
             return statusBroadcaster.latest
         } catch {
-            log.error("sync pass failed: \(String(describing: error), privacy: .public)")
-            statusBroadcaster.send(transitionalStatus(.failed(SyncFailure.classify(error))))
+            let failure = SyncFailure.classify(error)
+            // The classified kind is structural and safe to expose; the raw description can embed row
+            // values (a Postgres constraint DETAIL names the offending key), so it stays private.
+            log.error("sync pass failed: \(failure.wireValue, privacy: .public) — \(String(describing: error))")
+            statusBroadcaster.send(transitionalStatus(.failed(failure)))
             throw error
         }
         lastSyncedAt = now
@@ -820,8 +831,34 @@ public actor SyncEngine {
     func pull() async throws -> [String: Set<String>] {
         let order = topologicalOrder(tables)
         var pendingDeletes: [PendingDelete] = []
-        var seenPks: [String: Set<String>] = [:]
 
+        let seenPks: [String: Set<String>]
+        do {
+            seenPks = try await pullTables(order: order, pendingDeletes: &pendingDeletes)
+        } catch {
+            // A pull that dies mid-pass — a fetch failing on a later page or table — has already
+            // committed cursor advances past every tombstone deferred so far, so an unflushed
+            // deferral is a row that survives locally forever: the cursor never re-fetches it.
+            // Flush before propagating, exactly as the teardown checkpoint does. (`StopRequested`
+            // arrives *from* `abortIfStopping`, which has flushed already.) Best-effort `try?`: the
+            // caller must see the pull's own error, not a failure of this salvage write.
+            if !(error is StopRequested) {
+                try? await applyDeferredDeletes(pendingDeletes, order: order)
+            }
+            throw error
+        }
+
+        // Phase 2: tombstones, children-first (reverse FK order).
+        try await applyDeferredDeletes(pendingDeletes, order: order)
+        return seenPks
+    }
+
+    /// The pull's fetch/apply loop, table by table and page by page. Split from `pull()` so a throw
+    /// from any point in it — a fetch, a page apply, a teardown checkpoint — funnels through one
+    /// `catch` that can flush the tombstones deferred so far: every exit from this loop leaves
+    /// cursors already advanced past them.
+    private func pullTables(order: [String], pendingDeletes: inout [PendingDelete]) async throws -> [String: Set<String>] {
+        var seenPks: [String: Set<String>] = [:]
         for tableName in order {
             try await abortIfStopping(pendingDeletes, order: order) // teardown: bail between tables (APPS-513)
             guard let spec = tables.first(where: { $0.name == tableName }) else { continue }
@@ -852,8 +889,13 @@ public actor SyncEngine {
                 )
                 if page.isEmpty { break }
 
-                for row in page where !(row[spec.primaryKey]?.stringValue ?? "").isEmpty {
-                    seenPks[spec.name, default: []].insert(row[spec.primaryKey]!.stringValue!)
+                for row in page {
+                    // `wireKey`, not `stringValue`: PostgREST serializes an integer primary key as a
+                    // JSON number, and dropping those keys here would make a full resync reconcile the
+                    // table against "nothing seen" — deleting every clean local row.
+                    if let pk = row[spec.primaryKey].flatMap(Self.wireKey) {
+                        seenPks[spec.name, default: []].insert(pk)
+                    }
                 }
 
                 let pageCursor = cursor // immutable copy for the Sendable write closure
@@ -864,7 +906,7 @@ public actor SyncEngine {
                         var advanced = pageCursor
                         var deferred: [PendingDelete] = []
                         for row in page {
-                            let pk = row[spec.primaryKey]?.stringValue ?? ""
+                            let pk = row[spec.primaryKey].flatMap(Self.wireKey) ?? ""
                             let updatedAt = row[spec.cursorColumn]?.stringValue ?? ""
                             let tombstoned = !(row["deletedAt"]?.isNil ?? true)
                             if try Self.lwwAllows(
@@ -895,9 +937,6 @@ public actor SyncEngine {
                 if page.count < pageSize { break }
             }
         }
-
-        // Phase 2: tombstones, children-first (reverse FK order).
-        try await applyDeferredDeletes(pendingDeletes, order: order)
         return seenPks
     }
 
@@ -974,7 +1013,10 @@ public actor SyncEngine {
             if stopping { throw StopRequested() } // teardown: bail between reconcile steps (APPS-513)
             guard let seenPks = seen[spec.name] else { continue }
             let (localPks, dirtyPks) = try await db.read { db -> (Set<String>, Set<String>) in
-                let local = Set(try String.fetchAll(db, sql: "SELECT \"\(spec.primaryKey)\" FROM \"\(spec.name)\""))
+                // CAST: an INTEGER primary key renders to the same text the outbox's TEXT-affinity
+                // `pk` and the pull's wire-key decoding produce, so all three sets subtract in one
+                // alphabet — and a bare SELECT would hand GRDB an Int64 it refuses to decode as String.
+                let local = Set(try String.fetchAll(db, sql: "SELECT CAST(\"\(spec.primaryKey)\" AS TEXT) FROM \"\(spec.name)\""))
                 let dirty = Set(try String.fetchAll(
                     db, sql: "SELECT pk FROM \(SyncSchema.outboxTable) WHERE table_name = ?", arguments: [spec.name]
                 ))
@@ -1111,9 +1153,11 @@ public actor SyncEngine {
         var outcome = DrainOutcome(failed: 0, deadLettered: 0)
         for chunk in uploadChunks(ready, limit: uploadChunkSize) {
             if stopping { throw StopRequested() } // teardown: bail between chunks — each clear is transactional (APPS-513)
-            // One request for the whole chunk; on any failure fall through to one request per entry,
-            // which is also the only path a single-entry chunk ever takes.
-            if chunk.count > 1, await uploadedAsBatch(chunk, groupSeqs: groupSeqs) { continue }
+            // One request for the whole chunk; on a payload rejection fall through to one request per
+            // entry — also the only path a single-entry chunk ever takes. A connectivity- or
+            // auth-shaped batch failure throws instead: no row is at fault, so the per-row hunt would
+            // only multiply doomed requests (see `uploadedAsBatch`).
+            if chunk.count > 1, try await uploadedAsBatch(chunk, groupSeqs: groupSeqs) { continue }
             for entry in chunk {
                 if stopping { throw StopRequested() }
                 let seqs = groupSeqs[entry.seq] ?? [entry.seq]
@@ -1122,9 +1166,15 @@ public actor SyncEngine {
                 } catch {
                     // Auth-shaped failures (expired/refreshing token) recover out-of-band, so retry them
                     // without charging the retry budget — a token-refresh stretch mustn't dead-letter
-                    // healthy writes and strip their dirty-row protection (APPS-502). Genuine transient
-                    // failures still count toward `deadLetterAfter`; permanent ones park at once.
-                    let attempts = remoteErrorIsAuthTransient(error) ? entry.attempts : entry.attempts + 1
+                    // healthy writes and strip their dirty-row protection (APPS-502). Connectivity
+                    // failures are exempt for the same reason: offline says nothing about the write,
+                    // and a device is *expected* to sit offline far longer than the backoff windows the
+                    // cap allows — charging them would park the whole outbox after minutes of airplane
+                    // mode and strand every edit behind a manual repair. Genuine transient failures
+                    // (5xx, odd Postgres states) still count toward `deadLetterAfter`; permanent ones
+                    // park at once.
+                    let spared = remoteErrorIsAuthTransient(error) || remoteErrorIsConnectivity(error)
+                    let attempts = spared ? entry.attempts : entry.attempts + 1
                     // Permanent (4xx / constraint / RLS) → park now; transient → park once it exhausts the cap.
                     let park = remoteErrorIsPermanent(error) || attempts >= deadLetterAfter
                     try await recordFailure(entry, groupSeqs: seqs, attempts: attempts, now: now, park: park, error: error)
@@ -1142,7 +1192,13 @@ public actor SyncEngine {
     /// request, not the row, so charging every entry an attempt would park up to `limit` healthy
     /// writes for one poison neighbour. The per-entry re-run is what decides who was actually at
     /// fault; the extra round trips it costs are paid only on the unhealthy path.
-    private func uploadedAsBatch(_ chunk: [OutboxEntry], groupSeqs: [Int64: [Int64]]) async -> Bool {
+    ///
+    /// A failure naming the **connection or the credential** throws instead of returning false: no
+    /// row can be individually at fault, so the per-row hunt would just re-send the same doomed
+    /// request `chunk.count` more times — against a timing-out network, hours of them. The pass fails
+    /// and the scheduler's backoff owns the retry; no attempts were charged, so the batch re-runs
+    /// whole once the connection (or token) comes back.
+    private func uploadedAsBatch(_ chunk: [OutboxEntry], groupSeqs: [Int64: [Int64]]) async throws -> Bool {
         guard let spec = tables.first(where: { $0.name == chunk[0].tableName }) else {
             return false // table no longer synced — let the per-entry path drop the stale entries
         }
@@ -1180,6 +1236,7 @@ public actor SyncEngine {
             }
             return true
         } catch {
+            if remoteErrorIsConnectivity(error) || remoteErrorIsAuthTransient(error) { throw error }
             return false
         }
     }
@@ -1209,6 +1266,8 @@ public actor SyncEngine {
 
     /// A wire primary key as the outbox stores it. `_sync_outbox.pk` has TEXT affinity, so an integer
     /// key is `"7"` there and must be compared as one; anything that isn't a scalar key is no key.
+    /// Shared by the batch `match` and the pull's row decoding — PostgREST serializes an int8 key as
+    /// a JSON number, and both paths must read it the same way the upload side stores it.
     private static func wireKey(_ value: AnyJSON) -> String? {
         switch value {
         case .string(let string): return string
@@ -1249,9 +1308,11 @@ public actor SyncEngine {
             }
         }
         if park {
-            // Diagnostic breadcrumb for a parked write — table/pk/op/attempts + classified error, never
-            // the row payload (user content). pk is redacted in release by the default privacy (APPS-514).
-            log.error("dead-lettered \(entry.tableName, privacy: .public) pk=\(entry.pk) op=\(entry.op.rawValue, privacy: .public) attempts=\(attempts, privacy: .public): \(String(describing: error), privacy: .public)")
+            // Diagnostic breadcrumb for a parked write — table/pk/op/attempts + the classified kind,
+            // never the row payload (user content). pk and the raw error text stay at the default
+            // privacy (redacted in release): a server message can embed row values, e.g. a Postgres
+            // constraint DETAIL naming the offending key (APPS-514).
+            log.error("dead-lettered \(entry.tableName, privacy: .public) pk=\(entry.pk) op=\(entry.op.rawValue, privacy: .public) attempts=\(attempts, privacy: .public) kind=\(kind, privacy: .public): \(String(describing: error))")
         }
     }
 

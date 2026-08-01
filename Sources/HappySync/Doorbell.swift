@@ -75,6 +75,10 @@ struct SupabaseDoorbell: SyncDoorbell {
                         streams.append(channel.postgresChange(AnyAction.self, schema: "public", table: table.name))
                     }
                 }
+                // Signed out with every table scoped → nothing to listen for. Keep the stream open
+                // but idle instead of subscribing a listener-less channel; the engine re-rings with
+                // a fresh scope once sign-in resolves one (APPS-509).
+                guard !streams.isEmpty else { return }
                 await channel.subscribe()
                 await withTaskGroup(of: Void.self) { group in
                     for stream in streams {

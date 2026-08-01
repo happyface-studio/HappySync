@@ -154,6 +154,45 @@ import HappySyncTestSupport
     #expect(attempts == [1, 1, 1]) // one attempt each — the failed batch itself charged nothing
 }
 
+@Test func connectivityBatchFailureFailsThePassInsteadOfHuntingRowByRow() async throws {
+    let db = try recipesDB()
+    // The batch dies because the device is offline — no row is at fault, so re-running it row by row
+    // would only send three more doomed requests (against a timing-out network, hours of them). The
+    // drain must fail the pass — the scheduler's backoff owns the retry — and charge no attempts, so
+    // the batch re-runs whole once connectivity returns.
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(URLError(.notConnectedToInternet)))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    for i in 1...3 {
+        try await write(db, "INSERT INTO recipes (id, title) VALUES (?, ?)", ["r\(i)", "T\(i)"])
+    }
+
+    await #expect(throws: (any Error).self) { try await engine.drainOutbox() }
+
+    #expect(await remote.upsertRequests == 1) // the dead batch, and nothing after it
+    let attempts = try await db.read { try Int.fetchAll($0, sql: "SELECT attempts FROM _sync_outbox ORDER BY seq") }
+    #expect(attempts == [0, 0, 0]) // no attempts charged — these writes are healthy
+
+    try await engine.drainOutbox() // connectivity back → the whole backlog lands, still batched
+    #expect(try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM _sync_outbox") } == 0)
+}
+
+@Test func authShapedBatchFailureFailsThePassInsteadOfHuntingRowByRow() async throws {
+    let db = try recipesDB()
+    // Same shape for an expired token: the credential failed, not a row. Falling back per row would
+    // spend one doomed request per entry on every drain of a signed-out stretch (APPS-502).
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(httpError(401)))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")])
+    for i in 1...2 {
+        try await write(db, "INSERT INTO recipes (id, title) VALUES (?, ?)", ["r\(i)", "T\(i)"])
+    }
+
+    await #expect(throws: (any Error).self) { try await engine.drainOutbox() }
+
+    #expect(await remote.upsertRequests == 1)
+    let attempts = try await db.read { try Int.fetchAll($0, sql: "SELECT attempts FROM _sync_outbox ORDER BY seq") }
+    #expect(attempts == [0, 0])
+}
+
 @Test func representationsAreMatchedByPrimaryKeyNotArrivalOrder() async throws {
     let db = try recipesDB()
     // A server that answers a batch with the representations reversed. Matching them positionally
@@ -173,6 +212,14 @@ import HappySyncTestSupport
 }
 
 // MARK: - Fixtures
+
+/// Builds an `HTTPError` carrying `code`, so a batch-failure test can exercise the auth-shaped path.
+private func httpError(_ code: Int) -> HTTPError {
+    HTTPError(
+        data: Data(),
+        response: HTTPURLResponse(url: URL(string: "https://x")!, statusCode: code, httpVersion: nil, headerFields: nil)!
+    )
+}
 
 private func entry(seq: Int64, table: String, pk: String, op: SyncOp) -> OutboxEntry {
     OutboxEntry(row: ["seq": seq, "table_name": table, "pk": pk, "op": op.rawValue, "attempts": 0])

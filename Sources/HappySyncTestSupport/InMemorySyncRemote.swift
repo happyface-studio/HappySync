@@ -264,6 +264,19 @@ public actor InMemorySyncRemote: SyncRemote {
     /// The `(cursorColumn, primaryKey)` tuple a row sorts and resumes by — the same ordering the
     /// server applies, so pagination boundaries land where the engine expects them.
     private func tuple(_ row: [String: AnyJSON], _ cursorColumn: String, _ primaryKey: String) -> (String, String) {
-        (row[cursorColumn]?.stringValue ?? "", row[primaryKey]?.stringValue ?? "")
+        (row[cursorColumn]?.stringValue ?? "", row[primaryKey].flatMap(Self.keyText) ?? "")
+    }
+
+    /// The text form of a scalar key — an integer key renders to the same text the engine's outbox
+    /// and cursor store (`7` → `"7"`), so an integer-keyed dataset pages and resumes like a
+    /// string-keyed one. (The tie-break *within* one cursor instant is still a text compare, where a
+    /// real server compares integers numerically — seed distinct timestamps if that distinction ever
+    /// matters to a test.)
+    private static func keyText(_ value: AnyJSON) -> String? {
+        switch value {
+        case .string(let string): return string
+        case .integer(let int): return String(int)
+        default: return nil
+        }
     }
 }

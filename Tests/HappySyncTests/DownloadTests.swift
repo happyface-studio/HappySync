@@ -173,6 +173,48 @@ private func seedRecipe(_ db: DatabaseQueue, id: String, title: String, updatedA
     #expect(ingredients == 0)
 }
 
+@Test func deferredTombstonesAreFlushedWhenAPullDiesMidPass() async throws {
+    // The first table's page applies a tombstone *deferral* and advances the cursor past it in the
+    // same transaction; the second table's fetch then dies. The deferred delete must still land
+    // before the error propagates — the advanced cursor will never re-fetch that tombstone, so an
+    // unflushed deferral would leave the row alive locally forever. (The teardown checkpoint already
+    // flushed for exactly this reason; the error path must too.)
+    let db = try DatabaseQueue()
+    try await db.write { db in
+        try db.create(table: "recipes") { t in
+            t.column("id", .text).primaryKey()
+            t.column("updatedAt", .text)
+            t.column("deletedAt", .text)
+        }
+        try db.create(table: "recipeSteps") { t in
+            t.column("id", .text).primaryKey()
+            t.column("updatedAt", .text)
+            t.column("deletedAt", .text)
+        }
+        try db.execute(sql: "INSERT INTO recipes (id, updatedAt) VALUES ('r1', '2026-06-30T09:00:00.000Z')")
+    }
+    let remote = InMemorySyncRemote(dataset: [
+        "recipes": [["id": "r1", "updatedAt": "2026-06-30T10:00:00.000Z", "deletedAt": "2026-06-30T10:00:00.000Z"]],
+        "recipeSteps": [],
+    ])
+    await remote.onFetch { call in
+        if call == 2 { await remote.failNextFetches(1) } // the second table's fetch dies
+    }
+    let engine = try makeEngine(db: db, tables: [
+        SyncTable(name: "recipes"),
+        SyncTable(name: "recipeSteps", dependsOn: ["recipes"]),
+    ], remote: remote)
+
+    await #expect(throws: (any Error).self) { try await engine.pullNow() }
+
+    let (count, cursorId) = try await db.read { db -> (Int, String?) in
+        (try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM recipes WHERE id = 'r1'") ?? -1,
+         try String.fetchOne(db, sql: "SELECT last_id FROM _sync_state WHERE table_name = 'recipes'"))
+    }
+    #expect(cursorId == "r1") // the cursor had already advanced past the tombstone when the pass died…
+    #expect(count == 0)       // …so the deferred delete must have been flushed, not dropped
+}
+
 // MARK: - Pagination & tuple boundary
 
 @Test func pullPaginatesAcrossSameMillisecondBoundary() async throws {
