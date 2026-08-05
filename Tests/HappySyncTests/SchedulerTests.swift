@@ -165,9 +165,13 @@ private struct SeededGenerator: RandomNumberGenerator {
     for i in 0..<20 {
         try await write(db, "INSERT INTO recipes (id, title) VALUES (?, ?)", ["r\(i)", "row \(i)"])
     }
-    // Wait until every queued write has uploaded, then count how many sync passes it took.
+    // Wait until every queued write has uploaded, then count how many sync passes it took. The 20th
+    // upsert is observable mid-pass — before the drain's write-back commits and the pass's own pull
+    // fetches — so racing straight to `fetchCalls` can read zero passes on a loaded runner. Wait for
+    // the pull to land, then settle (the issue #19 pattern) before counting.
     #expect(await eventually { await remote.upsertCalls.count == 20 })
-    let passes = await remote.fetchCalls - baseline // one fetch per sync pass (empty dataset)
+    #expect(await eventually { await remote.fetchCalls > baseline }) // the burst's pass pulled
+    let passes = await settledFetchCalls(remote) - baseline // one fetch per sync pass (empty dataset)
     await engine.stop()
 
     #expect(passes >= 1) // it drained…
