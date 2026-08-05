@@ -109,6 +109,22 @@ func remoteErrorIsAuthTransient(_ error: Error) -> Bool {
     return false
 }
 
+/// True when a failure names the **connection**, not the payload: the request never completed
+/// (`URLError` — offline, DNS, timeout, dropped socket) or Postgres reported a connection error
+/// (class `08`). These say nothing about any individual write, so the drain treats them like the
+/// auth-shaped failures above: no retry-budget charge (a device is *expected* to sit offline far
+/// longer than the backoff cap allows — APPS-502's reasoning exactly), and no per-row re-run of a
+/// failed batch, which would only multiply doomed requests. An HTTP status is deliberately *not*
+/// connectivity — the server answered, so a per-row re-run can still isolate a poison row.
+func remoteErrorIsConnectivity(_ error: Error) -> Bool {
+    let underlying = (error as? RemoteFailure)?.underlying ?? error
+    if underlying is URLError { return true }
+    if let postgrest = underlying as? PostgrestError {
+        return postgrest.code?.hasPrefix("08") ?? false // connection_exception class
+    }
+    return false
+}
+
 /// The server side of the sync path. Abstracted behind a protocol so the drain can be driven by a
 /// fake that records call order and simulates failures — the production conformance
 /// (`SupabaseRemote`) is the only place that touches the network.

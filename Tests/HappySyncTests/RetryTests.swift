@@ -61,6 +61,20 @@ private func httpError(_ code: Int) -> HTTPError {
     #expect(remoteErrorIsAuthTransient(pg("23505")) == false)
 }
 
+@Test func remoteErrorRecognisesConnectivityFailures() {
+    func pg(_ code: String?) -> PostgrestError { PostgrestError(code: code, message: code ?? "") }
+    // Connection-shaped (exempt from the retry budget, and never worth a per-row batch re-run)…
+    #expect(remoteErrorIsConnectivity(URLError(.notConnectedToInternet)) == true)
+    #expect(remoteErrorIsConnectivity(URLError(.timedOut)) == true)
+    #expect(remoteErrorIsConnectivity(pg("08006")) == true) // connection_failure
+    // …recognised even through the RemoteFailure wrapper the production remote raises.
+    #expect(remoteErrorIsConnectivity(RemoteFailure(classifying: URLError(.networkConnectionLost))) == true)
+    // Not connection-shaped: the server answered, so a per-row re-run can still isolate a poison row.
+    #expect(remoteErrorIsConnectivity(httpError(503)) == false)
+    #expect(remoteErrorIsConnectivity(pg("23505")) == false)
+    #expect(remoteErrorIsConnectivity(SimulatedTransientFailure()) == false) // the generic double stays chargeable
+}
+
 // MARK: - Per-entry backoff
 
 @Test func drainSkipsEntryStillInsideBackoffWindow() async throws {
@@ -120,6 +134,29 @@ private func httpError(_ code: Int) -> HTTPError {
     #expect(remaining == 0)
 }
 
+@Test func offlineFailuresDoNotChargeTheRetryBudget() async throws {
+    let db = try recipesDB()
+    // Three consecutive drains fail offline — more passes than the cap below allows. Offline says
+    // nothing about the write: a device is *expected* to sit offline far longer than the backoff
+    // windows, and charging these would park the outbox after minutes of airplane mode, stranding
+    // every edit behind a manual repair (the same reasoning as the auth exemption, APPS-502).
+    let remote = InMemorySyncRemote(failUpserts: 3, upsertFailure: .error(URLError(.notConnectedToInternet)))
+    let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 2)
+    try await write(db, "INSERT INTO recipes (id, title) VALUES ('r1', 'Soup')")
+
+    for _ in 1...3 {
+        let outcome = try await engine.drainOutbox()
+        #expect(outcome.deadLettered == 0) // never parked, however long the offline stretch
+        try await agePastBackoff(db)
+    }
+    let attempts = try await db.read { try Int.fetchOne($0, sql: "SELECT attempts FROM _sync_outbox WHERE pk='r1'") }
+    #expect(attempts == 0) // connectivity charged nothing
+
+    try await engine.drainOutbox() // the network returns → the write lands
+    let remaining = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM _sync_outbox") }
+    #expect(remaining == 0)
+}
+
 @Test func transientPostgrestStateIsRetried() async throws {
     let db = try recipesDB()
     // 40001 serialization_failure surfaces as a PostgrestError but is a transient Postgres state.
@@ -155,22 +192,24 @@ private func httpError(_ code: Int) -> HTTPError {
 @Test func fullOutbox401StormRecoversWithZeroDeadLetters() async throws {
     let db = try recipesDB()
     let entryCount = 5
-    // Every upload in the first drain pass 401s (token stale at cold launch); afterwards auth refreshed.
-    let remote = InMemorySyncRemote(failUpserts: entryCount, upsertFailure: .error(httpError(401)))
+    // The whole outbox goes out as one batch and 401s (token stale at cold launch). The credential
+    // failed, not a row — so the pass fails right there rather than re-running five doomed per-row
+    // requests, and nothing is charged or parked.
+    let remote = InMemorySyncRemote(failUpserts: 1, upsertFailure: .error(httpError(401)))
     // A deliberately tiny cap: proves auth failures don't park even when the budget is nearly spent.
     let engine = try SyncEngine.forTesting(db: db, remote: remote, tables: [SyncTable(name: "recipes")], deadLetterAfter: 2)
     for i in 0..<entryCount {
         try await write(db, "INSERT INTO recipes (id, title) VALUES (?, ?)", ["r\(i)", "T\(i)"])
     }
 
-    try await engine.drainOutbox() // the entire outbox 401s in a single pass
+    await #expect(throws: (any Error).self) { try await engine.drainOutbox() }
     let deadAfterStorm = try await db.read {
         try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM _sync_outbox WHERE dead_lettered = 1")
     }
-    #expect(deadAfterStorm == 0) // no dead letters despite the whole outbox failing at once
+    #expect(deadAfterStorm == 0)              // no dead letters despite the whole outbox failing at once
+    #expect(await remote.upsertRequests == 1) // one rejected batch — no per-row hunt with a dead token
 
-    try await agePastBackoff(db)
-    try await engine.drainOutbox() // auth returns a valid token → every write lands
+    try await engine.drainOutbox() // auth returns a valid token → every write lands, still batched
     let remaining = try await db.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM _sync_outbox") }
     #expect(remaining == 0)
 }
