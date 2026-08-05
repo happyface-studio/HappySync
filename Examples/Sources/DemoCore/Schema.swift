@@ -7,7 +7,7 @@ import HappySync
 // removed child — the behaviour an app most often gets wrong by hand-deleting children.
 
 /// A list of things to do. The parent row.
-public struct TodoList: Codable, Identifiable, Hashable, FetchableRecord, PersistableRecord {
+public struct TodoList: Codable, Identifiable, Hashable, Sendable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "lists"
 
     public var id: String
@@ -22,7 +22,7 @@ public struct TodoList: Codable, Identifiable, Hashable, FetchableRecord, Persis
 /// One entry in a list. `listId` carries `ON DELETE CASCADE`, which is the whole trick: deleting a
 /// list removes its items in the same transaction and each item's own capture trigger queues its
 /// tombstone.
-public struct TodoItem: Codable, Identifiable, Hashable, FetchableRecord, PersistableRecord {
+public struct TodoItem: Codable, Identifiable, Hashable, Sendable, FetchableRecord, PersistableRecord {
     public static let databaseTableName = "items"
 
     public var id: String
